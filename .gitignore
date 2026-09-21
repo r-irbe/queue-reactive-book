@@ -1,0 +1,15 @@
+build/
+*.log
+.vcpkg/
+vcpkg_installed/
+.DS_Store
+*.pyc
+__pycache__/
+compile_commands.json
+.cache/
+.benchmarks/
+*.tmp
+results/bench-*
+results/*.json
+results/*.meta.txt
+results/*.notes.md
