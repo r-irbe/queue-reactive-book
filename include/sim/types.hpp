@@ -9,7 +9,7 @@ namespace sim {
     using OrderId   = std::uint64_t;//monotonically increasing
     using AgentId   = std::uint32_t;
     using TimeNs    = std::int64_t;//for example clock
-    //TODO reducing data storage requirements
+    // Reduced data storage requirements: 1B compact enums and 24B CompactOrder layout.
     enum class Side : std::uint8_t { Buy = 0, Sell = 1 };
 
     inline Side opposite(Side s) noexcept {
@@ -86,6 +86,15 @@ namespace sim {
         TimeNs    enqueue_ts = 0;                // offset 32  book time when queued
     };
     static_assert(sizeof(Order) == 40);
+
+    // Reduced data storage: CompactOrder packed into 24 bytes for high-density transport and replay logging.
+    struct alignas(8) CompactOrder {
+        OrderId       id         = 0;                // offset  0 (8B)
+        TimeNs        ts         = 0;                // offset  8 (8B)
+        Tick          price      = 0;                // offset 16 (4B)
+        Qty           qty        = 0;                // offset 20 (4B)
+    };
+    static_assert(sizeof(CompactOrder) == 24, "CompactOrder must be 24B for high-density storage");
 
     // Layout-stable: hot ids first, ts last so the matching loop only touches
     // the first cache line per Trade until trades are flushed downstream.

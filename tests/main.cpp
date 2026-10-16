@@ -4895,4 +4895,11 @@ TEST_CASE("Zero-tombstone intrusive slotmap and non-throwing construction", "[si
     REQUIRE(book.volume_at(sim::Side::Buy, 100) == 500);
     REQUIRE(book.order_count() == 50);
     REQUIRE(book.check_invariants_report().ok);
+
+    // 3. Compact storage requirements verification (TODO resolution)
+    static_assert(sizeof(sim::CompactOrder) == 24, "CompactOrder must be 24 bytes");
+    static_assert(sizeof(sim::IntrusiveOrderNode) == 32, "IntrusiveOrderNode must be 32 bytes");
+    sim::CompactOrder co{.id = 42, .ts = 1000, .price = 100, .qty = 10};
+    REQUIRE(co.id == 42);
+    REQUIRE(co.price == 100);
 }
