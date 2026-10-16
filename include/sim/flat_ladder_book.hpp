@@ -128,8 +128,10 @@ private:
 
     // 0 = none, 1 = buy, 2 = sell. PMR-allocated for arena locality with levels_.
     std::pmr::vector<std::uint8_t> level_side_;
-    // One bit per ladder level (1 = occupied). Enables O(N/64) refresh of best-price indices.
+    // One bit per ladder level (1 = occupied). Enables O(1) bitwise vEB search.
     std::pmr::vector<std::uint64_t> level_bitmap_;
+    // 2-level Bitwise van Emde Boas summary mask: 1 bit per 64-level word in level_bitmap_.
+    std::pmr::vector<std::uint64_t> summary_bitmap_;
     std::pmr::vector<OrderRef> id_refs_;
     std::pmr::vector<std::uint8_t> id_live_;
     std::size_t live_order_count_ = 0;

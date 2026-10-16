@@ -36,7 +36,9 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
   levels_.resize(tick_count_);
   level_side_.assign(tick_count_, kNoSide);
   // Bitmap: 1 bit per ladder slot; words are 64-bit so we round up.
-  level_bitmap_.assign((tick_count_ + 63) / 64, 0);
+  const std::size_t num_level_words = (tick_count_ + 63) / 64;
+  level_bitmap_.assign(num_level_words, 0);
+  summary_bitmap_.assign((num_level_words + 63) / 64, 0);
 
   // Pre-reserve node pool and id index for expected orders
   node_pool_.reserve(expected_orders);
@@ -131,7 +133,7 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       if (!is_market && price_of(idx) > price) break;
       available += levels_[idx].volume;
       if (available >= qty) return true;
-      // Seek next ask level via bitmap
+      // Seek next ask level via 2-level bitwise vEB summary
       const std::size_t next_idx = idx + 1;
       if (next_idx >= tick_count_) break;
       std::size_t word = next_idx >> 6;
@@ -139,12 +141,26 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       const std::uint64_t mask = (~std::uint64_t{0}) << bit;
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
-      for (std::size_t nw = level_bitmap_.size(); word < nw; ++word) {
-        if (w != 0) {
-          found = (word << 6) + static_cast<std::size_t>(__builtin_ctzll(w));
-          break;
+      if (w != 0) {
+        found = (word << 6) + static_cast<std::size_t>(__builtin_ctzll(w));
+      } else {
+        const std::size_t nw_idx = word + 1;
+        if (nw_idx < level_bitmap_.size()) {
+          const std::size_t sw = nw_idx >> 6;
+          const std::size_t sb = nw_idx & 63;
+          const std::uint64_t s_mask = (~std::uint64_t{0}) << sb;
+          for (std::size_t s = sw; s < summary_bitmap_.size(); ++s) {
+            std::uint64_t s_val = summary_bitmap_[s];
+            if (s == sw) s_val &= s_mask;
+            if (s_val != 0) {
+              const std::size_t tw = (s << 6) + static_cast<std::size_t>(__builtin_ctzll(s_val));
+              if (tw < level_bitmap_.size()) {
+                found = (tw << 6) + static_cast<std::size_t>(__builtin_ctzll(level_bitmap_[tw]));
+                break;
+              }
+            }
+          }
         }
-        if (word + 1 < nw) w = level_bitmap_[word + 1];
       }
       idx = found;
     }
@@ -160,14 +176,24 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       const std::uint64_t mask = (~std::uint64_t{0}) >> (63 - bit);
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
-      while (true) {
-        if (w != 0) {
-          found = (word << 6) + static_cast<std::size_t>(63 - __builtin_clzll(w));
-          break;
+      if (w != 0) {
+        found = (word << 6) + static_cast<std::size_t>(63 - __builtin_clzll(w));
+      } else if (word > 0) {
+        const std::size_t pw_idx = word - 1;
+        const std::size_t sw = pw_idx >> 6;
+        const std::size_t sb = pw_idx & 63;
+        const std::uint64_t s_mask = (~std::uint64_t{0}) >> (63 - sb);
+        for (std::int64_t s = static_cast<std::int64_t>(sw); s >= 0; --s) {
+          std::uint64_t s_val = summary_bitmap_[static_cast<std::size_t>(s)];
+          if (static_cast<std::size_t>(s) == sw) s_val &= s_mask;
+          if (s_val != 0) {
+            const std::size_t tw = (static_cast<std::size_t>(s) << 6) + static_cast<std::size_t>(63 - __builtin_clzll(s_val));
+            if (tw < level_bitmap_.size()) {
+              found = (tw << 6) + static_cast<std::size_t>(63 - __builtin_clzll(level_bitmap_[tw]));
+              break;
+            }
+          }
         }
-        if (word == 0) break;
-        --word;
-        w = level_bitmap_[word];
       }
       idx = found;
     }
@@ -628,15 +654,35 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
   const std::size_t bit_in_word = clamped & 63;
   const std::uint64_t head_mask = (~std::uint64_t{0}) >> (63 - bit_in_word);
   std::uint64_t w = level_bitmap_[word] & head_mask;
-  while (true) {
-    if (w != 0) {
-      const int hi = 63 - __builtin_clzll(w);
-      best_bid_idx_ = (word << 6) + static_cast<std::size_t>(hi);
+  if (w != 0) {
+    const int hi = 63 - __builtin_clzll(w);
+    best_bid_idx_ = (word << 6) + static_cast<std::size_t>(hi);
+    return;
+  }
+
+  // 2-level bitwise vEB summary jump for lower words
+  if (word == 0) {
+    best_bid_idx_ = kNpos;
+    return;
+  }
+  const std::size_t target_word = word - 1;
+  const std::size_t s_word = target_word >> 6;
+  const std::size_t s_bit = target_word & 63;
+  const std::uint64_t s_head_mask = (~std::uint64_t{0}) >> (63 - s_bit);
+
+  for (std::int64_t sw = static_cast<std::int64_t>(s_word); sw >= 0; --sw) {
+    std::uint64_t sw_val = summary_bitmap_[static_cast<std::size_t>(sw)];
+    if (static_cast<std::size_t>(sw) == s_word) {
+      sw_val &= s_head_mask;
+    }
+    if (sw_val != 0) {
+      const int hi_w = 63 - __builtin_clzll(sw_val);
+      const std::size_t prev_word = (static_cast<std::size_t>(sw) << 6) + static_cast<std::size_t>(hi_w);
+      const std::uint64_t target_w = level_bitmap_[prev_word];
+      const int hi = 63 - __builtin_clzll(target_w);
+      best_bid_idx_ = (prev_word << 6) + static_cast<std::size_t>(hi);
       return;
     }
-    if (word == 0) break;
-    --word;
-    w = level_bitmap_[word];
   }
   best_bid_idx_ = kNpos;
 }
@@ -650,29 +696,63 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
   const std::size_t bit_in_word = start & 63;
   const std::uint64_t tail_mask = (~std::uint64_t{0}) << bit_in_word;
   std::uint64_t w = level_bitmap_[word] & tail_mask;
-  const std::size_t nwords = level_bitmap_.size();
-  while (true) {
-    if (w != 0) {
-      const int lo = __builtin_ctzll(w);
-      best_ask_idx_ = (word << 6) + static_cast<std::size_t>(lo);
-      if (best_ask_idx_ >= tick_count_) [[unlikely]] {
-        best_ask_idx_ = kNpos;
-      }
-      return;
+  if (w != 0) {
+    const int lo = __builtin_ctzll(w);
+    best_ask_idx_ = (word << 6) + static_cast<std::size_t>(lo);
+    if (best_ask_idx_ >= tick_count_) [[unlikely]] {
+      best_ask_idx_ = kNpos;
     }
-    ++word;
-    if (word >= nwords) break;
-    w = level_bitmap_[word];
+    return;
+  }
+
+  // 2-level bitwise vEB summary jump for higher words
+  const std::size_t next_word = word + 1;
+  if (next_word >= level_bitmap_.size()) {
+    best_ask_idx_ = kNpos;
+    return;
+  }
+  const std::size_t s_word = next_word >> 6;
+  const std::size_t s_bit = next_word & 63;
+  const std::uint64_t s_tail_mask = (~std::uint64_t{0}) << s_bit;
+  const std::size_t num_s_words = summary_bitmap_.size();
+
+  for (std::size_t sw = s_word; sw < num_s_words; ++sw) {
+    std::uint64_t sw_val = summary_bitmap_[sw];
+    if (sw == s_word) {
+      sw_val &= s_tail_mask;
+    }
+    if (sw_val != 0) {
+      const int lo_w = __builtin_ctzll(sw_val);
+      const std::size_t target_w_idx = (sw << 6) + static_cast<std::size_t>(lo_w);
+      if (target_w_idx < level_bitmap_.size()) {
+        const std::uint64_t target_w = level_bitmap_[target_w_idx];
+        const int lo = __builtin_ctzll(target_w);
+        best_ask_idx_ = (target_w_idx << 6) + static_cast<std::size_t>(lo);
+        if (best_ask_idx_ >= tick_count_) [[unlikely]] {
+          best_ask_idx_ = kNpos;
+        }
+        return;
+      }
+    }
   }
   best_ask_idx_ = kNpos;
 }
 
 void FlatLadderBook::mark_level_occupied(std::size_t idx) noexcept {
-  level_bitmap_[idx >> 6] |= (std::uint64_t{1} << (idx & 63));
+  const std::size_t word = idx >> 6;
+  const std::uint64_t prev = level_bitmap_[word];
+  level_bitmap_[word] = prev | (std::uint64_t{1} << (idx & 63));
+  if (prev == 0) [[unlikely]] {
+    summary_bitmap_[word >> 6] |= (std::uint64_t{1} << (word & 63));
+  }
 }
 
 void FlatLadderBook::clear_level_occupied(std::size_t idx) noexcept {
-  level_bitmap_[idx >> 6] &= ~(std::uint64_t{1} << (idx & 63));
+  const std::size_t word = idx >> 6;
+  level_bitmap_[word] &= ~(std::uint64_t{1} << (idx & 63));
+  if (level_bitmap_[word] == 0) [[unlikely]] {
+    summary_bitmap_[word >> 6] &= ~(std::uint64_t{1} << (word & 63));
+  }
 }
 
 } // namespace sim
