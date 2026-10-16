@@ -3,6 +3,7 @@
 #include "sim/alloc_probe.hpp"
 #include "sim/flat_ladder_book.hpp"
 #include "sim/lob.hpp"
+#include "sim/queue_reactive.hpp"
 #include "sim/rng.hpp"
 
 #include <cstdlib>
@@ -24,13 +25,25 @@
 // left to the default implementation and are NOT counted (documented limit).
 void* operator new(std::size_t size) {
     void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
+    if (!p) {
+#if defined(__cpp_exceptions)
+        throw std::bad_alloc();
+#else
+        std::abort();
+#endif
+    }
     if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
     return p;
 }
 void* operator new[](std::size_t size) {
     void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
+    if (!p) {
+#if defined(__cpp_exceptions)
+        throw std::bad_alloc();
+#else
+        std::abort();
+#endif
+    }
     if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
     return p;
 }
@@ -68,7 +81,7 @@ inline sim::Order make_limit_order(sim::AgentId agent,
     return o;
 }
 
-// Adapter helpers — the FlatLadderBook hot path requires `ts`; LOB does not.
+// Adapter helpers -- the FlatLadderBook hot path requires `ts`; LOB does not.
 // Defaulting ts=0 here is safe in BENCH-ONLY code: production callers still
 // must pass an explicit timestamp.
 template <typename Book>
@@ -556,7 +569,7 @@ static void BM_LOB_CancelCycle_ArenaAuto(benchmark::State& state) {
 // ---------------------------------------------------------------------------
 
 // Deep cancel-cycle: rest at the inside of a wide band, then drain. Each
-// cancel that empties the inside-best level forces a refresh — the path
+// cancel that empties the inside-best level forces a refresh -- the path
 // the bitmap most accelerates.
 static void BM_FlatLadder_DeepCancelCycle(benchmark::State& state) {
     constexpr sim::Tick kMin   = 0;
@@ -598,7 +611,7 @@ static void BM_FlatLadder_DeepRefreshHeavy(benchmark::State& state) {
         }
         state.ResumeTiming();
 
-        // Cancel from the inside outward — each cancel triggers a full
+        // Cancel from the inside outward -- each cancel triggers a full
         // refresh sweep. Without the bitmap this is O(N) per cancel.
         // Reverse traversal is load-bearing (must always cancel the current
         // inside), so the modernize-to-range-for hint does not apply here.
@@ -710,4 +723,54 @@ BENCHMARK(BM_LOB_CancelCycle_ArenaAuto)
     ->Arg(1024)
     ->Arg(4096)
     ->Arg(16384);
+
+void BM_FlatLadder_STP_CancelPassive(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    for (auto _ : state) {
+        state.PauseTiming();
+        sim::FlatLadderBook book(90, 110, batch * 2);
+        for (int i = 0; i < batch; ++i) {
+            book.add(make_limit_order(1, sim::Side::Sell, 100, 10), i);
+        }
+        state.ResumeTiming();
+        for (int i = 0; i < batch; ++i) {
+            book.add(make_limit_order(1, sim::Side::Buy, 100, 10), batch + i, sim::StpMode::CancelPassive);
+        }
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_FlatLadder_QueueAhead(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(90, 110, batch * 2);
+    for (int i = 0; i < batch; ++i) {
+        book.add(make_limit_order(static_cast<sim::AgentId>(i + 1), sim::Side::Buy, 100, 10), i);
+    }
+    sim::Qty sink = 0;
+    for (auto _ : state) {
+        for (int i = 1; i <= batch; ++i) {
+            auto q = book.queue_ahead(static_cast<sim::OrderId>(i));
+            if (q) sink += *q;
+        }
+    }
+    benchmark::DoNotOptimize(sink);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_QueueReactive_EventGeneration(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::QueueReactiveProcess qrp;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            auto ev = qrp.next_event(100, 50, 101, 50);
+            benchmark::DoNotOptimize(ev);
+        }
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+BENCHMARK(BM_FlatLadder_STP_CancelPassive)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_QueueAhead)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_QueueReactive_EventGeneration)->Arg(1024)->Arg(4096);
+
 BENCHMARK_MAIN();

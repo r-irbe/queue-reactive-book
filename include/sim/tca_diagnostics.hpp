@@ -1,6 +1,6 @@
 #pragma once
 
-// tca_diagnostics.hpp — RTA-004: Three-risk diagnostic triplet (no netting)
+// tca_diagnostics.hpp -- RTA-004: Three-risk diagnostic triplet (no netting)
 //
 // Extends TCA/diagnostics export to emit three SEPARATE risk fields:
 //   1. Maker adversity risk (passive fill adverse selection)
@@ -29,17 +29,17 @@ namespace sim {
 // They are deliberately separate fields; no netting is ever performed.
 
 struct ThreeRiskTriplet {
-    // Risk 1: Maker adversity — adverse selection on passive (maker) fills
+    // Risk 1: Maker adversity -- adverse selection on passive (maker) fills
     //   = (post_fill_mid - fill_mid) * side_sign for passive fills
     //   Positive means the mid moved AWAY after you filled passively (adverse)
     Tick maker_adversity_x2 = 0;   // doubled for half-tick precision
 
-    // Risk 2: Taker adversity — adverse selection on aggressive (taker) fills
+    // Risk 2: Taker adversity -- adverse selection on aggressive (taker) fills
     //   = (post_fill_mid - fill_mid) * side_sign for aggressive fills
     //   Positive means the mid moved AGAINST you after you crossed (adverse)
     Tick taker_adversity_x2 = 0;   // doubled for half-tick precision
 
-    // Risk 3: Queue risk — queue-position/recognition risk
+    // Risk 3: Queue risk -- queue-position/recognition risk
     //   = unfilled qty * opportunity cost (ticks) when queue moved adversely
     //   Positive means you lost queue position and missed fills (adverse)
     Tick queue_risk_x2 = 0;        // doubled for half-tick precision
@@ -79,7 +79,7 @@ inline constexpr std::array<ExportColumn, kThreeRiskExportCount>
 inline constexpr std::string_view kNoNettingViolated = "NETTING_VIOLATION";
 
 inline constexpr bool no_netting_guard(const ThreeRiskTriplet& t) noexcept {
-    // If all three fields are zero, there's nothing to net — guard passes
+    // If all three fields are zero, there's nothing to net -- guard passes
     // trivially. The guard is for tests to call, not for production hot-path.
     (void)t;
     return true;
@@ -96,7 +96,7 @@ inline PerSideRisk split_risk_by_side(const ThreeRiskTriplet& triplet,
                                       Qty buy_qty,
                                       Qty sell_qty) noexcept {
     // Simple proportional split if both sides have quantity
-    // This is NOT netting — it's a per-side breakout for attribution
+    // This is NOT netting -- it's a per-side breakout for attribution
     const auto total_qty = buy_qty + sell_qty;
     if (total_qty == 0) return {};
 

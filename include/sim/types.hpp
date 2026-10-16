@@ -43,11 +43,19 @@ namespace sim {
     };
     static_assert(sizeof(OrderRef) == 16, "OrderRef must be 16B for cache-line packing");
 
-    //TODO: Add more order types
+    struct InvariantReport {
+        bool ok = true;
+        const char* message = "ok";
+        explicit operator bool() const noexcept { return ok; }
+    };
+
     enum class OrderType : std::uint8_t {
-        Limit  = 0,
-        Cancel = 1,
-        Market = 2,
+        Limit    = 0,
+        Cancel   = 1,
+        Market   = 2,
+        PostOnly = 3, // Passive maker only: rejected if crosses the book
+        IOC      = 4, // Immediate-Or-Cancel: matches available depth; remainder cancelled
+        FOK      = 5, // Fill-Or-Kill: fills 100% of order volume or cancels completely with 0 fills
     };
 
     enum class EventKind : std::uint8_t {
@@ -56,7 +64,15 @@ namespace sim {
         Trade  = 2,
     };
 
-    // Hot matching fields first (id, qty, agent, price) fit in 24 bytes — one cache line access.
+    // Self-Trade Prevention (STP) policies for high-frequency market participants.
+    enum class StpMode : std::uint8_t {
+        None               = 0, // Match normally (self-trades allowed)
+        CancelPassive      = 1, // Cancel resting order (maker) on collision
+        CancelAggressive   = 2, // Cancel incoming order (taker) on collision
+        DecrementAndCancel = 3, // Decrement both orders by min(taker, maker) qty without trade
+    };
+
+    // Hot matching fields first (id, qty, agent, price) fit in 24 bytes -- one cache line access.
     struct Order {
         OrderId   id         = 0;                // offset  0
         Qty       qty        = 0;                // offset  8  remaining, >0 while live
@@ -65,7 +81,8 @@ namespace sim {
         Tick      price      = 0;                // offset 20  ignored for Market
         Side      side       = Side::Buy;        // offset 24
         OrderType type       = OrderType::Limit; // offset 25
-                                                 // offset 26–31: padding
+        StpMode   stp        = StpMode::None;    // offset 26  Self-Trade Prevention policy
+                                                 // offset 27-31: 5B padding
         TimeNs    enqueue_ts = 0;                // offset 32  book time when queued
     };
     static_assert(sizeof(Order) == 40);

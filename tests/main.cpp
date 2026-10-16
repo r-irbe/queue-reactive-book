@@ -16,6 +16,7 @@
 #include "sim/moving_window_features.hpp"
 #include "sim/order_flow_features.hpp"
 #include "sim/parent_order_tracker.hpp"
+#include "sim/queue_reactive.hpp"
 #include "sim/queue_state_observer.hpp"
 #include "sim/quote_adapters.hpp"
 #include "sim/ofi_sparsity_features.hpp"
@@ -66,7 +67,7 @@ inline sim::Order make_market_order(sim::AgentId agent,
 }
 
 // Bridge the two add()/cancel() signatures: LOB takes no ts; FlatLadderBook
-// requires ts. Default ts=0 in test code only — production API still mandates
+// requires ts. Default ts=0 in test code only -- production API still mandates
 // an explicit timestamp on the FlatLadderBook hot path.
 template <typename Book>
 auto add_at(Book& b, const sim::Order& o, sim::TimeNs ts = 0) {
@@ -325,7 +326,7 @@ TEST_CASE("flat ladder is_empty / total_volume / event_count", "[flat-ladder][me
     REQUIRE(book.total_volume(sim::Side::Buy) == 2);
     REQUIRE(book.event_count() == 3);
 
-    // Cancel remaining bid → buy side empty, single side remains.
+    // Cancel remaining bid   buy side empty, single side remains.
     REQUIRE(book.cancel(1, 4));
     REQUIRE(book.total_volume(sim::Side::Buy) == 0);
     REQUIRE(book.event_count() == 4);
@@ -419,7 +420,7 @@ TEST_CASE("flat ladder check_invariants holds across deep ladder operations",
         REQUIRE((ba && *ba == 50'000));
     }
 
-    // Drain the inside bid (highest bid = 49'999 → 5th bid added → id 5).
+    // Drain the inside bid (highest bid = 49'999   5th bid added   id 5).
     // Refresh must walk down the bitmap to the next non-empty word.
     REQUIRE(book.cancel(/*id=*/5, ++ts));
     book.check_invariants();
@@ -428,7 +429,7 @@ TEST_CASE("flat ladder check_invariants holds across deep ladder operations",
         REQUIRE((bb && *bb == 4096));
     }
 
-    // Drain the inside ask (lowest ask = 50'000 → 1st ask added → id 6).
+    // Drain the inside ask (lowest ask = 50'000   1st ask added   id 6).
     // Refresh must walk up the bitmap to the next non-empty word.
     REQUIRE(book.cancel(/*id=*/6, ++ts));
     book.check_invariants();
@@ -2534,10 +2535,10 @@ TEST_CASE("risk audit log records a deterministic accept/reject trail",
     // 1: accepted buy of 5 (inventory 0 -> projected 5, within cap).
     auto i1 = submit(1, 100, sim::Side::Buy, 5);
     audit.record(i1, guard.evaluate(i1, sim::RiskState{.inventory = 0}));
-    // 2: rejected — order qty 6 exceeds max_order_qty 5.
+    // 2: rejected -- order qty 6 exceeds max_order_qty 5.
     auto i2 = submit(2, 110, sim::Side::Buy, 6);
     audit.record(i2, guard.evaluate(i2, sim::RiskState{.inventory = 5}));
-    // 3: rejected — projected inventory 8+5=13 exceeds max_abs_inventory 10.
+    // 3: rejected -- projected inventory 8+5=13 exceeds max_abs_inventory 10.
     auto i3 = submit(3, 120, sim::Side::Buy, 5);
     audit.record(i3, guard.evaluate(i3, sim::RiskState{.inventory = 8}));
 
@@ -4557,7 +4558,7 @@ TEST_CASE("RTA-005: reward ledger does not contaminate TCA",
     REQUIRE(tca_summary.aggressive_markout_x2_qty == 0);
 
     // Verify the reward summary fields are NOT present in TcaSummary
-    // (compile-time structural disjointness — these fields simply don't exist
+    // (compile-time structural disjointness -- these fields simply don't exist
     // on TcaSummary, so if this compiles, the disjointness is enforced)
     REQUIRE(rs->cumulative_reward_x1e6 != tca_summary.passive_qty);  // different types, different meanings
 }
@@ -4614,4 +4615,284 @@ TEST_CASE("RTA-004: three-risk triplet has independent fields",
             REQUIRE(col.name.find("net") == std::string_view::npos);
         }
     }
+}
+
+TEST_CASE("Self-Trade Prevention policies in FlatLadderBook and LimitOrderBook", "[lob][stp]") {
+    SECTION("FlatLadderBook CancelPassive cancels resting maker on self-match") {
+        sim::FlatLadderBook book(90, 110);
+        auto maker = make_limit_order(1, sim::Side::Sell, 100, 20);
+        book.add(maker, 1000);
+
+        // Incoming buy from same agent with CancelPassive
+        auto taker = make_limit_order(1, sim::Side::Buy, 100, 15);
+        auto res = book.add(taker, 2000, sim::StpMode::CancelPassive);
+
+        REQUIRE(res.trades.empty());
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 0);
+        // Maker was cancelled; taker rests on the bid side as an uncrossed limit
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 15);
+    }
+
+    SECTION("FlatLadderBook CancelAggressive cancels incoming taker immediately") {
+        sim::FlatLadderBook book(90, 110);
+        auto maker = make_limit_order(1, sim::Side::Sell, 100, 20);
+        book.add(maker, 1000);
+
+        auto taker = make_limit_order(1, sim::Side::Buy, 100, 15);
+        auto res = book.add(taker, 2000, sim::StpMode::CancelAggressive);
+
+        REQUIRE(res.trades.empty());
+        REQUIRE(res.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 20); // maker still resting
+    }
+
+    SECTION("FlatLadderBook DecrementAndCancel decrements both without trade") {
+        sim::FlatLadderBook book(90, 110);
+        auto maker = make_limit_order(1, sim::Side::Sell, 100, 30);
+        book.add(maker, 1000);
+
+        auto taker = make_limit_order(1, sim::Side::Buy, 100, 10);
+        auto res = book.add(taker, 2000, sim::StpMode::DecrementAndCancel);
+
+        REQUIRE(res.trades.empty());
+        REQUIRE(res.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 20); // 30 - 10 = 20 remaining
+    }
+
+    SECTION("LimitOrderBook STP policies match FlatLadderBook behavior") {
+        sim::LimitOrderBook book;
+        auto maker = make_limit_order(42, sim::Side::Sell, 105, 50);
+        book.add(maker);
+
+        auto taker = make_limit_order(42, sim::Side::Buy, 105, 20);
+        auto res = book.add(taker, sim::StpMode::DecrementAndCancel);
+
+        REQUIRE(res.trades.empty());
+        REQUIRE(book.volume_at(sim::Side::Sell, 105) == 30);
+    }
+}
+
+TEST_CASE("L3 FIFO queue position tracking (queue_ahead)", "[lob][l3][queue]") {
+    SECTION("FlatLadderBook queue_ahead tracks resting order volume ahead") {
+        sim::FlatLadderBook book(90, 110);
+        auto o1 = book.add(make_limit_order(1, sim::Side::Buy, 100, 10), 1000);
+        auto o2 = book.add(make_limit_order(2, sim::Side::Buy, 100, 25), 1100);
+        auto o3 = book.add(make_limit_order(3, sim::Side::Buy, 100, 15), 1200);
+
+        // Order IDs start at 1
+        REQUIRE(book.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+        REQUIRE(book.queue_ahead(2) == std::make_optional<sim::Qty>(10));
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(35));
+
+        // Cancel order 1 -> orders 2 and 3 advance
+        book.cancel(1, 1300);
+        REQUIRE(book.queue_ahead(1) == std::nullopt);
+        REQUIRE(book.queue_ahead(2) == std::make_optional<sim::Qty>(0));
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(25));
+
+        // Market sell of 15 lots -> partially fills order 2 (10 lots remain)
+        book.add(make_market_order(9, sim::Side::Sell, 15), 1400);
+        REQUIRE(book.queue_ahead(2) == std::make_optional<sim::Qty>(0));
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(10));
+
+        // Market sell of 10 lots -> fully fills order 2
+        book.add(make_market_order(9, sim::Side::Sell, 10), 1500);
+        REQUIRE(book.queue_ahead(2) == std::nullopt);
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(0));
+    }
+
+    SECTION("LimitOrderBook queue_ahead parity") {
+        sim::LimitOrderBook book;
+        book.add(make_limit_order(1, sim::Side::Sell, 102, 20));
+        book.add(make_limit_order(2, sim::Side::Sell, 102, 30));
+        book.add(make_limit_order(3, sim::Side::Sell, 102, 40));
+
+        REQUIRE(book.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+        REQUIRE(book.queue_ahead(2) == std::make_optional<sim::Qty>(20));
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(50));
+
+        book.cancel(1);
+        REQUIRE(book.queue_ahead(1) == std::nullopt);
+        REQUIRE(book.queue_ahead(2) == std::make_optional<sim::Qty>(0));
+        REQUIRE(book.queue_ahead(3) == std::make_optional<sim::Qty>(30));
+    }
+}
+
+TEST_CASE("Queue-Reactive model and Hawkes point-process generator", "[sim][queue_reactive]") {
+    sim::QueueReactiveProcess qrp;
+
+    auto lambda_shallow = qrp.compute_intensities(10, 10);
+    auto lambda_deep    = qrp.compute_intensities(1000, 1000);
+
+    // In queue-reactive theory (Huang et al.), deeper queue implies:
+    // 1. Lower limit order arrival intensity (traders don't crowd large queues)
+    const std::size_t buy_limit_idx = static_cast<std::size_t>(sim::QueueEventType::BuyLimit);
+    REQUIRE(lambda_deep[buy_limit_idx] < lambda_shallow[buy_limit_idx]);
+
+    // 2. Higher cancellation intensity (more resting volume to cancel)
+    const std::size_t buy_cancel_idx = static_cast<std::size_t>(sim::QueueEventType::BuyCancel);
+    REQUIRE(lambda_deep[buy_cancel_idx] > lambda_shallow[buy_cancel_idx]);
+
+    // Generate 50 consecutive events and ensure timestamps strictly monotonically increase
+    sim::TimeNs prev_time = 0;
+    for (int i = 0; i < 50; ++i) {
+        auto ev = qrp.next_event(100, 50, 101, 50);
+        REQUIRE(qrp.current_time() > prev_time);
+        REQUIRE(ev.qty >= 1);
+        REQUIRE(ev.inter_arrival_ns > 0);
+        prev_time = qrp.current_time();
+    }
+}
+
+TEST_CASE("Extended order types: PostOnly, IOC, and FOK parity", "[sim][order_types]") {
+    SECTION("FlatLadderBook PostOnly") {
+        sim::FlatLadderBook book(90, 110);
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50), 1000);
+
+        // Crossing PostOnly Buy is rejected
+        sim::Order post_cross{.qty = 20, .orig_qty = 20, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto res1 = book.add(post_cross, 2000);
+        REQUIRE(res1.trades.empty());
+        REQUIRE(res1.filled == 0);
+        REQUIRE(res1.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 50);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 0);
+
+        // Non-crossing PostOnly Buy rests passively
+        sim::Order post_passive{.qty = 30, .orig_qty = 30, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto res2 = book.add(post_passive, 3000);
+        REQUIRE(res2.trades.empty());
+        REQUIRE(res2.filled == 0);
+        REQUIRE(res2.remaining == 30);
+        REQUIRE(book.volume_at(sim::Side::Buy, 99) == 30);
+    }
+
+    SECTION("LimitOrderBook PostOnly") {
+        sim::LimitOrderBook book;
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50));
+
+        sim::Order post_cross{.qty = 20, .orig_qty = 20, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto res1 = book.add(post_cross);
+        REQUIRE(res1.trades.empty());
+        REQUIRE(res1.filled == 0);
+        REQUIRE(res1.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 50);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 0);
+
+        sim::Order post_passive{.qty = 30, .orig_qty = 30, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto res2 = book.add(post_passive);
+        REQUIRE(res2.trades.empty());
+        REQUIRE(res2.filled == 0);
+        REQUIRE(res2.remaining == 30);
+        REQUIRE(book.volume_at(sim::Side::Buy, 99) == 30);
+    }
+
+    SECTION("FlatLadderBook IOC") {
+        sim::FlatLadderBook book(90, 110);
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50), 1000);
+
+        sim::Order ioc{.qty = 80, .orig_qty = 80, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::IOC};
+        auto res = book.add(ioc, 2000);
+        REQUIRE(res.trades.size() == 1);
+        REQUIRE(res.filled == 50);
+        REQUIRE(res.remaining == 30);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 0); // Residual does NOT rest
+    }
+
+    SECTION("LimitOrderBook IOC") {
+        sim::LimitOrderBook book;
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50));
+
+        sim::Order ioc{.qty = 80, .orig_qty = 80, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::IOC};
+        auto res = book.add(ioc);
+        REQUIRE(res.trades.size() == 1);
+        REQUIRE(res.filled == 50);
+        REQUIRE(res.remaining == 30);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 0);
+    }
+
+    SECTION("FlatLadderBook FOK") {
+        sim::FlatLadderBook book(90, 110);
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50), 1000);
+
+        // Insufficient liquidity -> killed with 0 fills
+        sim::Order fok_kill{.qty = 80, .orig_qty = 80, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        auto res1 = book.add(fok_kill, 2000);
+        REQUIRE(res1.trades.empty());
+        REQUIRE(res1.filled == 0);
+        REQUIRE(res1.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 50);
+
+        // Sufficient liquidity -> fills 100%
+        sim::Order fok_fill{.qty = 40, .orig_qty = 40, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        auto res2 = book.add(fok_fill, 3000);
+        REQUIRE(res2.trades.size() == 1);
+        REQUIRE(res2.filled == 40);
+        REQUIRE(res2.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 10);
+    }
+
+    SECTION("LimitOrderBook FOK") {
+        sim::LimitOrderBook book;
+        book.add(make_limit_order(1, sim::Side::Sell, 100, 50));
+
+        sim::Order fok_kill{.qty = 80, .orig_qty = 80, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        auto res1 = book.add(fok_kill);
+        REQUIRE(res1.trades.empty());
+        REQUIRE(res1.filled == 0);
+        REQUIRE(res1.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 50);
+
+        sim::Order fok_fill{.qty = 40, .orig_qty = 40, .price = 100, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        auto res2 = book.add(fok_fill);
+        REQUIRE(res2.trades.size() == 1);
+        REQUIRE(res2.filled == 40);
+        REQUIRE(res2.remaining == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, 100) == 10);
+    }
+}
+
+TEST_CASE("Zero-tombstone intrusive slotmap and non-throwing construction", "[sim][intrusive_slotmap]") {
+    // 1. Non-throwing construction and factory check
+    auto opt_book = sim::FlatLadderBook::create(100, 90);
+    REQUIRE(opt_book == nullptr);
+
+    sim::FlatLadderBook invalid(100, 90);
+    REQUIRE_FALSE(invalid.is_valid());
+
+    auto valid_book = sim::FlatLadderBook::create(90, 110);
+    REQUIRE(valid_book != nullptr);
+    REQUIRE(valid_book->is_valid());
+
+    // 2. Intrusive unlinking and slot recycling
+    sim::FlatLadderBook book(90, 110, 256);
+    std::vector<sim::OrderId> ids;
+    for (int i = 0; i < 50; ++i) {
+        auto res = book.add(make_limit_order(i, sim::Side::Buy, 100, 10), 1000 + i);
+        ids.push_back(i + 1);
+    }
+
+    REQUIRE(book.volume_at(sim::Side::Buy, 100) == 500);
+    REQUIRE(book.order_count() == 50);
+    REQUIRE(book.check_invariants_report().ok);
+
+    // Cancel odd orders (strict O(1) intrusive unlinking, zero tombstones)
+    for (std::size_t i = 0; i < ids.size(); i += 2) {
+        REQUIRE(book.cancel(ids[i], 2000 + i));
+    }
+
+    REQUIRE(book.volume_at(sim::Side::Buy, 100) == 250);
+    REQUIRE(book.order_count() == 25);
+    REQUIRE(book.check_invariants_report().ok);
+
+    // Re-fill with new orders; verify recycled slots
+    for (int i = 0; i < 25; ++i) {
+        book.add(make_limit_order(100 + i, sim::Side::Buy, 100, 10), 3000 + i);
+    }
+
+    REQUIRE(book.volume_at(sim::Side::Buy, 100) == 500);
+    REQUIRE(book.order_count() == 50);
+    REQUIRE(book.check_invariants_report().ok);
 }

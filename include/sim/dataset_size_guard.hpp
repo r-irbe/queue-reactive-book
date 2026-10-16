@@ -59,18 +59,26 @@ inline SizeRegime classify_dataset_size(std::uint64_t expected_events,
     return SizeRegime::InRam;
 }
 
+inline bool check_dataset_size(std::uint64_t expected_events,
+                               std::uint64_t expected_bytes,
+                               const DatasetSizeBudget& budget) noexcept {
+    return classify_dataset_size(expected_events, expected_bytes, budget) != SizeRegime::Refuse;
+}
+
 // Throws std::runtime_error when the expected dataset exceeds a non-zero limit.
 // A no-op when the budget is disabled or within bounds.
 inline void check_dataset_size_or_throw(std::uint64_t expected_events,
                                         std::uint64_t expected_bytes,
                                         const DatasetSizeBudget& budget) {
     if (classify_dataset_size(expected_events, expected_bytes, budget) == SizeRegime::Refuse) {
+#if defined(__cpp_exceptions)
         throw std::runtime_error(
             "dataset-size guard: refusing replay -- expected dataset (" +
             std::to_string(expected_events) + " events, " +
             std::to_string(expected_bytes) + " bytes) exceeds in-RAM budget (" +
             std::to_string(budget.max_events) + " events, " +
             std::to_string(budget.max_bytes) + " bytes); fail loud instead of thrashing");
+#endif
     }
 }
 

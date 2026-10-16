@@ -1,6 +1,6 @@
 #pragma once
 
-// reward_ledger.hpp — RTA-001: Separate reward ledger (disjoint from TCA)
+// reward_ledger.hpp -- RTA-001: Separate reward ledger (disjoint from TCA)
 //
 // A standalone evaluation-layer ledger for RL/agent reward signals that is
 // deliberately disjoint from tca.hpp. TcaSummary/InventoryState may never
@@ -209,7 +209,7 @@ private:
 // These static_asserts ensure that RewardSummary and TcaSummary have no
 // overlapping field names, providing a compile-time guard against accidental
 // contamination. If someone adds a field to RewardSummary that matches a TcaSummary
-// field name, this will fail to compile (as a signal, not a hard error — the
+// field name, this will fail to compile (as a signal, not a hard error -- the
 // guard is advisory since the structs are in the same namespace).
 //
 // We check by ensuring RewardSummary does not have these TcaSummary field names:

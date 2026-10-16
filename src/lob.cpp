@@ -22,17 +22,68 @@ LimitOrderBook::LimitOrderBook(std::size_t expected_orders,
 // add
 // ---------------------------------------------------------------------------
 
-ExecutionResult LimitOrderBook::add(Order order) {
+ExecutionResult LimitOrderBook::add(Order order, StpMode stp) {
     order.id       = next_id_++;
     order.orig_qty = order.qty;
-    const bool is_limit = (order.type == OrderType::Limit);
+    const StpMode effective_stp = (stp != StpMode::None)
+                                      ? stp
+                                      : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
 
     ExecutionResult result;
     result.trades.reserve(4);
+
+    // 1. Post-Only Pre-flight Check:
+    if (order.type == OrderType::PostOnly) {
+        if (is_buy(order.side)) {
+            if (!asks_.empty() && asks_.begin()->first <= order.price) {
+                result.remaining = 0;
+                result.filled = 0;
+                return result;
+            }
+        } else {
+            if (!bids_.empty() && bids_.begin()->first >= order.price) {
+                result.remaining = 0;
+                result.filled = 0;
+                return result;
+            }
+        }
+        rest(order);
+        result.remaining = order.qty;
+        result.filled = 0;
+        return result;
+    }
+
+    // 2. Fill-Or-Kill (FOK) Pre-flight Liquidity Check:
+    if (order.type == OrderType::FOK) {
+        Qty available = 0;
+        if (is_buy(order.side)) {
+            for (const auto& [price, level] : asks_) {
+                if (price > order.price) break;
+                available += level.volume;
+                if (available >= order.qty) break;
+            }
+        } else {
+            for (const auto& [price, level] : bids_) {
+                if (price < order.price) break;
+                available += level.volume;
+                if (available >= order.qty) break;
+            }
+        }
+        if (available < order.qty) {
+            result.remaining = 0;
+            result.filled = 0;
+            return result;
+        }
+    }
+
+    const bool is_limit = (order.type == OrderType::Limit ||
+                           order.type == OrderType::IOC ||
+                           order.type == OrderType::FOK);
+
     if (is_buy(order.side))
-        match_against_asks(order, result, is_limit, order.price);
+        match_against_asks(order, result, is_limit, order.price, effective_stp);
     else
-        match_against_bids(order, result, is_limit, order.price);
+        match_against_bids(order, result, is_limit, order.price, effective_stp);
 
     if (order.type == OrderType::Limit && order.qty > 0)
         rest(order);
@@ -43,13 +94,13 @@ ExecutionResult LimitOrderBook::add(Order order) {
 }
 
 // ---------------------------------------------------------------------------
-// matching — inner loops access maker.id(0), maker.qty(8), maker.agent(12)
+// matching -- inner loops access maker.id(0), maker.qty(8), maker.agent(12)
 // all within the first 16 bytes of Order; one cache line per maker.
 // Data-driven implementation: one template, parameterized by book map & maker side.
 // Compiler specializes at instantiation time with zero overhead.
 // ---------------------------------------------------------------------------
 
-void LimitOrderBook::match_against_asks(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price) {
+void LimitOrderBook::match_against_asks(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, StpMode stp) {
     while (incoming.qty > 0 && !asks_.empty()) {
         auto it = asks_.begin();
         if (is_limit && it->first > limit_price) break;
@@ -61,6 +112,33 @@ void LimitOrderBook::match_against_asks(Order& incoming, ExecutionResult& out, b
         while (incoming.qty > 0 && level.head < level.orders.size()) {
             Order& maker = level.orders[level.head];
             if (maker.qty == 0) { ++level.head; continue; }
+
+            // Self-Trade Prevention (STP) check
+            if (incoming.agent == maker.agent && stp != StpMode::None) {
+                if (stp == StpMode::CancelPassive) {
+                    level.volume -= maker.qty;
+                    id_index_.erase(maker.id);
+                    --level.live_orders;
+                    maker.qty = 0;
+                    ++level.head;
+                    continue;
+                } else if (stp == StpMode::CancelAggressive) {
+                    incoming.qty = 0;
+                    break;
+                } else if (stp == StpMode::DecrementAndCancel) {
+                    const Qty dec = std::min(incoming.qty, maker.qty);
+                    maker.qty -= dec;
+                    level.volume -= dec;
+                    incoming.qty -= dec;
+                    if (maker.qty == 0) {
+                        id_index_.erase(maker.id);
+                        --level.live_orders;
+                        ++level.head;
+                    }
+                    if (incoming.qty == 0) break;
+                    continue;
+                }
+            }
 
             const Qty fill = std::min(incoming.qty, maker.qty);
             out.trades.push_back({maker.id, incoming.id,
@@ -82,7 +160,7 @@ void LimitOrderBook::match_against_asks(Order& incoming, ExecutionResult& out, b
     }
 }
 
-void LimitOrderBook::match_against_bids(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price) {
+void LimitOrderBook::match_against_bids(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, StpMode stp) {
     while (incoming.qty > 0 && !bids_.empty()) {
         auto it = bids_.begin();
         if (is_limit && it->first < limit_price) break;
@@ -94,6 +172,33 @@ void LimitOrderBook::match_against_bids(Order& incoming, ExecutionResult& out, b
         while (incoming.qty > 0 && level.head < level.orders.size()) {
             Order& maker = level.orders[level.head];
             if (maker.qty == 0) { ++level.head; continue; }
+
+            // Self-Trade Prevention (STP) check
+            if (incoming.agent == maker.agent && stp != StpMode::None) {
+                if (stp == StpMode::CancelPassive) {
+                    level.volume -= maker.qty;
+                    id_index_.erase(maker.id);
+                    --level.live_orders;
+                    maker.qty = 0;
+                    ++level.head;
+                    continue;
+                } else if (stp == StpMode::CancelAggressive) {
+                    incoming.qty = 0;
+                    break;
+                } else if (stp == StpMode::DecrementAndCancel) {
+                    const Qty dec = std::min(incoming.qty, maker.qty);
+                    maker.qty -= dec;
+                    level.volume -= dec;
+                    incoming.qty -= dec;
+                    if (maker.qty == 0) {
+                        id_index_.erase(maker.id);
+                        --level.live_orders;
+                        ++level.head;
+                    }
+                    if (incoming.qty == 0) break;
+                    continue;
+                }
+            }
 
             const Qty fill = std::min(incoming.qty, maker.qty);
             out.trades.push_back({maker.id, incoming.id,
@@ -168,7 +273,7 @@ void LimitOrderBook::rest(Order& order) {
 }
 
 // ---------------------------------------------------------------------------
-// cancel — O(log P): map lookup + direct tombstone via stored index, no scan.
+// cancel -- O(log P): map lookup + direct tombstone via stored index, no scan.
 // ---------------------------------------------------------------------------
 
 bool LimitOrderBook::cancel(OrderId id) {
@@ -186,6 +291,11 @@ bool LimitOrderBook::cancel(OrderId id) {
         level.volume -= o.qty;
         --level.live_orders;
         o.qty         = 0;
+        if (ref.slot == level.head) {
+            while (level.head < level.orders.size() && level.orders[level.head].qty == 0) {
+                ++level.head;
+            }
+        }
         if (level.volume == 0) book_map.erase(it);
         else maybe_compact_level(ref.side, ref.price, level);
     };
@@ -193,6 +303,27 @@ bool LimitOrderBook::cancel(OrderId id) {
     if (is_buy(ref.side)) tombstone(bids_);
     else                  tombstone(asks_);
     return true;
+}
+
+std::optional<Qty> LimitOrderBook::queue_ahead(OrderId id) const noexcept {
+    const auto idx_it = id_index_.find(id);
+    if (idx_it == id_index_.end()) return std::nullopt;
+    const OrderRef ref = idx_it->second;
+
+    auto check_ahead = [&](const auto& book_map) -> std::optional<Qty> {
+        const auto it = book_map.find(ref.price);
+        if (it == book_map.end()) return std::nullopt;
+        const Level& level = it->second;
+        if (ref.slot < level.head || ref.slot >= level.orders.size()) return std::nullopt;
+        if (level.orders[ref.slot].qty == 0) return std::nullopt;
+        Qty ahead = 0;
+        for (std::size_t i = level.head; i < ref.slot; ++i) {
+            if (level.orders[i].qty > 0) ahead += level.orders[i].qty;
+        }
+        return ahead;
+    };
+
+    return is_buy(ref.side) ? check_ahead(bids_) : check_ahead(asks_);
 }
 
 // ---------------------------------------------------------------------------

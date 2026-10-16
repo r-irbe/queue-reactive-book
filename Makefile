@@ -2,7 +2,7 @@ CXX ?= g++
 CXXSTD ?= -std=c++20
 WARN       ?= -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor
 OPT      ?= -O2 -DNDEBUG
-INCLUDES ?= -Iinclude
+INCLUDES ?= -Iinclude -Iinclude/test_shim
 PYTHON     ?= python3
 
 # --- Opt-in diagnostic / release build modes (default behavior unchanged) -----
@@ -54,7 +54,9 @@ VCPKG_INSTALLED_DIR ?= $(CURDIR)/vcpkg_installed
 VCPKG_INCLUDEDIR = $(VCPKG_INSTALLED_DIR)/$(VCPKG_TRIPLET)/include
 VCPKG_LIBDIR = $(VCPKG_INSTALLED_DIR)/$(VCPKG_TRIPLET)/lib
 
-SRC := $(wildcard src/*.cpp)
+LIB_SRC := src/flat_ladder_book.cpp src/lob.cpp
+MAIN_SRC := src/main.cpp
+SRC := $(LIB_SRC) $(MAIN_SRC)
 TEST_SRC := $(wildcard tests/*.cpp)
 BENCH_SRC := $(wildcard bench/*.cpp)
 EXAMPLE_SRC := $(wildcard examples/*.cpp)
@@ -78,10 +80,15 @@ CPPFLAGS += -isystem $(VCPKG_INCLUDEDIR)
 LDFLAGS  += -L$(VCPKG_LIBDIR)
 endif
 
+TEST_LDLIBS :=
+ifneq ($(wildcard $(VCPKG_LIBDIR)/manual-link/libCatch2Main.a),)
 TEST_LDLIBS := -L$(VCPKG_LIBDIR)/manual-link -lCatch2Main -lCatch2
-BENCH_LDLIBS := -lbenchmark
-EXAMPLE_LDLIBS :=
+endif
 
+BENCH_LDLIBS :=
+ifneq ($(wildcard $(VCPKG_LIBDIR)/libbenchmark.a),)
+BENCH_LDLIBS := -lbenchmark
+endif
 ifeq ($(UNAME_S),Linux)
 BENCH_LDLIBS += -lpthread
 endif
@@ -127,19 +134,19 @@ dirs:
 build: build-bin
 
 build-bin: dirs
-	$(call BUILD_IF_SOURCES,SRC,No src/*.cpp yet — add sources when the implementation lands.,$(COMPILE_BASE) $(SRC) -o $(BIN_RUN))
+	$(call BUILD_IF_SOURCES,LIB_SRC,No src/*.cpp yet.,$(COMPILE_BASE) $(MAIN_SRC) $(LIB_SRC) -o $(BIN_RUN))
 
 test: test-bin
 	@./$(BIN_TEST)
 
 test-bin: dirs
-	$(call BUILD_IF_SOURCES,TEST_SRC,No tests/*.cpp yet — add sources when the test suite lands.,$(COMPILE_BASE) $(TEST_SRC) $(SRC) $(TEST_LDLIBS) -o $(BIN_TEST))
+	$(call BUILD_IF_SOURCES,TEST_SRC,No tests/*.cpp yet.,$(COMPILE_BASE) $(TEST_SRC) $(LIB_SRC) $(TEST_LDLIBS) -o $(BIN_TEST))
 
 bench: bench-bin
 	@./$(BIN_BENCH)
 
 bench-bin: dirs
-	$(call BUILD_IF_SOURCES,BENCH_SRC,No bench/*.cpp yet — add sources when the benchmark suite lands.,$(COMPILE_BASE) $(BENCH_SRC) $(SRC) $(BENCH_LDLIBS) -o $(BIN_BENCH))
+	$(call BUILD_IF_SOURCES,BENCH_SRC,No bench/*.cpp yet.,$(COMPILE_BASE) $(BENCH_SRC) $(LIB_SRC) $(BENCH_LDLIBS) -o $(BIN_BENCH))
 
 # Run the suite and persist a timestamped JSON + console log + env metadata to
 # results/. Forward extra args via BENCH_ARGS="--benchmark_filter=BM_FlatLadder.*".
@@ -158,7 +165,7 @@ example: example-bin
 	@./$(BIN_EXAMPLE)
 
 example-bin: dirs
-	$(call BUILD_IF_SOURCES,EXAMPLE_SRC,No examples/*.cpp yet — add sources when examples land.,$(COMPILE_BASE) $(EXAMPLE_SRC) $(SRC) $(EXAMPLE_LDLIBS) -o $(BIN_EXAMPLE))
+	$(call BUILD_IF_SOURCES,EXAMPLE_SRC,No examples/*.cpp yet -- add sources when examples land.,$(COMPILE_BASE) $(EXAMPLE_SRC) $(SRC) $(EXAMPLE_LDLIBS) -o $(BIN_EXAMPLE))
 
 lint:
 	@chmod +x scripts/run_clang_tidy.sh

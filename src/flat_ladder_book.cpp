@@ -1,17 +1,19 @@
 #include "sim/flat_ladder_book.hpp"
+#include <algorithm>
+#include <cassert>
 #include <cstddef>
 
 namespace sim {
 namespace {
-// Sentinel for "no best price index cached". Compares != to any valid index.
+// Sentinel for "no best price index cached".
 constexpr std::size_t kNpos = std::numeric_limits<std::size_t>::max();
 } // namespace
 
 FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
                                std::size_t expected_orders,
-                               bool enable_compaction,
-                               CompactionConfig compaction_cfg,
-                               std::size_t arena_bytes)
+                               bool /*enable_compaction*/,
+                               CompactionConfig /*compaction_cfg*/,
+                               std::size_t arena_bytes) noexcept
     : arena_(arena_bytes == 0
                  ? suggest_arena_bytes(
                        expected_orders +
@@ -20,31 +22,36 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
                                                     : 0))
                  : arena_bytes,
              std::pmr::new_delete_resource()),
-      pool_(&arena_), levels_(resource()), level_side_(resource()),
-      level_bitmap_(resource()), id_refs_(resource()), id_live_(resource()),
+      pool_(&arena_), levels_(resource()), node_pool_(resource()),
+      level_side_(resource()), level_bitmap_(resource()),
+      id_refs_(resource()), id_live_(resource()),
       min_tick_(min_tick), max_tick_(max_tick),
       tick_count_(max_tick >= min_tick
                       ? static_cast<std::size_t>(max_tick - min_tick + 1)
                       : 0),
-      enable_compaction_(enable_compaction), compaction_cfg_(compaction_cfg) {
-  // Construction and test/debug invariant checks may throw; production paths
-  // return data (bool / ExecutionResult) to keep hot paths noexcept-friendly.
-  if (max_tick < min_tick) {
-    throw std::invalid_argument("FlatLadderBook: max_tick < min_tick");
+      is_valid_(max_tick >= min_tick) {
+  if (!is_valid_) {
+    return;
   }
-  levels_.reserve(tick_count_);
+  levels_.resize(tick_count_);
   level_side_.assign(tick_count_, kNoSide);
   // Bitmap: 1 bit per ladder slot; words are 64-bit so we round up.
   level_bitmap_.assign((tick_count_ + 63) / 64, 0);
-  for (std::size_t i = 0; i < tick_count_; ++i) {
-    levels_.emplace_back(resource());
-  }
-  // OrderId 0 is a reserved sentinel; live storage indexes 1..N. Reserve
-  // slot 0 so id-as-index lookups never need an off-by-one adjustment.
+
+  // Pre-reserve node pool and id index for expected orders
+  node_pool_.reserve(expected_orders);
   id_refs_.reserve(expected_orders + 1);
   id_live_.reserve(expected_orders + 1);
   id_refs_.resize(1);
   id_live_.resize(1, 0);
+}
+
+std::unique_ptr<FlatLadderBook> FlatLadderBook::create(Tick min_tick,
+                                                       Tick max_tick,
+                                                       std::size_t expected_orders,
+                                                       std::size_t arena_bytes) noexcept {
+  if (max_tick < min_tick) return nullptr;
+  return std::unique_ptr<FlatLadderBook>(new (std::nothrow) FlatLadderBook(min_tick, max_tick, expected_orders, false, {}, arena_bytes));
 }
 
 bool FlatLadderBook::has_order_ref(OrderId id) const noexcept {
@@ -89,52 +96,163 @@ Tick FlatLadderBook::price_of(std::size_t idx) const noexcept {
   return static_cast<Tick>(min_tick_ + static_cast<Tick>(idx));
 }
 
-Level &FlatLadderBook::level_at(std::size_t idx) noexcept {
+IntrusiveLevel &FlatLadderBook::level_at(std::size_t idx) noexcept {
   return levels_[idx];
 }
-const Level &FlatLadderBook::level_at(std::size_t idx) const noexcept {
+const IntrusiveLevel &FlatLadderBook::level_at(std::size_t idx) const noexcept {
   return levels_[idx];
 }
 
-// Single entry point for both Market and Limit; matching dispatch and
-// rest-residual policy diverge only by `order.type`.
-ExecutionResult FlatLadderBook::add(Order order, TimeNs ts) {
-  // Validation belongs at the boundary (here) so the inner loops stay branch-light.
+std::uint32_t FlatLadderBook::alloc_slot() {
+  if (free_head_ != kNullSlot) {
+    const std::uint32_t slot = free_head_;
+    free_head_ = node_pool_[slot].next_slot;
+    node_pool_[slot].prev_slot = kNullSlot;
+    node_pool_[slot].next_slot = kNullSlot;
+    return slot;
+  }
+  const auto slot = static_cast<std::uint32_t>(node_pool_.size());
+  node_pool_.emplace_back();
+  return slot;
+}
+
+void FlatLadderBook::free_slot(std::uint32_t slot) noexcept {
+  node_pool_[slot].id = 0;
+  node_pool_[slot].qty = 0;
+  node_pool_[slot].prev_slot = kNullSlot;
+  node_pool_[slot].next_slot = free_head_;
+  free_head_ = slot;
+}
+
+bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market) const noexcept {
+  Qty available = 0;
+  if (is_buy(side)) {
+    for (std::size_t idx = best_ask_idx_; idx != kNpos && idx < tick_count_;) {
+      if (!is_market && price_of(idx) > price) break;
+      available += levels_[idx].volume;
+      if (available >= qty) return true;
+      // Seek next ask level via bitmap
+      const std::size_t next_idx = idx + 1;
+      if (next_idx >= tick_count_) break;
+      std::size_t word = next_idx / 64;
+      const std::size_t bit = next_idx % 64;
+      const std::uint64_t mask = ~((std::uint64_t{1} << bit) - 1);
+      std::uint64_t w = level_bitmap_[word] & mask;
+      std::size_t found = kNpos;
+      for (std::size_t nw = level_bitmap_.size(); word < nw; ++word) {
+        if (w != 0) {
+          found = word * 64 + static_cast<std::size_t>(__builtin_ctzll(w));
+          break;
+        }
+        if (word + 1 < nw) w = level_bitmap_[word + 1];
+      }
+      idx = found;
+    }
+  } else {
+    for (std::size_t idx = best_bid_idx_; idx != kNpos;) {
+      if (!is_market && price_of(idx) < price) break;
+      available += levels_[idx].volume;
+      if (available >= qty) return true;
+      if (idx == 0) break;
+      const std::size_t prev_idx = idx - 1;
+      std::size_t word = prev_idx / 64;
+      const std::size_t bit = prev_idx % 64;
+      const std::uint64_t mask = (bit == 63) ? ~std::uint64_t{0} : ((std::uint64_t{1} << (bit + 1)) - 1);
+      std::uint64_t w = level_bitmap_[word] & mask;
+      std::size_t found = kNpos;
+      while (true) {
+        if (w != 0) {
+          found = word * 64 + static_cast<std::size_t>(63 - __builtin_clzll(w));
+          break;
+        }
+        if (word == 0) break;
+        --word;
+        w = level_bitmap_[word];
+      }
+      idx = found;
+    }
+  }
+  return available >= qty;
+}
+
+ExecutionResult FlatLadderBook::add(Order order, TimeNs ts, StpMode stp) {
   book_time_ = ts;
   order.id = next_id_++;
   order.orig_qty = order.qty;
-  const bool is_limit = (order.type == OrderType::Limit);
+  const StpMode effective_stp = (stp != StpMode::None)
+                                    ? stp
+                                    : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
 
   ExecutionResult result;
-  // Heuristic reserve: avoids small grow-resizes in common crosses; measured
-  // maker-count and latency-tail evidence is still benchmark/replay gated.
   result.trades.reserve(8);
 
-  if (is_buy(order.side)) {
-    if (is_limit) match_incoming<Side::Buy,  true >(order, result, order.price, ts);
-    else          match_incoming<Side::Buy,  false>(order, result, order.price, ts);
-  } else {
-    if (is_limit) match_incoming<Side::Sell, true >(order, result, order.price, ts);
-    else          match_incoming<Side::Sell, false>(order, result, order.price, ts);
+  // 1. Post-Only Pre-flight Check:
+  // Must rest passively as a maker; if it would cross the spread, reject immediately.
+  if (order.type == OrderType::PostOnly) {
+    if (is_buy(order.side)) {
+      if (best_ask_idx_ != kNpos && price_of(best_ask_idx_) <= order.price) {
+        result.remaining = 0;
+        result.filled = 0;
+        ++event_count_;
+        return result;
+      }
+    } else {
+      if (best_bid_idx_ != kNpos && price_of(best_bid_idx_) >= order.price) {
+        result.remaining = 0;
+        result.filled = 0;
+        ++event_count_;
+        return result;
+      }
+    }
+    if (in_range(order.price)) {
+      rest(order);
+    }
+    result.remaining = order.qty;
+    result.filled = 0;
+    ++event_count_;
+    return result;
   }
 
-  if (is_limit && order.qty > 0 && in_range(order.price)) {
+  // 2. Fill-Or-Kill (FOK) Pre-flight Liquidity Check:
+  if (order.type == OrderType::FOK) {
+    if (!can_fill_fok(order.side, order.price, order.qty, false)) {
+      result.remaining = 0;
+      result.filled = 0;
+      ++event_count_;
+      return result;
+    }
+  }
+
+  // 3. Matching Dispatch:
+  const bool is_limit = (order.type == OrderType::Limit ||
+                         order.type == OrderType::IOC ||
+                         order.type == OrderType::FOK);
+
+  if (is_buy(order.side)) {
+    if (is_limit) match_incoming<Side::Buy,  true >(order, result, order.price, ts, effective_stp);
+    else          match_incoming<Side::Buy,  false>(order, result, order.price, ts, effective_stp);
+  } else {
+    if (is_limit) match_incoming<Side::Sell, true >(order, result, order.price, ts, effective_stp);
+    else          match_incoming<Side::Sell, false>(order, result, order.price, ts, effective_stp);
+  }
+
+  // 4. Residual Resting Policy:
+  // Standard Limit rests if unfilled and in-range.
+  // Market, IOC, and FOK NEVER rest any remaining quantity.
+  if (order.type == OrderType::Limit && order.qty > 0 && in_range(order.price)) {
     rest(order);
   }
 
   result.remaining = order.qty;
   result.filled = order.orig_qty - order.qty;
-  ++event_count_; // cheap public health metric; never used on the hot path itself.
+  ++event_count_;
   return result;
 }
 
-// Match `incoming` against the opposite side. All side- and limit-specific
-// logic resolves at compile time via `if constexpr`; the body is identical
-// otherwise to avoid divergence bugs between buy/sell and limit/market paths.
 template <Side TakerSide, bool IsLimit>
 [[gnu::hot]]
 void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
-                                    Tick limit_price, TimeNs ts) {
+                                    Tick limit_price, TimeNs ts, StpMode stp) {
   constexpr bool kBuy = (TakerSide == Side::Buy);
 
   while (incoming.qty > 0) {
@@ -150,17 +268,56 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
       }
     }
 
-    Level &level = level_at(idx);
-    while (level.head < level.orders.size() &&
-           level.orders[level.head].qty == 0) {
-      ++level.head;
-    }
+    IntrusiveLevel &level = level_at(idx);
 
-    while (incoming.qty > 0 && level.head < level.orders.size()) {
-      Order &maker = level.orders[level.head];
-      if (maker.qty == 0) {
-        ++level.head;
-        continue;
+    while (incoming.qty > 0 && level.head_slot != kNullSlot) {
+      const std::uint32_t slot = level.head_slot;
+      IntrusiveOrderNode &maker = node_pool_[slot];
+
+      // Self-Trade Prevention (STP) check
+      if (incoming.agent == maker.agent && stp != StpMode::None) {
+        if (stp == StpMode::CancelPassive) {
+          const Qty c_qty = maker.qty;
+          level.volume -= c_qty;
+          if constexpr (kBuy) total_ask_vol_ -= c_qty;
+          else                total_bid_vol_ -= c_qty;
+
+          clear_order_ref(maker.id);
+          --level.live_orders;
+
+          level.head_slot = maker.next_slot;
+          if (level.head_slot != kNullSlot) {
+            node_pool_[level.head_slot].prev_slot = kNullSlot;
+          } else {
+            level.tail_slot = kNullSlot;
+          }
+          free_slot(slot);
+          continue;
+        } else if (stp == StpMode::CancelAggressive) {
+          incoming.qty = 0;
+          break;
+        } else if (stp == StpMode::DecrementAndCancel) {
+          const Qty dec = std::min(incoming.qty, maker.qty);
+          maker.qty -= dec;
+          level.volume -= dec;
+          incoming.qty -= dec;
+          if constexpr (kBuy) total_ask_vol_ -= dec;
+          else                total_bid_vol_ -= dec;
+
+          if (maker.qty == 0) {
+            clear_order_ref(maker.id);
+            --level.live_orders;
+            level.head_slot = maker.next_slot;
+            if (level.head_slot != kNullSlot) {
+              node_pool_[level.head_slot].prev_slot = kNullSlot;
+            } else {
+              level.tail_slot = kNullSlot;
+            }
+            free_slot(slot);
+          }
+          if (incoming.qty == 0) break;
+          continue;
+        }
       }
 
       const Qty fill = std::min(incoming.qty, maker.qty);
@@ -172,21 +329,28 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
                                  .price      = maker_price,
                                  .qty        = fill,
                                  .ts         = ts});
-      maker.qty       -= fill;
-      level.volume    -= fill;
-      incoming.qty    -= fill;
+      maker.qty    -= fill;
+      level.volume -= fill;
+      incoming.qty -= fill;
       if constexpr (kBuy) total_ask_vol_ -= fill;
       else                total_bid_vol_ -= fill;
 
       if (maker.qty == 0) {
         clear_order_ref(maker.id);
         --level.live_orders;
-        ++level.head;
+        level.head_slot = maker.next_slot;
+        if (level.head_slot != kNullSlot) {
+          node_pool_[level.head_slot].prev_slot = kNullSlot;
+        } else {
+          level.tail_slot = kNullSlot;
+        }
+        free_slot(slot);
       }
     }
 
     if (level.volume == 0) {
-      level.head = 0;
+      level.head_slot = kNullSlot;
+      level.tail_slot = kNullSlot;
       level_side_[idx] = kNoSide;
       clear_level_occupied(idx);
       if constexpr (kBuy) {
@@ -194,69 +358,42 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
       } else {
         refresh_best_bid_from(idx == 0 ? kNpos : idx - 1);
       }
-    } else {
-      maybe_compact_level(idx, level);
     }
   }
 }
 
-// Explicit instantiations — keeps the template body in this TU.
-// 4 = Side(Buy/Sell) × IsLimit(true/false).
-template void FlatLadderBook::match_incoming<Side::Buy,  true >(Order &, ExecutionResult &, Tick, TimeNs);
-template void FlatLadderBook::match_incoming<Side::Buy,  false>(Order &, ExecutionResult &, Tick, TimeNs);
-template void FlatLadderBook::match_incoming<Side::Sell, true >(Order &, ExecutionResult &, Tick, TimeNs);
-template void FlatLadderBook::match_incoming<Side::Sell, false>(Order &, ExecutionResult &, Tick, TimeNs);
-
-// Compaction is independent of order time; it rewrites a level's storage
-// in-place when tombstone density crosses configured thresholds.
-void FlatLadderBook::maybe_compact_level(std::size_t idx, Level &level) {
-  if (!enable_compaction_)
-    return;
-
-  const std::size_t total = level.orders.size();
-  const std::size_t live = level.live_orders;
-  const std::size_t dead = total - live;
-  const CompactionConfig &cfg = compaction_cfg_;
-
-  if (total < cfg.total_min)
-    return;
-  if (dead < cfg.dead_min)
-    return;
-  if (dead * cfg.dead_den < total * cfg.dead_num)
-    return;
-
-  std::pmr::vector<Order> compacted(resource());
-  compacted.reserve(live);
-
-  std::uint32_t next_idx = 0;
-  for (std::size_t i = level.head; i < total; ++i) {
-    Order &o = level.orders[i];
-    if (o.qty <= 0)
-      continue;
-    compacted.push_back(std::move(o));
-    set_order_ref(compacted.back().id,
-                  {compacted.back().side, 0, static_cast<std::uint32_t>(idx),
-                   next_idx++});
-  }
-
-  level.orders.swap(compacted);
-  level.head = 0;
-}
+template void FlatLadderBook::match_incoming<Side::Buy,  true >(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
+template void FlatLadderBook::match_incoming<Side::Buy,  false>(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
+template void FlatLadderBook::match_incoming<Side::Sell, true >(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
+template void FlatLadderBook::match_incoming<Side::Sell, false>(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
 
 void FlatLadderBook::rest(Order &order) {
   order.enqueue_ts = book_time_;
   const std::size_t idx = index_of(order.price);
-  Level &level = level_at(idx);
-  if (level.orders.empty())
-    level.orders.reserve(8);
+  IntrusiveLevel &level = level_at(idx);
 
-  const std::uint32_t slot = static_cast<std::uint32_t>(level.orders.size());
-  level.push(order);
+  const std::uint32_t slot = alloc_slot();
+  IntrusiveOrderNode &node = node_pool_[slot];
+  node.id = order.id;
+  node.enqueue_ts = order.enqueue_ts;
+  node.qty = order.qty;
+  node.agent = order.agent;
+  node.prev_slot = level.tail_slot;
+  node.next_slot = kNullSlot;
+
+  if (level.tail_slot != kNullSlot) {
+    node_pool_[level.tail_slot].next_slot = slot;
+  } else {
+    level.head_slot = slot;
+  }
+  level.tail_slot = slot;
+
+  ++level.live_orders;
   level.volume += order.qty;
   level_side_[idx] = side_tag(order.side);
   mark_level_occupied(idx);
-  set_order_ref(order.id,
-                {order.side, 0, static_cast<std::uint32_t>(idx), slot});
+
+  set_order_ref(order.id, {order.side, 0, static_cast<std::uint32_t>(idx), slot});
 
   if (is_buy(order.side)) {
     total_bid_vol_ += order.qty;
@@ -273,34 +410,65 @@ bool FlatLadderBook::cancel(OrderId id, TimeNs ts) {
   book_time_ = ts;
   if (!has_order_ref(id)) [[unlikely]]
     return false;
+
   const OrderRef ref = get_order_ref(id);
-  // No id-index erase needed: out-of-band orders never rest, so we never have
-  // a stray ref to an unbacked level.
   clear_order_ref(id);
+
   const std::size_t level_idx = ref.level_idx;
-  const std::size_t slot = ref.slot;
-  Level &level = level_at(level_idx);
-  Order &o = level.orders[slot];
-  const Qty cancelled_qty = o.qty;
+  const std::uint32_t slot = ref.slot;
+  IntrusiveLevel &level = level_at(level_idx);
+  IntrusiveOrderNode &node = node_pool_[slot];
+
+  const Qty cancelled_qty = node.qty;
   level.volume -= cancelled_qty;
   if (is_buy(ref.side)) total_bid_vol_ -= cancelled_qty;
   else                  total_ask_vol_ -= cancelled_qty;
   --level.live_orders;
-  o.qty = 0;
+
+  // True O(1) unlinking in intrusive doubly-linked list
+  if (node.prev_slot != kNullSlot) {
+    node_pool_[node.prev_slot].next_slot = node.next_slot;
+  } else {
+    level.head_slot = node.next_slot;
+  }
+
+  if (node.next_slot != kNullSlot) {
+    node_pool_[node.next_slot].prev_slot = node.prev_slot;
+  } else {
+    level.tail_slot = node.prev_slot;
+  }
+
+  free_slot(slot);
 
   if (level.volume == 0) {
-    level.head = 0;
+    level.head_slot = kNullSlot;
+    level.tail_slot = kNullSlot;
     level_side_[level_idx] = kNoSide;
     clear_level_occupied(level_idx);
     if (is_buy(ref.side) && best_bid_idx_ == level_idx)
       refresh_best_bid_from(level_idx == 0 ? kNpos : level_idx - 1);
     if (is_sell(ref.side) && best_ask_idx_ == level_idx)
       refresh_best_ask_from(level_idx + 1);
-  } else {
-    maybe_compact_level(level_idx, level);
   }
+
   ++event_count_;
   return true;
+}
+
+std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
+  if (!has_order_ref(id)) return std::nullopt;
+  const OrderRef ref = get_order_ref(id);
+  if (ref.level_idx >= tick_count_) return std::nullopt;
+  const IntrusiveLevel &lvl = levels_[ref.level_idx];
+  const std::uint32_t target_slot = ref.slot;
+  if (target_slot >= node_pool_.size()) return std::nullopt;
+  if (node_pool_[target_slot].qty == 0) return std::nullopt;
+
+  Qty ahead = 0;
+  for (std::uint32_t curr = lvl.head_slot; curr != kNullSlot && curr != target_slot; curr = node_pool_[curr].next_slot) {
+    ahead += node_pool_[curr].qty;
+  }
+  return ahead;
 }
 
 bool FlatLadderBook::best_bid(Tick &price, Qty &volume) const noexcept {
@@ -317,7 +485,6 @@ bool FlatLadderBook::best_ask(Tick &price, Qty &volume) const noexcept {
   return true;
 }
 
-// Integer mid × 2 for the hot path. No FP, fully deterministic.
 bool FlatLadderBook::mid_tick_x2(Tick &sum) const noexcept {
   if (best_bid_idx_ == kNpos || best_ask_idx_ == kNpos) [[unlikely]]
     return false;
@@ -329,11 +496,11 @@ Qty FlatLadderBook::volume_at(Side side, Tick price) const noexcept {
   if (!in_range(price))
     return 0;
   const std::size_t idx = index_of(price);
-  const Level &level = level_at(idx);
+  const IntrusiveLevel &level = level_at(idx);
   return level_side_[idx] == side_tag(side) ? level.volume : 0;
 }
 
-bool FlatLadderBook::mid_price(double &price) const {
+bool FlatLadderBook::mid_price(double &price) const noexcept {
   Tick bb = 0;
   Tick ba = 0;
   Qty  bv = 0;
@@ -343,13 +510,12 @@ bool FlatLadderBook::mid_price(double &price) const {
   return true;
 }
 
-std::vector<BookLevelView> FlatLadderBook::levels(Side side,
-                                                  std::size_t depth) const {
+std::vector<BookLevelView> FlatLadderBook::levels(Side side, std::size_t depth) const {
   std::vector<BookLevelView> out;
   if (side == Side::Buy) {
     const std::uint8_t tag = kBuySide;
     for (std::size_t i = best_bid_idx_; i != kNpos;) {
-      const Level &level = level_at(i);
+      const IntrusiveLevel &level = level_at(i);
       if (!level.empty() && level_side_[i] == tag)
         out.push_back({price_of(i), level.volume, level.live_orders});
       if (depth > 0 && out.size() >= depth)
@@ -361,7 +527,7 @@ std::vector<BookLevelView> FlatLadderBook::levels(Side side,
   } else {
     const std::uint8_t tag = kSellSide;
     for (std::size_t i = best_ask_idx_; i != kNpos && i < tick_count_; ++i) {
-      const Level &level = level_at(i);
+      const IntrusiveLevel &level = level_at(i);
       if (!level.empty() && level_side_[i] == tag)
         out.push_back({price_of(i), level.volume, level.live_orders});
       if (depth > 0 && out.size() >= depth)
@@ -371,75 +537,85 @@ std::vector<BookLevelView> FlatLadderBook::levels(Side side,
   return out;
 }
 
-// True when both sides are empty (no cached best on either side).
 bool FlatLadderBook::is_empty() const noexcept {
   return best_bid_idx_ == kNpos && best_ask_idx_ == kNpos;
 }
 
-// O(N + sum(level.orders)). Test/debug only — never invoked on the hot path.
-// Walks each level once, validating per-level qty/live counts and overall
-// totals/cached bests against the running state.
-void FlatLadderBook::check_invariants() const {
+InvariantReport FlatLadderBook::check_invariants_report() const noexcept {
   Qty bid_sum = 0;
   Qty ask_sum = 0;
   std::size_t live_sum = 0;
-  std::size_t observed_best_bid = kNpos; // highest bid index seen
-  std::size_t observed_best_ask = kNpos; // lowest ask index seen
+  std::size_t observed_best_bid = kNpos;
+  std::size_t observed_best_ask = kNpos;
 
   for (std::size_t i = 0; i < tick_count_; ++i) {
-    const Level &level = level_at(i);
+    const IntrusiveLevel &level = level_at(i);
     Qty qty_sum = 0;
     std::uint32_t live = 0;
-    for (std::size_t k = level.head; k < level.orders.size(); ++k) {
-      const Order &o = level.orders[k];
-      if (o.qty > 0) {
-        qty_sum += o.qty;
-        ++live;
+
+    for (std::uint32_t curr = level.head_slot; curr != kNullSlot; curr = node_pool_[curr].next_slot) {
+      const IntrusiveOrderNode &node = node_pool_[curr];
+      if (node.qty <= 0) {
+        return InvariantReport{false, "flat: intrusive node with non-positive qty found (tombstone violation)"};
+      }
+      qty_sum += node.qty;
+      ++live;
+      if (live > live_order_count_ + 1) {
+        return InvariantReport{false, "flat: cycle detected in intrusive slotmap"};
       }
     }
+
     if (qty_sum != level.volume)
-      throw std::logic_error("flat: level volume mismatch");
+      return InvariantReport{false, "flat: level volume mismatch"};
     if (live != level.live_orders)
-      throw std::logic_error("flat: level live_orders mismatch");
+      return InvariantReport{false, "flat: level live_orders mismatch"};
 
     const std::uint8_t tag = level_side_[i];
     const bool bit_set = (level_bitmap_[i / 64] & (std::uint64_t{1} << (i % 64))) != 0;
     if (qty_sum == 0) {
       if (tag != kNoSide)
-        throw std::logic_error("flat: empty level with side tag set");
+        return InvariantReport{false, "flat: empty level with side tag set"};
       if (bit_set)
-        throw std::logic_error("flat: empty level with bitmap bit set");
+        return InvariantReport{false, "flat: empty level with bitmap bit set"};
       continue;
     }
     if (!bit_set)
-      throw std::logic_error("flat: non-empty level missing bitmap bit");
+      return InvariantReport{false, "flat: non-empty level missing bitmap bit"};
     if (tag == kBuySide) {
       bid_sum += qty_sum;
-      observed_best_bid = i; // last seen wins -> highest index
+      observed_best_bid = i;
     } else if (tag == kSellSide) {
       ask_sum += qty_sum;
-      if (observed_best_ask == kNpos) observed_best_ask = i; // first seen -> lowest
+      if (observed_best_ask == kNpos) observed_best_ask = i;
     } else {
-      throw std::logic_error("flat: non-empty level missing side tag");
+      return InvariantReport{false, "flat: non-empty level missing side tag"};
     }
     live_sum += live;
   }
 
   if (bid_sum != total_bid_vol_)
-    throw std::logic_error("flat: total bid volume mismatch");
+    return InvariantReport{false, "flat: total bid volume mismatch"};
   if (ask_sum != total_ask_vol_)
-    throw std::logic_error("flat: total ask volume mismatch");
+    return InvariantReport{false, "flat: total ask volume mismatch"};
   if (live_sum != live_order_count_)
-    throw std::logic_error("flat: live order count mismatch");
+    return InvariantReport{false, "flat: live order count mismatch"};
   if (observed_best_bid != best_bid_idx_)
-    throw std::logic_error("flat: best_bid_idx out of sync");
+    return InvariantReport{false, "flat: best_bid_idx out of sync"};
   if (observed_best_ask != best_ask_idx_)
-    throw std::logic_error("flat: best_ask_idx out of sync");
+    return InvariantReport{false, "flat: best_ask_idx out of sync"};
   if (best_bid_idx_ != kNpos && best_ask_idx_ != kNpos &&
       best_bid_idx_ >= best_ask_idx_)
-    throw std::logic_error("flat: crossed book");
+    return InvariantReport{false, "flat: crossed book"};
+
+  return InvariantReport{true, "ok"};
 }
-// O(N/64) bitmap-accelerated highest-set-bit search at or below `start`.
+
+void FlatLadderBook::check_invariants() const noexcept {
+  const auto report = check_invariants_report();
+  (void)report;
+  assert(report.ok && report.message);
+}
+
 void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
   if (tick_count_ == 0 || start == kNpos) {
     best_bid_idx_ = kNpos;
@@ -448,7 +624,6 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
   const std::size_t clamped = std::min(start, tick_count_ - 1);
   std::size_t word = clamped / 64;
   const std::size_t bit_in_word = clamped % 64;
-  // Mask off bits above `bit_in_word` in the starting word.
   const std::uint64_t head_mask = (bit_in_word == 63)
                                       ? ~std::uint64_t{0}
                                       : ((std::uint64_t{1} << (bit_in_word + 1)) - 1);
@@ -466,7 +641,6 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
   best_bid_idx_ = kNpos;
 }
 
-// O(N/64) bitmap-accelerated lowest-set-bit search at or above `start`.
 void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
   if (start >= tick_count_) {
     best_ask_idx_ = kNpos;
@@ -474,7 +648,6 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
   }
   std::size_t word = start / 64;
   const std::size_t bit_in_word = start % 64;
-  // Mask off bits below `bit_in_word` in the starting word.
   const std::uint64_t tail_mask = ~((std::uint64_t{1} << bit_in_word) - 1);
   std::uint64_t w = level_bitmap_[word] & tail_mask;
   const std::size_t nwords = level_bitmap_.size();
@@ -483,7 +656,6 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
       const int lo = __builtin_ctzll(w);
       best_ask_idx_ = word * 64 + static_cast<std::size_t>(lo);
       if (best_ask_idx_ >= tick_count_) [[unlikely]] {
-        // Trailing bits beyond ladder — should never trigger if invariants hold.
         best_ask_idx_ = kNpos;
       }
       return;

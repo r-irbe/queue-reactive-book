@@ -61,7 +61,7 @@ struct Level {
 // Complexity:
 //   add (no cross):  O(log P)      P = distinct price levels
 //   add (full cross):O(log P + F)  F = number of fills
-//   cancel:          O(log P)      direct index — no per-level scan
+//   cancel:          O(log P)      direct index -- no per-level scan
 //   best_bid/ask:    O(1)
 //   volume_at:       O(log P)
 //
@@ -70,7 +70,7 @@ struct Level {
 //   - No crossed book when both sides are non-empty.
 //   - level.volume == sum of live qty in that level.
 //
-// Not implemented: self-trade prevention, hidden/iceberg orders, post-only.
+// Supports Self-Trade Prevention (STP) policies and ground-truth L3 queue position.
 class LimitOrderBook {
 public:
     // Pre-reserve id-index for estimated peak live order count.
@@ -81,10 +81,18 @@ public:
 
     // Submit an order. Book assigns OrderId. Market orders drop unfilled
     // remainder; limit orders rest if not fully filled.
-    ExecutionResult add(Order order);
+    // Supports explicit or per-order Self-Trade Prevention (STP).
+    ExecutionResult add(Order order, StpMode stp = StpMode::None);
 
-    // Cancel by id. O(log P) — direct tombstone, no level scan.
+    // Cancel by id. O(log P) -- direct tombstone, no level scan.
     bool cancel(OrderId id);
+
+    void set_default_stp_mode(StpMode mode) noexcept { default_stp_mode_ = mode; }
+    StpMode default_stp_mode() const noexcept { return default_stp_mode_; }
+
+    // Ground-truth L3 FIFO queue position: returns resting volume ahead of `id` at its price level.
+    // Returns std::nullopt if the order is not found, not live, or already fully filled/cancelled.
+    std::optional<Qty> queue_ahead(OrderId id) const noexcept;
 
     void   set_time(TimeNs t) noexcept { book_time_ = t; }
     TimeNs time()             const noexcept { return book_time_; }
@@ -125,15 +133,16 @@ private:
     TimeNs  book_time_ = 0;
     bool    enable_compaction_ = true;
     CompactionConfig compaction_cfg_{};
+    StpMode default_stp_mode_ = StpMode::None;
 
     std::pmr::memory_resource* resource() noexcept { return &pool_; }
     const std::pmr::memory_resource* resource() const noexcept { return &pool_; }
 
     template <typename BookMap>
-    void match_with_side(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, BookMap& book, Side incoming_side);
+    void match_with_side(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, BookMap& book, Side incoming_side, StpMode stp);
     
-    void match_against_asks(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price);
-    void match_against_bids(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price);
+    void match_against_asks(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, StpMode stp);
+    void match_against_bids(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, StpMode stp);
     void maybe_compact_level(Side side, Tick price, Level& level);
     void rest(Order& order);
 };

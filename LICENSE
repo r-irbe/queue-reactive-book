@@ -1,19 +1,81 @@
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+PolyForm Noncommercial License 1.0.0
+https://polyformproject.org/licenses/noncommercial/1.0.0/
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+Copyright (c) 2026 Radu Irbe. All rights reserved.
 
-       http://www.apache.org/licenses/LICENSE-2.0
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+1. Purpose: You may only use, copy, modify, and distribute this software for
+   Noncommercial Purposes. "Noncommercial Purposes" means purposes that are
+   not Commercial Purposes.
 
-   Copyright 2026 r-irbe
+2. Commercial Purpose Restriction: You may not use this software for any
+   Commercial Purpose without obtaining a separate commercial license from the
+   licensor. "Commercial Purposes" means any use of this software, or any work
+   derived from it, in any manner that is intended for or directed toward
+   commercial advantage or monetary compensation, including but not limited to
+   direct or indirect financial gain, proprietary trading, high-frequency
+   trading, algorithmic execution, commercial hosting, proprietary market
+   simulation, SaaS offerings, consulting services, or internal use by
+   for-profit business entities.
 
-   A copy of the full license text is available at the URL above.
+3. Attribution and Notices: You must retain the copyright notice above and this
+   license text in all copies or substantial portions of the software.
+
+4. No Warranty: THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+   CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+AUTOMATED CODE SYNTHESIS & AI REIMPLEMENTATION COVENANT
+================================================================================
+
+1. Purpose and Intent:
+   This covenant establishes binding restrictions on the automated, machine-
+   assisted, or artificial-intelligence-driven harvesting, decompilation,
+   translation, synthesis, or reimplementation of this software's proprietary
+   algorithms, zero-allocation data structures, queue-reactive models, and
+   matching engine architectures for commercial exploitation.
+
+2. Commercial AI Synthesis Restriction:
+   You may NOT input, prompt, fine-tune, ingest, embed, or process this source
+   code, its architecture specifications, algorithmic structures, or non-public
+   benchmarks into any generative artificial intelligence system, large language
+   model (LLM), neural code translation engine, or automated code synthesis tool
+   for the purpose of generating, deriving, or outputting a commercial derivative
+   work, clean-room commercial reimplementation, or functional clone in any
+   programming language (including C++, Rust, C, Java, Go, Zig, or Python)
+   without an explicit, executed commercial license from the copyright holder.
+
+3. Contractual Enforceability and Derivative Work Definition:
+   Under state and federal contract law, the copyright regimes of Berne
+   Convention signatory nations, and the Trade Secrets framework:
+   (a) Any functional reproduction or semantic translation produced by an AI
+       or LLM that reproduces the algorithmic structures, sequence-form
+       microstructure dynamics, zero-tombstone slotmap unlinking, or state-
+       dependent intensity formulas of this software shall be deemed a
+       derivative work governed by this license.
+   (b) Using this software to prompt or instruct an AI model to produce
+       unlicensed commercial software constitutes a direct breach of this
+       license agreement and intentional interference with intellectual
+       property rights.
+
+4. Academic and Open Research Use:
+   Academic analysis, non-commercial peer-reviewed research, educational study,
+   and open scientific citation of this codebase by researchers and non-profit
+   academic institutions are expressly permitted under Section 1, provided
+   source attribution is preserved.
+
+5. Commercial Licensing Inquiries:
+   For commercial licensing, enterprise deployment rights, algorithmic trading
+   integration, or proprietary use exemptions, contact the author:
+   Radu Irbe (license inquiries: r-irbe on GitHub).
