@@ -46,32 +46,22 @@ inline OfiSample make_ofi_sample(const BookObservables& prev,
     OfiSample out{};
     out.seq = curr.seq;
     out.ts = curr.ts;
-    out.has_bid = prev.has_bid && curr.has_bid;
-    out.has_ask = prev.has_ask && curr.has_ask;
-    out.censored = !out.has_bid || !out.has_ask;
+    out.has_bid = prev.has_bid & curr.has_bid;
+    out.has_ask = prev.has_ask & curr.has_ask;
+    out.censored = !(out.has_bid & out.has_ask);
 
-    if (out.has_bid) {
-        const std::int64_t qb = curr.best_bid_qty;
-        const std::int64_t qb_prev = prev.best_bid_qty;
-        if (curr.best_bid > prev.best_bid) {
-            out.bid_term = qb;
-        } else if (curr.best_bid == prev.best_bid) {
-            out.bid_term = qb - qb_prev;
-        } else {
-            out.bid_term = -qb_prev;
-        }
-    }
-    if (out.has_ask) {
-        const std::int64_t qa = curr.best_ask_qty;
-        const std::int64_t qa_prev = prev.best_ask_qty;
-        if (curr.best_ask > prev.best_ask) {
-            out.ask_term = qa_prev;
-        } else if (curr.best_ask == prev.best_ask) {
-            out.ask_term = -(qa - qa_prev);
-        } else {
-            out.ask_term = -qa;
-        }
-    }
+    const std::int64_t qb = curr.best_bid_qty;
+    const std::int64_t qb_prev = prev.best_bid_qty;
+    const std::int64_t bid_val = qb * (curr.best_bid >= prev.best_bid) -
+                                 qb_prev * (curr.best_bid <= prev.best_bid);
+    out.bid_term = bid_val * out.has_bid;
+
+    const std::int64_t qa = curr.best_ask_qty;
+    const std::int64_t qa_prev = prev.best_ask_qty;
+    const std::int64_t ask_val = qa_prev * (curr.best_ask >= prev.best_ask) -
+                                 qa * (curr.best_ask <= prev.best_ask);
+    out.ask_term = ask_val * out.has_ask;
+
     out.ofi = out.bid_term + out.ask_term;
     return out;
 }

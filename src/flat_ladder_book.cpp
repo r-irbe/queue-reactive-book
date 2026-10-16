@@ -85,7 +85,7 @@ OrderRef FlatLadderBook::get_order_ref(OrderId id) const noexcept {
 }
 
 bool FlatLadderBook::in_range(Tick price) const noexcept {
-  return tick_count_ > 0 && price >= min_tick_ && price <= max_tick_;
+  return (tick_count_ > 0) & (price >= min_tick_) & (price <= max_tick_);
 }
 
 std::size_t FlatLadderBook::index_of(Tick price) const noexcept {
@@ -134,14 +134,14 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       // Seek next ask level via bitmap
       const std::size_t next_idx = idx + 1;
       if (next_idx >= tick_count_) break;
-      std::size_t word = next_idx / 64;
-      const std::size_t bit = next_idx % 64;
-      const std::uint64_t mask = ~((std::uint64_t{1} << bit) - 1);
+      std::size_t word = next_idx >> 6;
+      const std::size_t bit = next_idx & 63;
+      const std::uint64_t mask = (~std::uint64_t{0}) << bit;
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
       for (std::size_t nw = level_bitmap_.size(); word < nw; ++word) {
         if (w != 0) {
-          found = word * 64 + static_cast<std::size_t>(__builtin_ctzll(w));
+          found = (word << 6) + static_cast<std::size_t>(__builtin_ctzll(w));
           break;
         }
         if (word + 1 < nw) w = level_bitmap_[word + 1];
@@ -155,14 +155,14 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       if (available >= qty) return true;
       if (idx == 0) break;
       const std::size_t prev_idx = idx - 1;
-      std::size_t word = prev_idx / 64;
-      const std::size_t bit = prev_idx % 64;
-      const std::uint64_t mask = (bit == 63) ? ~std::uint64_t{0} : ((std::uint64_t{1} << (bit + 1)) - 1);
+      std::size_t word = prev_idx >> 6;
+      const std::size_t bit = prev_idx & 63;
+      const std::uint64_t mask = (~std::uint64_t{0}) >> (63 - bit);
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
       while (true) {
         if (w != 0) {
-          found = word * 64 + static_cast<std::size_t>(63 - __builtin_clzll(w));
+          found = (word << 6) + static_cast<std::size_t>(63 - __builtin_clzll(w));
           break;
         }
         if (word == 0) break;
@@ -279,8 +279,8 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
         if (stp == StpMode::CancelPassive) {
           const Qty c_qty = maker.qty;
           level.volume -= c_qty;
-          if constexpr (kBuy) total_ask_vol_ -= c_qty;
-          else                total_bid_vol_ -= c_qty;
+          constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
+          total_vol_[kOppositeSide] -= c_qty;
 
           clear_order_ref(maker.id);
           --level.live_orders;
@@ -301,8 +301,8 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
           maker.qty -= dec;
           level.volume -= dec;
           incoming.qty -= dec;
-          if constexpr (kBuy) total_ask_vol_ -= dec;
-          else                total_bid_vol_ -= dec;
+          constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
+          total_vol_[kOppositeSide] -= dec;
 
           if (maker.qty == 0) {
             clear_order_ref(maker.id);
@@ -332,8 +332,8 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
       maker.qty    -= fill;
       level.volume -= fill;
       incoming.qty -= fill;
-      if constexpr (kBuy) total_ask_vol_ -= fill;
-      else                total_bid_vol_ -= fill;
+      constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
+      total_vol_[kOppositeSide] -= fill;
 
       if (maker.qty == 0) {
         clear_order_ref(maker.id);
@@ -395,12 +395,11 @@ void FlatLadderBook::rest(Order &order) {
 
   set_order_ref(order.id, {order.side, 0, static_cast<std::uint32_t>(idx), slot});
 
+  total_vol_[static_cast<std::uint8_t>(order.side) & 1] += order.qty;
   if (is_buy(order.side)) {
-    total_bid_vol_ += order.qty;
     if (best_bid_idx_ == kNpos || idx > best_bid_idx_)
       best_bid_idx_ = idx;
   } else {
-    total_ask_vol_ += order.qty;
     if (best_ask_idx_ == kNpos || idx < best_ask_idx_)
       best_ask_idx_ = idx;
   }
@@ -421,8 +420,7 @@ bool FlatLadderBook::cancel(OrderId id, TimeNs ts) {
 
   const Qty cancelled_qty = node.qty;
   level.volume -= cancelled_qty;
-  if (is_buy(ref.side)) total_bid_vol_ -= cancelled_qty;
-  else                  total_ask_vol_ -= cancelled_qty;
+  total_vol_[static_cast<std::uint8_t>(ref.side) & 1] -= cancelled_qty;
   --level.live_orders;
 
   // True O(1) unlinking in intrusive doubly-linked list
@@ -472,32 +470,36 @@ std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
 }
 
 bool FlatLadderBook::best_bid(Tick &price, Qty &volume) const noexcept {
-  if (best_bid_idx_ == kNpos) [[unlikely]] return false;
-  price = price_of(best_bid_idx_);
-  volume = volume_at(Side::Buy, price);
-  return true;
+  const bool has = (best_bid_idx_ != kNpos);
+  const std::size_t idx = has ? best_bid_idx_ : 0;
+  price = price_of(idx);
+  volume = levels_[idx].volume * has;
+  return has;
 }
 
 bool FlatLadderBook::best_ask(Tick &price, Qty &volume) const noexcept {
-  if (best_ask_idx_ == kNpos) [[unlikely]] return false;
-  price = price_of(best_ask_idx_);
-  volume = volume_at(Side::Sell, price);
-  return true;
+  const bool has = (best_ask_idx_ != kNpos);
+  const std::size_t idx = has ? best_ask_idx_ : 0;
+  price = price_of(idx);
+  volume = levels_[idx].volume * has;
+  return has;
 }
 
 bool FlatLadderBook::mid_tick_x2(Tick &sum) const noexcept {
-  if (best_bid_idx_ == kNpos || best_ask_idx_ == kNpos) [[unlikely]]
-    return false;
-  sum = static_cast<Tick>(price_of(best_bid_idx_) + price_of(best_ask_idx_));
-  return true;
+  const bool has_bid = (best_bid_idx_ != kNpos);
+  const bool has_ask = (best_ask_idx_ != kNpos);
+  const bool valid = has_bid & has_ask;
+  const std::size_t bid_idx = has_bid ? best_bid_idx_ : 0;
+  const std::size_t ask_idx = has_ask ? best_ask_idx_ : 0;
+  sum = static_cast<Tick>(price_of(bid_idx) + price_of(ask_idx));
+  return valid;
 }
 
 Qty FlatLadderBook::volume_at(Side side, Tick price) const noexcept {
-  if (!in_range(price))
-    return 0;
-  const std::size_t idx = index_of(price);
-  const IntrusiveLevel &level = level_at(idx);
-  return level_side_[idx] == side_tag(side) ? level.volume : 0;
+  const bool in_b = (price >= min_tick_) & (price <= max_tick_);
+  const std::size_t idx = static_cast<std::size_t>(price - min_tick_) * in_b;
+  const bool side_match = (level_side_[idx] == side_tag(side)) & in_b;
+  return levels_[idx].volume * side_match;
 }
 
 bool FlatLadderBook::mid_price(double &price) const noexcept {
@@ -593,9 +595,9 @@ InvariantReport FlatLadderBook::check_invariants_report() const noexcept {
     live_sum += live;
   }
 
-  if (bid_sum != total_bid_vol_)
+  if (bid_sum != total_vol_[0])
     return InvariantReport{false, "flat: total bid volume mismatch"};
-  if (ask_sum != total_ask_vol_)
+  if (ask_sum != total_vol_[1])
     return InvariantReport{false, "flat: total ask volume mismatch"};
   if (live_sum != live_order_count_)
     return InvariantReport{false, "flat: live order count mismatch"};
@@ -622,16 +624,14 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
     return;
   }
   const std::size_t clamped = std::min(start, tick_count_ - 1);
-  std::size_t word = clamped / 64;
-  const std::size_t bit_in_word = clamped % 64;
-  const std::uint64_t head_mask = (bit_in_word == 63)
-                                      ? ~std::uint64_t{0}
-                                      : ((std::uint64_t{1} << (bit_in_word + 1)) - 1);
+  std::size_t word = clamped >> 6;
+  const std::size_t bit_in_word = clamped & 63;
+  const std::uint64_t head_mask = (~std::uint64_t{0}) >> (63 - bit_in_word);
   std::uint64_t w = level_bitmap_[word] & head_mask;
   while (true) {
     if (w != 0) {
       const int hi = 63 - __builtin_clzll(w);
-      best_bid_idx_ = word * 64 + static_cast<std::size_t>(hi);
+      best_bid_idx_ = (word << 6) + static_cast<std::size_t>(hi);
       return;
     }
     if (word == 0) break;
@@ -646,15 +646,15 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
     best_ask_idx_ = kNpos;
     return;
   }
-  std::size_t word = start / 64;
-  const std::size_t bit_in_word = start % 64;
-  const std::uint64_t tail_mask = ~((std::uint64_t{1} << bit_in_word) - 1);
+  std::size_t word = start >> 6;
+  const std::size_t bit_in_word = start & 63;
+  const std::uint64_t tail_mask = (~std::uint64_t{0}) << bit_in_word;
   std::uint64_t w = level_bitmap_[word] & tail_mask;
   const std::size_t nwords = level_bitmap_.size();
   while (true) {
     if (w != 0) {
       const int lo = __builtin_ctzll(w);
-      best_ask_idx_ = word * 64 + static_cast<std::size_t>(lo);
+      best_ask_idx_ = (word << 6) + static_cast<std::size_t>(lo);
       if (best_ask_idx_ >= tick_count_) [[unlikely]] {
         best_ask_idx_ = kNpos;
       }
@@ -668,11 +668,11 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
 }
 
 void FlatLadderBook::mark_level_occupied(std::size_t idx) noexcept {
-  level_bitmap_[idx / 64] |= (std::uint64_t{1} << (idx % 64));
+  level_bitmap_[idx >> 6] |= (std::uint64_t{1} << (idx & 63));
 }
 
 void FlatLadderBook::clear_level_occupied(std::size_t idx) noexcept {
-  level_bitmap_[idx / 64] &= ~(std::uint64_t{1} << (idx % 64));
+  level_bitmap_[idx >> 6] &= ~(std::uint64_t{1} << (idx & 63));
 }
 
 } // namespace sim

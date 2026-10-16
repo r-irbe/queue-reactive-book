@@ -108,9 +108,9 @@ public:
     Tick max_tick() const noexcept { return max_tick_; }
     std::size_t tick_count() const noexcept { return tick_count_; }
 
-    // O(1): book maintains running side totals on rest/match/cancel.
+    // O(1) branchless: book maintains running side totals on rest/match/cancel.
     Qty total_volume(Side s) const noexcept {
-        return is_buy(s) ? total_bid_vol_ : total_ask_vol_;
+        return total_vol_[static_cast<std::uint8_t>(s) & 1];
     }
     std::uint64_t event_count() const noexcept { return event_count_; }
 
@@ -133,8 +133,7 @@ private:
     std::pmr::vector<OrderRef> id_refs_;
     std::pmr::vector<std::uint8_t> id_live_;
     std::size_t live_order_count_ = 0;
-    Qty total_bid_vol_ = 0;
-    Qty total_ask_vol_ = 0;
+    Qty total_vol_[2] = {0, 0}; // [0] = Buy, [1] = Sell
 
     Tick min_tick_ = 0;
     Tick max_tick_ = -1;
@@ -157,7 +156,7 @@ private:
     static constexpr std::uint8_t kBuySide = 1;
     static constexpr std::uint8_t kSellSide = 2;
     static constexpr std::uint8_t side_tag(Side side) noexcept {
-        return side == Side::Buy ? kBuySide : kSellSide;
+        return static_cast<std::uint8_t>(static_cast<std::uint8_t>(side) + 1);
     }
 
     bool has_order_ref(OrderId id) const noexcept;

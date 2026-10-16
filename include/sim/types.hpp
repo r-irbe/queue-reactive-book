@@ -4,24 +4,50 @@
 #include <cstddef>
 
 namespace sim {
-    using Tick      = std::int32_t;//oil was negative years ago ...
-    using Qty       = std::int32_t;//can also be neg. position
-    using OrderId   = std::uint64_t;//monotonically increasing
-    using AgentId   = std::uint32_t;
-    using TimeNs    = std::int64_t;//for example clock
+    using Tick          = std::int32_t;//oil was negative years ago ...
+    using Qty           = std::int32_t;//can also be neg. position
+    using OrderId       = std::uint64_t;//monotonically increasing
+    using ParentOrderId = std::uint64_t;
+    using ScenarioId    = std::uint32_t;
+    using EventSeq      = std::uint64_t;
+    using AgentId       = std::uint32_t;
+    using TimeNs        = std::int64_t;//for example clock
+
+    // Latency model constants & profiles
+    struct LatencyConfig {
+        TimeNs md_delay_ns        = 50'000;
+        TimeNs decision_delay_ns  = 10'000;
+        TimeNs oe_delay_ns        = 50'000;
+        TimeNs jitter_ns          = 0;
+    };
+
+    struct LatencyProfile {
+        LatencyConfig md;
+        LatencyConfig dec;
+        LatencyConfig oe;
+    };
     // Reduced data storage requirements: 1B compact enums and 24B CompactOrder layout.
     enum class Side : std::uint8_t { Buy = 0, Sell = 1 };
 
-    inline Side opposite(Side s) noexcept {
-        return s == Side::Buy ? Side::Sell : Side::Buy;
+    inline constexpr Side opposite(Side s) noexcept {
+        return static_cast<Side>(static_cast<std::uint8_t>(s) ^ 1);
     }
 
-    inline const char* side_name(Side s) noexcept {
-        return s == Side::Buy ? "BUY" : "SELL";
+    inline constexpr const char* side_name(Side s) noexcept {
+        constexpr const char* kSideNames[2] = {"BUY", "SELL"};
+        return kSideNames[static_cast<std::uint8_t>(s) & 1];
     }
 
-    inline constexpr bool is_buy(Side s) noexcept { return s == Side::Buy; }
-    inline constexpr bool is_sell(Side s) noexcept { return s == Side::Sell; }
+    inline constexpr bool is_buy(Side s) noexcept {
+        return static_cast<std::uint8_t>(s) == 0;
+    }
+    inline constexpr bool is_sell(Side s) noexcept {
+        return static_cast<std::uint8_t>(s) == 1;
+    }
+
+    inline constexpr std::uint8_t side_idx(Side s) noexcept {
+        return static_cast<std::uint8_t>(s) & 1;
+    }
 
     // RNG constants: data-driven seed & distribution parameters
     namespace rng_constants {

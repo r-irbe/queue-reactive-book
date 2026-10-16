@@ -258,8 +258,8 @@ inline Tick signed_shortfall_x2(Side side,
                                 Tick fill_price,
                                 Tick benchmark_mid_x2) noexcept {
     const Tick fill_x2 = static_cast<Tick>(fill_price * 2);
-    return is_buy(side) ? static_cast<Tick>(fill_x2 - benchmark_mid_x2)
-                        : static_cast<Tick>(benchmark_mid_x2 - fill_x2);
+    const Tick sign = 1 - 2 * static_cast<Tick>(side_idx(side));
+    return static_cast<Tick>((fill_x2 - benchmark_mid_x2) * sign);
 }
 
 inline Tick taker_effective_spread_x2(const FillRecord& fill) noexcept {

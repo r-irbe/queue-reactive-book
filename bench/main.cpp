@@ -23,6 +23,10 @@
 // non-aligned new/delete family is provided so partial replacement cannot mix
 // allocators. Over-aligned (`std::align_val_t`) allocations are intentionally
 // left to the default implementation and are NOT counted (documented limit).
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void* operator new(std::size_t size) {
     void* p = std::malloc(size == 0 ? 1 : size);
     if (!p) {
@@ -63,6 +67,9 @@ void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 

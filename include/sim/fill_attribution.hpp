@@ -41,8 +41,8 @@ inline Side maker_side_from_taker(Side taker_side) noexcept {
 
 inline Tick signed_markout_x2(Side side, Tick fill_price, Tick future_mid_x2) noexcept {
     const Tick fill_x2 = static_cast<Tick>(fill_price * 2);
-    return is_buy(side) ? static_cast<Tick>(future_mid_x2 - fill_x2)
-                        : static_cast<Tick>(fill_x2 - future_mid_x2);
+    const Tick sign = 1 - 2 * static_cast<Tick>(side_idx(side));
+    return static_cast<Tick>((future_mid_x2 - fill_x2) * sign);
 }
 
 inline FillRecord make_fill_record(const Trade& trade,

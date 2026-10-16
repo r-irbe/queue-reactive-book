@@ -5,10 +5,7 @@
 #include <cstdint>
 
 namespace sim {
-
-using ParentOrderId = std::uint64_t;
-using ScenarioId = std::uint32_t;
-using EventSeq = std::uint64_t;
+// ParentOrderId, ScenarioId, and EventSeq are defined in types.hpp
 
 enum class TraceEventKind : std::uint8_t {
     SubmitLimit = 0,

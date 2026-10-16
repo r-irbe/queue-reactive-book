@@ -51,11 +51,12 @@ struct OrderFlowDelta {
 };
 
 inline Qty non_negative_qty(Qty qty) noexcept {
-    return qty > 0 ? qty : 0;
+    return std::max<Qty>(qty, 0);
 }
 
 inline Qty signed_qty(Side side, Qty qty) noexcept {
-    return is_buy(side) ? qty : static_cast<Qty>(-qty);
+    const Qty sign = 1 - 2 * static_cast<Qty>(static_cast<std::uint8_t>(side) & 1);
+    return qty * sign;
 }
 
 inline OrderFlowDelta make_order_flow_delta(const TraceEvent& event,

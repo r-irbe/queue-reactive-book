@@ -63,16 +63,15 @@ export_volume_depth_features(const TopKBookSnapshot<K>& snapshot) noexcept {
     std::int64_t cumulative_ask_notional = 0;
 
     for (std::size_t i = 0; i < K; ++i) {
-        if (i < snapshot.bid_count) {
-            cumulative_bid_qty =
-                static_cast<Qty>(cumulative_bid_qty + snapshot.bids[i].qty);
-            cumulative_bid_notional += level_notional(snapshot.bids[i]);
-        }
-        if (i < snapshot.ask_count) {
-            cumulative_ask_qty =
-                static_cast<Qty>(cumulative_ask_qty + snapshot.asks[i].qty);
-            cumulative_ask_notional += level_notional(snapshot.asks[i]);
-        }
+        const bool has_bid = (i < snapshot.bid_count);
+        cumulative_bid_qty =
+            static_cast<Qty>(cumulative_bid_qty + snapshot.bids[i].qty * has_bid);
+        cumulative_bid_notional += level_notional(snapshot.bids[i]) * has_bid;
+
+        const bool has_ask = (i < snapshot.ask_count);
+        cumulative_ask_qty =
+            static_cast<Qty>(cumulative_ask_qty + snapshot.asks[i].qty * has_ask);
+        cumulative_ask_notional += level_notional(snapshot.asks[i]) * has_ask;
 
         out[pos++] = static_cast<double>(cumulative_bid_qty);
         out[pos++] = static_cast<double>(cumulative_ask_qty);
