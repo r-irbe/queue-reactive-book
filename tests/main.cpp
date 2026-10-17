@@ -1,3 +1,4 @@
+#include "sim/bitwise_veb_codings.hpp"
 #include <catch2/catch_test_macros.hpp>
 
 #include "sim/alloc_probe.hpp"
@@ -4902,4 +4903,62 @@ TEST_CASE("Zero-tombstone intrusive slotmap and non-throwing construction", "[si
     sim::CompactOrder co{.id = 42, .ts = 1000, .price = 100, .qty = 10};
     REQUIRE(co.id == 42);
     REQUIRE(co.price == 100);
+}
+
+TEST_CASE("Lean-aligned Bitwise vEB 128/256/512, ARM MSB-first, Offset-Binary, Gray Basket, and Elias-Fano", "[sim][veb_codings]") {
+    sim::BitwiseVeb128 v128;
+    v128.insert(95);
+    v128.insert(12);
+    REQUIRE(v128.find_min() == 12);
+    REQUIRE(v128.find_max() == 95);
+    v128.remove(12);
+    REQUIRE(v128.find_min() == 95);
+
+    sim::BitwiseVeb256Avx2 v256;
+    v256.insert(210);
+    v256.insert(45);
+    REQUIRE(v256.find_min() == 45);
+    v256.remove(45);
+    REQUIRE(v256.find_min() == 210);
+
+    sim::BitwiseVeb512 v512;
+    v512.insert(499);
+    v512.insert(129);
+    REQUIRE(v512.find_min() == 129);
+    v512.remove(129);
+    REQUIRE(v512.find_min() == 499);
+
+    sim::ArmMsbBitboard64 arm_bb;
+    arm_bb.insert(41);
+    arm_bb.insert(7);
+    REQUIRE(arm_bb.find_min() == 7);
+    REQUIRE(arm_bb.find_max() == 41);
+
+    REQUIRE(sim::OffsetBinaryCodec::encode(-500) < sim::OffsetBinaryCodec::encode(0));
+    REQUIRE(sim::OffsetBinaryCodec::encode(0) < sim::OffsetBinaryCodec::encode(500));
+    REQUIRE(sim::OffsetBinaryCodec::decode(sim::OffsetBinaryCodec::encode(-123456)) == -123456);
+
+    sim::KnuthGrayBasket<6> basket({10, -20, 35, 5, -15, 40});
+    std::size_t flip = 0;
+    std::uint64_t mask = 0;
+    std::int64_t val = 0;
+    std::size_t count = 0;
+    while (basket.next_subset(flip, mask, val)) {
+        std::int64_t expected = 0;
+        for (std::size_t i = 0; i < 6; ++i) {
+            if ((mask & (1ULL << i)) != 0ULL) expected += basket.weights[i];
+        }
+        REQUIRE(val == expected);
+        ++count;
+    }
+    REQUIRE(count == 63);
+
+    std::vector<std::uint64_t> sorted_ts;
+    for (std::uint64_t i = 0; i < 512; ++i) {
+        sorted_ts.push_back(i * 100ULL + (i & 7ULL));
+    }
+    sim::EliasFanoIndex ef(sorted_ts);
+    for (std::size_t i = 0; i < sorted_ts.size(); ++i) {
+        REQUIRE(ef.get(i) == sorted_ts[i]);
+    }
 }
