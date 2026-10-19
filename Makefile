@@ -3,6 +3,14 @@ CXXSTD ?= -std=c++20
 WARN       ?= -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor
 OPT      ?= -O2 -DNDEBUG
 INCLUDES ?= -Iinclude -Iinclude/test_shim
+QRLOB_BUILD_EXPERIMENTAL ?= ON
+ifeq ($(QRLOB_BUILD_EXPERIMENTAL),ON)
+  INCLUDES += -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
+else ifeq ($(QRLOB_BUILD_EXPERIMENTAL),1)
+  INCLUDES += -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
+else
+  INCLUDES += -DQRLOB_BUILD_EXPERIMENTAL=0
+endif
 PYTHON     ?= python3
 
 # --- Opt-in diagnostic / release build modes (default behavior unchanged) -----
