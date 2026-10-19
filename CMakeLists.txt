@@ -43,3 +43,5 @@ else()
 endif()
 target_link_libraries(sim_test PRIVATE qrlob_core)
 add_test(NAME sim_test COMMAND sim_test)
+
+add_custom_target(qrlob_tests DEPENDS sim_test)

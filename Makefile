@@ -4,12 +4,13 @@ WARN       ?= -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor
 OPT      ?= -O2 -DNDEBUG
 INCLUDES ?= -Iinclude -Iinclude/test_shim
 QRLOB_BUILD_EXPERIMENTAL ?= ON
+TEST_EXP_FLAGS :=
 ifeq ($(QRLOB_BUILD_EXPERIMENTAL),ON)
-  INCLUDES += -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
+  TEST_EXP_FLAGS := -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
 else ifeq ($(QRLOB_BUILD_EXPERIMENTAL),1)
-  INCLUDES += -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
+  TEST_EXP_FLAGS := -Iexperimental -DQRLOB_BUILD_EXPERIMENTAL=1
 else
-  INCLUDES += -DQRLOB_BUILD_EXPERIMENTAL=0
+  TEST_EXP_FLAGS := -DQRLOB_BUILD_EXPERIMENTAL=0
 endif
 PYTHON     ?= python3
 
@@ -77,7 +78,7 @@ BIN_TEST     := $(BUILD_DIR)/sim_test
 BIN_BENCH    := $(BUILD_DIR)/sim_bench
 BIN_EXAMPLE  := $(BUILD_DIR)/sim_example
 
-.PHONY: all help build build-bin test test-bin bench bench-bin bench-save bench-shards example example-bin lint lint-fix run clean dirs deps deps-clean asan ubsan tsan debug release-lto
+.PHONY: all help build build-bin test test_core test-bin bench bench-bin bench-save bench-shards example example-bin lint lint-fix run clean dirs deps deps-clean asan ubsan tsan debug release-lto
 
 CPPFLAGS += $(INCLUDES)
 CXXFLAGS += $(CXXSTD) $(WARN) $(OPT) $(SANITIZE_FLAGS)
@@ -147,8 +148,12 @@ build-bin: dirs
 test: test-bin
 	@./$(BIN_TEST)
 
+test_core:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory test QRLOB_BUILD_EXPERIMENTAL=OFF
+
 test-bin: dirs
-	$(call BUILD_IF_SOURCES,TEST_SRC,No tests/*.cpp yet.,$(COMPILE_BASE) $(TEST_SRC) $(LIB_SRC) $(TEST_LDLIBS) -o $(BIN_TEST))
+	$(call BUILD_IF_SOURCES,TEST_SRC,No tests/*.cpp yet.,$(COMPILE_BASE) $(TEST_EXP_FLAGS) $(TEST_SRC) $(LIB_SRC) $(TEST_LDLIBS) -o $(BIN_TEST))
 
 bench: bench-bin
 	@./$(BIN_BENCH)
