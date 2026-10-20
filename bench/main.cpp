@@ -12,21 +12,21 @@
 #include <utility>
 #include <vector>
 
-// --- CMU-002: bench-only global allocation-operator replacement -------------
-//
-// These global replacements live ONLY in the benchmark translation unit (a
-// standalone binary). The library and test binaries are deliberately NOT
-// instrumented, so Catch2 static registration and `sim` keep the platform
-// allocator. When a ScopedAllocCounter is armed (`alloc_counting_active()`),
-// each allocation is tallied into the thread-local AllocStats; otherwise these
-// are thin pass-throughs over std::malloc/std::free. The full standard
-// non-aligned new/delete family is provided so partial replacement cannot mix
-// allocators. Over-aligned (`std::align_val_t`) allocations are intentionally
-// left to the default implementation and are NOT counted (documented limit).
+// Global allocation-operator replacement for ScopedAllocCounter telemetry.
+// Active only while a ScopedAllocCounter is armed on the calling thread.
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 #endif
+namespace {
+inline void* aligned_alloc_impl(std::size_t size, std::size_t align) noexcept {
+    if (align < sizeof(void*)) align = sizeof(void*);
+    void* p = nullptr;
+    if (posix_memalign(&p, align, size == 0 ? 1 : size) != 0) return nullptr;
+    return p;
+}
+} // namespace
+
 void* operator new(std::size_t size) {
     void* p = std::malloc(size == 0 ? 1 : size);
     if (!p) {
@@ -51,6 +51,30 @@ void* operator new[](std::size_t size) {
     if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
     return p;
 }
+void* operator new(std::size_t size, std::align_val_t al) {
+    void* p = aligned_alloc_impl(size, static_cast<std::size_t>(al));
+    if (!p) {
+#if defined(__cpp_exceptions)
+        throw std::bad_alloc();
+#else
+        std::abort();
+#endif
+    }
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new[](std::size_t size, std::align_val_t al) {
+    void* p = aligned_alloc_impl(size, static_cast<std::size_t>(al));
+    if (!p) {
+#if defined(__cpp_exceptions)
+        throw std::bad_alloc();
+#else
+        std::abort();
+#endif
+    }
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
     void* p = std::malloc(size == 0 ? 1 : size);
     if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
@@ -61,12 +85,28 @@ void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
     if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
     return p;
 }
+void* operator new(std::size_t size, std::align_val_t al, const std::nothrow_t&) noexcept {
+    void* p = aligned_alloc_impl(size, static_cast<std::size_t>(al));
+    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new[](std::size_t size, std::align_val_t al, const std::nothrow_t&) noexcept {
+    void* p = aligned_alloc_impl(size, static_cast<std::size_t>(al));
+    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
 void operator delete(void* ptr) noexcept { std::free(ptr); }
 void operator delete[](void* ptr) noexcept { std::free(ptr); }
 void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
 void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
 void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::align_val_t, const std::nothrow_t&) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::align_val_t, const std::nothrow_t&) noexcept { std::free(ptr); }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
@@ -651,9 +691,8 @@ static void BM_FlatLadder_DeepCrossingMatch(benchmark::State& state) {
         kQty);
 }
 
-// CMU-002: allocation-probe family. These benchmarks measure ALLOCATIONS, not
-// wall-clock latency. Do NOT compare their timing to the latency families
-// (e.g. BM_LOB_AddNoCross); read only their `allocs` / `alloc_bytes` counters.
+// Allocation-probe benchmarks: measure steady-state heap allocations across
+// passive and crossing hot paths after book construction.
 static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     const int batch = static_cast<int>(state.range(0));
     constexpr sim::Tick kMid = 10'000;
@@ -662,9 +701,9 @@ static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     std::uint64_t total_bytes = 0;
 
     for (auto _ : state) {
-        // Construct the book OUTSIDE the counted region so we measure the
-        // steady-state add loop, not one-time book construction.
+        state.PauseTiming();
         sim::LimitOrderBook book(static_cast<std::size_t>(batch * 2 + 64));
+        state.ResumeTiming();
         std::uint64_t sink = 0;
         sim::diag::AllocStats delta{};
         {
@@ -691,9 +730,97 @@ static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch) * 2);
 }
 
+static void BM_FlatLadder_AddNoCross_AllocProbe(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    constexpr sim::Tick kMin = 9'980;
+    constexpr sim::Tick kMax = 10'020;
+    constexpr sim::Tick kMid = 10'000;
+    constexpr sim::Qty kQty = 1;
+    std::uint64_t total_allocs = 0;
+    std::uint64_t total_bytes = 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        sim::FlatLadderBook book(kMin, kMax, static_cast<std::size_t>(batch * 2 + 64));
+        state.ResumeTiming();
+        std::uint64_t sink = 0;
+        sim::diag::AllocStats delta{};
+        {
+            sim::diag::ScopedAllocCounter counter;
+            for (int i = 0; i < batch; ++i) {
+                const sim::Order buy = make_limit_order(
+                    1, sim::Side::Buy, static_cast<sim::Tick>(kMid - 10 - (i & 7)), kQty);
+                const sim::Order sell = make_limit_order(
+                    2, sim::Side::Sell, static_cast<sim::Tick>(kMid + 10 + (i & 7)), kQty);
+                const sim::TimeNs ts = static_cast<sim::TimeNs>(i);
+                sink += static_cast<std::uint64_t>(book.add(buy, ts * 2).filled);
+                sink += static_cast<std::uint64_t>(book.add(sell, ts * 2 + 1).filled);
+            }
+            delta = counter.delta();
+        }
+        benchmark::DoNotOptimize(sink);
+        total_allocs += delta.allocations;
+        total_bytes += delta.bytes;
+    }
+
+    state.counters["allocs"] =
+        benchmark::Counter(static_cast<double>(total_allocs), benchmark::Counter::kAvgIterations);
+    state.counters["alloc_bytes"] =
+        benchmark::Counter(static_cast<double>(total_bytes), benchmark::Counter::kAvgIterations);
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch) * 2);
+}
+
+static void BM_FlatLadder_AddIntoCrossing_AllocProbe(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    constexpr sim::Tick kMin = 9'980;
+    constexpr sim::Tick kMax = 10'020;
+    constexpr sim::Tick kAsk = 10'000;
+    constexpr sim::Qty kQty = 1;
+    std::uint64_t total_allocs = 0;
+    std::uint64_t total_bytes = 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        sim::FlatLadderBook book(kMin, kMax, static_cast<std::size_t>(batch * 2 + 64));
+        for (int i = 0; i < batch; ++i) {
+            const sim::Order ask = make_limit_order(
+                1, sim::Side::Sell, static_cast<sim::Tick>(kAsk + (i & 7)), kQty);
+            book.add_into(ask, static_cast<sim::TimeNs>(i), nullptr, 0);
+        }
+        state.ResumeTiming();
+
+        sim::Trade trade_buf[16]{};
+        std::uint64_t sink = 0;
+        sim::diag::AllocStats delta{};
+        {
+            sim::diag::ScopedAllocCounter counter;
+            for (int i = 0; i < batch; ++i) {
+                const sim::Order buy = make_limit_order(
+                    2, sim::Side::Buy, static_cast<sim::Tick>(kAsk + 7), kQty);
+                const auto summary = book.add_into(
+                    buy, static_cast<sim::TimeNs>(batch + i), trade_buf, 16);
+                sink += static_cast<std::uint64_t>(summary.filled) + summary.trade_count;
+            }
+            delta = counter.delta();
+        }
+        benchmark::DoNotOptimize(sink);
+        benchmark::DoNotOptimize(trade_buf);
+        total_allocs += delta.allocations;
+        total_bytes += delta.bytes;
+    }
+
+    state.counters["allocs"] =
+        benchmark::Counter(static_cast<double>(total_allocs), benchmark::Counter::kAvgIterations);
+    state.counters["alloc_bytes"] =
+        benchmark::Counter(static_cast<double>(total_bytes), benchmark::Counter::kAvgIterations);
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch));
+}
+
 BENCHMARK(BM_LOB_AddNoCross)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_LOB_AddNoCross_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_FlatLadder_AddNoCross)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_AddNoCross_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_AddIntoCrossing_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_LOB_CancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_CancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_LOB_CancelCycle_NoCompaction)->Arg(1024)->Arg(4096)->Arg(16384);
@@ -701,8 +828,7 @@ BENCHMARK(BM_LOB_CrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_CrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_LOB_OutOfBandPassive)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_OutOfBandPassive)->Arg(1024)->Arg(4096)->Arg(16384);
-// Deep-ladder benches \u2014 evidence that bitmap refresh keeps cancel + match
-// cost essentially flat as the tick band widens 2.5\u00d7\u00d72500.
+// Deep-ladder benchmarks across a 100,001-tick band.
 BENCHMARK(BM_FlatLadder_DeepCancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_DeepRefreshHeavy)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_DeepCrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);

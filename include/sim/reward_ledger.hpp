@@ -1,20 +1,8 @@
 #pragma once
 
-// reward_ledger.hpp -- RTA-001: Separate reward ledger (disjoint from TCA)
-//
-// A standalone evaluation-layer ledger for RL/agent reward signals that is
-// deliberately disjoint from tca.hpp. TcaSummary/InventoryState may never
-// reference reward fields, and RewardLedger may never write into TCA
-// structures. This header is the authoritative enforcement point for that
-// separation.
-//
-// INVARIANT: RewardLedger shares no symbols with tca.hpp. TCA is pure
-// markout/execution accounting; reward is RL/agent evaluation. They must
-// remain disjoint so reward contamination of TCA is structurally impossible.
-//
-// KERNEL: This header does NOT touch flat_ladder_book.cpp/.hpp. It lives in
-// the evaluation/diagnostics layer, consumed by replay_pipeline or offline
-// analysis only. No hot-path matching code depends on it.
+// Agent reward ledger keyed by `(parent_id, agent, scenario_id)`.
+// Kept structurally separate from `tca.hpp` so execution markout accounting
+// and reinforcement-learning reward shaping do not share state or schemas.
 
 #include "export_schema.hpp"
 
@@ -128,12 +116,7 @@ inline constexpr std::array<ExportColumn, kRewardSummaryExportCount>
         {"fill_rate_pct"}
     }};
 
-// --- Reward ledger (disjoint from TCA accumulator) ----------------------------
-//
-// The ledger accumulates reward summaries per (parent_order, agent, scenario).
-// It is consumed by offline analysis, replay diagnostics, or reward-vs-TCA
-// divergence reporting (RTA-002). It must NEVER be read by TCA computation
-// or written to by TCA accumulation.
+// Accumulates per-(parent_order, agent, scenario) reward summaries.
 
 class RewardLedger {
 public:
@@ -204,22 +187,5 @@ private:
     RewardConventions conventions_{};
 };
 
-// --- Disjointness compile-time guards ------------------------------------------
-//
-// These static_asserts ensure that RewardSummary and TcaSummary have no
-// overlapping field names, providing a compile-time guard against accidental
-// contamination. If someone adds a field to RewardSummary that matches a TcaSummary
-// field name, this will fail to compile (as a signal, not a hard error -- the
-// guard is advisory since the structs are in the same namespace).
-//
-// We check by ensuring RewardSummary does not have these TcaSummary field names:
-//   passive_qty, aggressive_qty, passive_notional, aggressive_notional,
-//   passive_fee_cost, aggressive_fee_cost, passive_markout_x2_qty, etc.
-//
-// (Implementing this as a concept or static_assert requires reflection which
-// C++20 doesn't have. Instead, the disjointness is enforced structurally:
-// RewardLedger is a separate class, RewardKey is a separate struct, and the
-// export schema arrays are separate constexpr arrays. No shared inheritance,
-// no shared base, no shared accessor functions.)
 
 }  // namespace sim

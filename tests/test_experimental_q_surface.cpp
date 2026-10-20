@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Open-WebUI & Project Q Systems Engineering
-// SPDX-License-Identifier: Apache-2.0
+// Experimental surface tests: SPSC shared-memory ring, offline Hawkes/VPIN
+// replay, and flat-ladder parity harness.
 
 #if !defined(QRLOB_BUILD_EXPERIMENTAL) || QRLOB_BUILD_EXPERIMENTAL
 

@@ -8,25 +8,10 @@
 
 namespace sim {
 
-// --- Feature/label JOIN MANIFEST (Tier-4 proposal CML-004, offline, cold path) -
-//
-// PROBLEM: features expose `seq`/`ts` (feature_export.hpp) and labels expose
-// fill/eval `seq`/`ts` (label_export.hpp), but NO schema-level artifact states
-// the join causality `feature_seq + embargo < label_start_seq <= label_eval_seq`,
-// the embargo gap, or the train/test split boundary. A leaky join (a label whose
-// information window opens at or before the feature observation, plus embargo)
-// can therefore silently contaminate a training set.
-//
-// This is a header-only, cold-path VALIDATOR. It never feeds the frozen matching
-// kernel; it only inspects already-exported feature/label row coordinates and
-// classifies whether the join is causally usable for training. It does NOT
-// impute, reorder, or mutate any row, and it does NOT change any existing column
-// array. Determinism: a pure function of the integer/seq inputs.
-//
-// Half-open embargo semantics: the label's information window must START strictly
-// after `feature_seq + embargo_events` (and `feature_ts + embargo_ns`). A label
-// that starts AT the embargo boundary is rejected as leaky (the boundary event
-// itself is inside the embargo).
+// Causality, embargo, and split-boundary validator for feature-to-label joins.
+// Requires `feature_seq + embargo_events < label_start_seq <= label_eval_seq`
+// and `feature_ts + embargo_ns < label_start_ts <= label_eval_ts` within a
+// single dataset split (`Train`, `Validation`, or `Test`).
 
 enum class JoinValidity : std::uint8_t {
     Usable = 0,         // causally clean: safe to join feature->label for training

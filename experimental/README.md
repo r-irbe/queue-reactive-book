@@ -1,34 +1,13 @@
-# Experimental Surface (Absorbed from Project Q)
+# Experimental Replay and Parity Surface
 
-This directory contains the experimental and offline verification surface
-absorbed from `/home/radu/code/q` (`f190d0a4`), isolated behind the opt-in
-build option `QRLOB_BUILD_EXPERIMENTAL` (default `ON` for test builds).
+Headers in this directory provide offline calibration, shared-memory transport, and cross-implementation parity checks. They are compiled into `sim_test` when `QRLOB_BUILD_EXPERIMENTAL=ON` (the default for `make test`) and excluded when `QRLOB_BUILD_EXPERIMENTAL=OFF` (`make test_core`).
 
-## Isolation Invariant
+## Isolation Boundary
 
-The production matching core (`include/sim/flat_ladder_book.hpp`,
-`src/flat_ladder_book.cpp`, `include/sim/lob.hpp`, `src/lob.cpp`) remains
-strictly zero-exception (`-fno-exceptions`) and zero-allocation on the hot
-path. Nothing in `include/sim/` or `src/` includes or depends on `experimental/`.
-Data flows strictly one way: out of the matching core or replay traces into
-these experimental adapters and offline diagnostics.
+Nothing in `include/sim/` or `src/` includes headers from `experimental/`. The matching core (`FlatLadderBook` and `LimitOrderBook`) compiles without exceptions (`-fno-exceptions`) and performs no heap allocations on its pre-sized hot path. Data flows strictly outward from matching engine events or recorded traces into these offline tools.
 
-## Components
+## Headers
 
-1. `experimental/spsc_ring_bridge.hpp`
-   - Lock-free, zero-allocation POSIX shared-memory SPSC ring bridge
-     (`ShmIpcEvent`, `ShmIpcHeader`, `ShmRingChannel`, `ShmSpscProducer`,
-     `ShmSpscConsumer`, `ShmSpscEndpoint`) matching the 64-byte binary wire
-     layout of `rust-mmap-engine` (`shm_spsc_ipc::ShmIpcEvent`).
-2. `experimental/offline_hawkes_calibrator.hpp`
-   - Offline dyadic Hawkes point-process intensity replay (`ArrivalEvent`,
-     `HawkesParams`, `ArrivalPointProcessReplay`), state-dependent
-     queue-reactive Hawkes calibrator (`StateDependentHawkesCalibrator`), and
-     equal-volume VPIN flow-toxicity replay (`SignedTrade`, `VolumeBucket`,
-     `VpinResult`, `VpinToxicityReplay`) with compile-time non-feedback guards.
-3. `experimental/flat_ladder_parity_harness.hpp`
-   - Deterministic replay parity harness comparing the production intrusive
-     `sim::FlatLadderBook` against `sim::LimitOrderBook` and the byte-frozen
-     tombstone-array ladder (`ByteFrozenTombstoneLadder`) from `q`, plus the
-     offline cache-oblivious van Emde Boas static search parity verifier
-     (`VebStaticSearch`).
+- `experimental/spsc_ring_bridge.hpp` implements a lock-free POSIX shared-memory single-producer single-consumer ring (`ShmIpcEvent`, `ShmIpcHeader`, `ShmRingChannel`, `ShmSpscProducer`, `ShmSpscConsumer`, `ShmSpscEndpoint`) using a 64-byte cache-line-aligned event layout.
+- `experimental/offline_hawkes_calibrator.hpp` provides offline dyadic Hawkes intensity replay (`ArrivalPointProcessReplay`), queue-reactive state-bucketed arrival calibration (`StateDependentHawkesCalibrator`), and equal-volume VPIN toxicity calculation (`VpinToxicityReplay`).
+- `experimental/flat_ladder_parity_harness.hpp` verifies event-by-event replay equivalence between `sim::FlatLadderBook`, `sim::LimitOrderBook`, a reference tombstone-array ladder (`ByteFrozenTombstoneLadder`), and a static van Emde Boas tree layout (`VebStaticSearch`).

@@ -1,9 +1,6 @@
-// Copyright (c) 2026 Open-WebUI & Project Q Systems Engineering
-// SPDX-License-Identifier: Apache-2.0
-//
-// Experimental byte-frozen flat_ladder_book parity harness and cache-oblivious
-// vEB static search verifier absorbed from /home/radu/code/q (commit f190d0a4).
-// Isolated from the -fno-exceptions matching core behind QRLOB_BUILD_EXPERIMENTAL.
+// Deterministic replay parity harness comparing `FlatLadderBook`,
+// `LimitOrderBook`, and a tombstone-vector reference ladder, plus a
+// cache-oblivious van Emde Boas static search layout (`VebStaticSearch`).
 
 #pragma once
 
@@ -20,8 +17,7 @@
 namespace sim {
 namespace experimental {
 
-// Static cache-oblivious (van-Emde-Boas layout) ordered search index absorbed
-// from Project Q (offline/veb_static_search.hpp).
+// Static cache-oblivious (van Emde Boas layout) ordered search index.
 template <typename Key>
 class VebStaticSearch {
 public:

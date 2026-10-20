@@ -10,24 +10,10 @@
 
 namespace sim {
 
-// --- Guarded market-making quote adapters (Tier-2 PROTOTYPE) -------------------
-//
-// PROTOTYPE. Avellaneda-Stoikov (AS) and related quote models computed as
-// GUARDED adapters that emit ordinary tick-valid SubmitLimit intents ABOVE the
-// replay path. The seductive-wrong-takeaway this design refuses (roadmap T4):
-// AS/GLFT/CJP assume a fill-intensity law lambda(delta)=A*exp(-k*delta); if the
-// model self-reports fills through that intensity it fabricates PnL. Here the
-// adapter ONLY proposes quotes -- it has no fill, intensity, or PnL output, and
-// fills are decided solely by the frozen kernel/replay. The header never touches
-// `flat_ladder_book.*` and uses no RNG/wall-clock/mutable global state, so it is
-// replay-hash invariant.
-//
-// Units (a deliberate guard against the classic AS unit bug):
-//   * `mid_x2` is a DOUBLED-tick coordinate (int64); converted once to a tick
-//     price double `mid = 0.5*mid_x2`. All AS math is in tick-price doubles, and
-//     only the final bid/ask are snapped to integer ticks.
-//   * `sigma2_per_second` is variance per second; tau is seconds, derived from
-//     event-time ns. The product sigma2*tau is therefore unit-consistent.
+// Risk-guarded Avellaneda-Stoikov quote calculator that snaps reservation and
+// optimal spread to integer ticks and lowers valid quotes into `StrategyIntent`
+// limit orders. `mid_x2` is in doubled ticks (`mid = 0.5 * mid_x2`) and
+// `sigma2_per_second * tau` is dimensionless variance over remaining horizon.
 
 enum class QuoteModelKind : std::uint8_t {
     AvellanedaStoikov = 0,

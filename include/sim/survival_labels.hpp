@@ -7,13 +7,8 @@
 
 namespace sim {
 
-// --- Resting-order fill / survival LABELS (Tier-3 item 14, offline labels) -----
-//
-// Roadmap item 14 asks for "fill / survival labels" for resting limit orders.
-// This scaffold produces a no-look-ahead survival label for ONE resting order
-// from the events that touch it, in event-sequence order. It is header-only,
-// cold-path, and never feeds the frozen matching kernel (it only LABELS the
-// kernel's already-produced event stream).
+// Single-order survival and right-censoring label tracker over a half-open
+// event/time horizon `[start, start + H)`.
 //
 // Terminal states (a resting order resolves to exactly one):
 //   Filled            cumulative fills reached the ORIGINAL resting qty within

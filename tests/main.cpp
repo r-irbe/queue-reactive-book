@@ -38,6 +38,81 @@
 #include <type_traits>
 #include <utility>
 
+#include <cstdlib>
+#include <limits>
+#include <new>
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define QRLOB_SANITIZER_ACTIVE 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define QRLOB_SANITIZER_ACTIVE 1
+#endif
+#endif
+
+#ifndef QRLOB_SANITIZER_ACTIVE
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+namespace {
+inline void* test_aligned_alloc(std::size_t size, std::size_t align) noexcept {
+    if (align < sizeof(void*)) align = sizeof(void*);
+    void* p = nullptr;
+    if (posix_memalign(&p, align, size == 0 ? 1 : size) != 0) return nullptr;
+    return p;
+}
+} // namespace
+
+void* operator new(std::size_t size) {
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (!p) throw std::bad_alloc();
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new[](std::size_t size) {
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (!p) throw std::bad_alloc();
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new(std::size_t size, std::align_val_t al) {
+    void* p = test_aligned_alloc(size, static_cast<std::size_t>(al));
+    if (!p) throw std::bad_alloc();
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new[](std::size_t size, std::align_val_t al) {
+    void* p = test_aligned_alloc(size, static_cast<std::size_t>(al));
+    if (!p) throw std::bad_alloc();
+    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
+    return p;
+}
+void operator delete(void* ptr) noexcept { std::free(ptr); }
+void operator delete[](void* ptr) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#endif
+
 namespace {
 
 inline sim::Order make_limit_order(sim::AgentId agent,
@@ -1662,8 +1737,8 @@ TEST_CASE("export schema meta defaults to the current schema version",
 TEST_CASE("identical numeric frames are interpretation-incompatible when units, "
           "time basis, or label horizon differ",
           "[features][schema][meta]") {
-    // The roadmap T1 counterexample: two frames whose numbers are byte-identical
-    // but whose meaning differs must NOT be treated as comparable.
+    // Two frames whose numbers are byte-identical but whose units or horizons
+    // differ must not be treated as comparable.
     sim::ExportSchemaMeta ticks_eventtime{};
     ticks_eventtime.schema_name = "book_observables";
     ticks_eventtime.timestamp_basis = sim::TimestampBasis::EventTime;
@@ -3103,13 +3178,8 @@ TEST_CASE("execution baselines create TWAP limit schedules for passive baselines
     REQUIRE(schedule[1].qty == 2);
 }
 
-// --- CMU-002: allocation probe is replay-hash neutral -----------------------
-//
-// The bench binary replaces global operator new/delete to count allocations;
-// the test binary does NOT (per design, to keep Catch2 static-init safe). Here
-// we only verify that arming/disarming a ScopedAllocCounter -- which merely
-// reads and bumps a thread-local integer -- cannot perturb the deterministic
-// replay hash.
+// Allocation probe is replay-hash neutral: arming/disarming ScopedAllocCounter
+// does not perturb the deterministic replay digest.
 TEST_CASE("scoped alloc counter does not perturb replay hash",
           "[diagnostics][alloc-probe]") {
     auto run = [](bool arm_counter) {
@@ -3156,7 +3226,7 @@ TEST_CASE("scoped alloc counter does not perturb replay hash",
     REQUIRE(sim::diag::alloc_arm_depth() == 0);
 }
 
-// --- CC-002: feature-export contract honours the prefix-hash determinism -----
+// Feature-export contract honours prefix-hash determinism.
 TEST_CASE("sync feature export sink verifies prefix-hash parity",
           "[features][export-contract]") {
     sim::ReplayDriver replay(0, 100, 16);
@@ -3270,7 +3340,7 @@ TEST_CASE("sync feature export sink rejects reordered and duplicated frames",
     }
 }
 
-// --- CXM-001: dataset-size guard classifies and fails loud -------------------
+// Dataset-size guard classification and budget enforcement.
 TEST_CASE("dataset size guard is a no-op when disabled",
           "[replay][dataset-guard]") {
     sim::DatasetSizeBudget budget{};
@@ -3330,7 +3400,7 @@ TEST_CASE("dataset size guard tolerates an invalid warn fraction",
 }
 
 TEST_CASE("queue-state observer seeds queue-ahead and trades consume the front",
-          "[queue-state][observer][tier2]") {
+          "[queue-state][observer]") {
     sim::QueueStateObserver obs;
     // Our order rests behind 10 units already at the level.
     obs.on_submit(/*id=*/1, sim::Side::Buy, /*price=*/50, /*qty=*/5,
@@ -3371,7 +3441,7 @@ TEST_CASE("queue-state observer seeds queue-ahead and trades consume the front",
 }
 
 TEST_CASE("queue-state observer censors queue-ahead on unknown-position cancels",
-          "[queue-state][observer][censoring][tier2]") {
+          "[queue-state][observer][censoring]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Buy, 50, 5, 10, 100, /*qty_ahead=*/8);
 
@@ -3403,7 +3473,7 @@ TEST_CASE("queue-state observer censors queue-ahead on unknown-position cancels"
 }
 
 TEST_CASE("queue-state observer tracks fill lifecycle without lookahead",
-          "[queue-state][observer][lifecycle][tier2]") {
+          "[queue-state][observer][lifecycle]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Sell, 70, 6, 5, 50, /*qty_ahead=*/4);
 
@@ -3438,7 +3508,7 @@ TEST_CASE("queue-state observer tracks fill lifecycle without lookahead",
 }
 
 TEST_CASE("queue-state observer right-censors unresolved orders, fabricating nothing",
-          "[queue-state][observer][right-censoring][tier2]") {
+          "[queue-state][observer][right-censoring]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Buy, 50, 5, 1, 10, 0);  // never resolved
     obs.on_submit(2, sim::Side::Buy, 50, 5, 1, 10, 0);
@@ -3461,7 +3531,7 @@ TEST_CASE("queue-state observer right-censors unresolved orders, fabricating not
 }
 
 TEST_CASE("queue-state observer schema and metadata are explicit",
-          "[queue-state][observer][schema][tier2]") {
+          "[queue-state][observer][schema]") {
     REQUIRE(sim::kQueueStateExportSchema.size() == sim::kQueueStateExportCount);
     const auto meta = sim::queue_state_schema_meta();
     REQUIRE(meta.schema_name == "queue_state");
@@ -3481,7 +3551,7 @@ TEST_CASE("queue-state observer schema and metadata are explicit",
 }
 
 TEST_CASE("queue-state observer is replay-hash invariant: A/B against the real book",
-          "[queue-state][observer][replay-invariant][tier2]") {
+          "[queue-state][observer][replay-invariant]") {
     // The observer is an external read-only sink. Driving it from the SAME
     // observations must not perturb matching: the book's fills and top-of-book
     // trajectory are byte-identical with and without the observer attached.
@@ -3540,7 +3610,7 @@ TEST_CASE("queue-state observer is replay-hash invariant: A/B against the real b
 }
 
 TEST_CASE("execution-baseline taxonomy gates comparability to one harness",
-          "[execution][baseline-taxonomy][tier2]") {
+          "[execution][baseline-taxonomy]") {
     sim::TcaConventions conv{};
     conv.fee_sign = sim::FeeSignConvention::PositiveIsCost;
     conv.benchmark = sim::BenchmarkReference::ArrivalMid;
@@ -3577,7 +3647,7 @@ TEST_CASE("execution-baseline taxonomy gates comparability to one harness",
 }
 
 TEST_CASE("VWAP schedule completes the parent exactly via largest-remainder",
-          "[execution][vwap][tier2]") {
+          "[execution][vwap]") {
     sim::ParentExecutionOrder order{};
     order.parent_id = 9001;
     order.side = sim::Side::Sell;
@@ -3611,7 +3681,7 @@ TEST_CASE("VWAP schedule completes the parent exactly via largest-remainder",
 }
 
 TEST_CASE("POV schedule may honestly under-fill when volume runs out",
-          "[execution][pov][tier2]") {
+          "[execution][pov]") {
     sim::ParentExecutionOrder order{};
     order.side = sim::Side::Buy;
     order.qty = 100;
@@ -3658,7 +3728,7 @@ inline sim::BookObservables make_l1(sim::Tick best_bid, sim::Qty bid_qty,
 } // namespace
 
 TEST_CASE("consecutive-snapshot OFI follows the Cont-Kukanov-Stoikov signs",
-          "[ofi][microstructure][tier2]") {
+          "[ofi][microstructure]") {
     const auto base = make_l1(99, 10, 101, 12, 1, 100);
 
     SECTION("bid price up adds the new bid size") {
@@ -3702,7 +3772,7 @@ TEST_CASE("consecutive-snapshot OFI follows the Cont-Kukanov-Stoikov signs",
 }
 
 TEST_CASE("OFI is distinct from single-snapshot volume imbalance and censors gaps",
-          "[ofi][microstructure][censoring][tier2]") {
+          "[ofi][microstructure][censoring]") {
     // A balanced book with a one-sided OFI: equal qty both sides (volume
     // imbalance ~ 0) but the bid just stepped up -> strictly positive OFI.
     const auto prev = make_l1(99, 10, 101, 10, 1, 1);
@@ -3728,7 +3798,7 @@ TEST_CASE("OFI is distinct from single-snapshot volume imbalance and censors gap
 }
 
 TEST_CASE("depth sparsity exposes fixed-grid holes so zeros are not read as liquidity",
-          "[depth][sparsity][tier2]") {
+          "[depth][sparsity]") {
     sim::TopKBookSnapshot<4> snap{};
     snap.seq = 7;
     snap.ts = 70;
@@ -3750,7 +3820,7 @@ TEST_CASE("depth sparsity exposes fixed-grid holes so zeros are not read as liqu
 }
 
 TEST_CASE("allocation budget gates offline regions without affecting matching",
-          "[alloc][budget][tier2]") {
+          "[alloc][budget]") {
     using sim::diag::AllocBudget;
     using sim::diag::AllocStats;
 
@@ -3786,7 +3856,7 @@ TEST_CASE("allocation budget gates offline regions without affecting matching",
 }
 
 TEST_CASE("replay checkpoint verifies reproduced state and localizes divergence",
-          "[replay][checkpoint][tier2]") {
+          "[replay][checkpoint]") {
     sim::ReplayDiagnostics d{};
     d.input_events = 100;
     d.accepted_events = 95;
@@ -3847,7 +3917,7 @@ inline sim::QuoteInputs as_inputs(std::int64_t mid_x2, sim::Qty inv) {
 } // namespace
 
 TEST_CASE("AS quote skews against inventory and stays tick-valid",
-          "[quote-adapter][as][tier2]") {
+          "[quote-adapter][as]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);
 
     const auto flat = sim::make_as_quote(p, as_inputs(200, 0));   // mid = 100
@@ -3869,7 +3939,7 @@ TEST_CASE("AS quote skews against inventory and stays tick-valid",
 }
 
 TEST_CASE("AS quotes never cross across a parameter sweep",
-          "[quote-adapter][as][non-crossing][tier2]") {
+          "[quote-adapter][as][non-crossing]") {
     for (double gamma : {0.05, 0.1, 0.5}) {
         for (double k : {0.05, 0.1, 1.0}) {
             for (double sigma2 : {0.0, 0.5, 2.0}) {
@@ -3885,7 +3955,7 @@ TEST_CASE("AS quotes never cross across a parameter sweep",
     }
 }
 
-TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards][tier2]") {
+TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);  // flat quote is bid 93 / ask 107
 
     SECTION("invalid parameters yield no quote at all") {
@@ -3922,7 +3992,7 @@ TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards]
 }
 
 TEST_CASE("quote adapters never produce phantom fills, only SubmitLimit intents",
-          "[quote-adapter][no-phantom-fill][tier2]") {
+          "[quote-adapter][no-phantom-fill]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);
     const auto q = sim::make_as_quote(p, as_inputs(200, 0));
     const auto intents = sim::to_quote_intents(
@@ -3960,7 +4030,7 @@ inline bool approx_eq(double a, double b, double eps = 1e-9) {
 }
 
 TEST_CASE("impact diagnostics: direction-normalized realized sign",
-          "[impact-diagnostics][tier3][sign]") {
+          "[impact-diagnostics][sign]") {
     sim::ImpactObservation buy{};
     buy.side = sim::Side::Buy;
     buy.pre_mid_x2 = 200;    // mid 100.0
@@ -3976,7 +4046,7 @@ TEST_CASE("impact diagnostics: direction-normalized realized sign",
 }
 
 TEST_CASE("impact diagnostics: adverse move yields negative realized",
-          "[impact-diagnostics][tier3][adverse]") {
+          "[impact-diagnostics][adverse]") {
     sim::ImpactObservation o{};
     o.side = sim::Side::Buy;
     o.pre_mid_x2 = 200;
@@ -3987,14 +4057,14 @@ TEST_CASE("impact diagnostics: adverse move yields negative realized",
 }
 
 TEST_CASE("impact diagnostics: prediction is caller's coef, no internal fitting",
-          "[impact-diagnostics][tier3][no-fit]") {
+          "[impact-diagnostics][no-fit]") {
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(0.5, 4.0), 1.0));
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(0.5, -4.0), 1.0));
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(1.0, 4.0), 2.0));
 }
 
 TEST_CASE("impact diagnostics: known residual, rmse and bias",
-          "[impact-diagnostics][tier3][residual]") {
+          "[impact-diagnostics][residual]") {
     sim::ImpactObservation a{};
     a.side = sim::Side::Buy; a.participation = 1.0;
     a.pre_mid_x2 = 200; a.post_mid_x2 = 204;  // realized +2 -> residual +1
@@ -4012,7 +4082,7 @@ TEST_CASE("impact diagnostics: known residual, rmse and bias",
 }
 
 TEST_CASE("impact diagnostics: pending and missing-mid observations excluded",
-          "[impact-diagnostics][tier3][exclusions]") {
+          "[impact-diagnostics][exclusions]") {
     sim::ImpactObservation base{};
     base.side = sim::Side::Buy; base.participation = 1.0;
     base.pre_mid_x2 = 200; base.post_mid_x2 = 204;
@@ -4031,7 +4101,7 @@ TEST_CASE("impact diagnostics: pending and missing-mid observations excluded",
 }
 
 TEST_CASE("impact diagnostics: schema meta is event-time, diagnostics-only",
-          "[impact-diagnostics][tier3][schema]") {
+          "[impact-diagnostics][schema]") {
     const auto m = sim::impact_diagnostics_schema_meta();
     REQUIRE(m.timestamp_basis == sim::TimestampBasis::EventTime);
     REQUIRE(m.quantity_unit == sim::QuantityUnit::Ratio);
@@ -4041,7 +4111,7 @@ TEST_CASE("impact diagnostics: schema meta is event-time, diagnostics-only",
 #include "sim/survival_labels.hpp"
 
 TEST_CASE("survival: full fill within horizon resolves Filled",
-          "[survival][tier3][filled]") {
+          "[survival][filled]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 100; cfg.start_ts = 0; cfg.original_qty = 10;
     cfg.horizon_events = 50;
@@ -4054,7 +4124,7 @@ TEST_CASE("survival: full fill within horizon resolves Filled",
 }
 
 TEST_CASE("survival: partial fill stays Pending, then completes Filled",
-          "[survival][tier3][partial]") {
+          "[survival][partial]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4068,7 +4138,7 @@ TEST_CASE("survival: partial fill stays Pending, then completes Filled",
 }
 
 TEST_CASE("survival: partial fill then cancel -> CensoredCancel with filled recorded",
-          "[survival][tier3][cancel]") {
+          "[survival][cancel]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4081,7 +4151,7 @@ TEST_CASE("survival: partial fill then cancel -> CensoredCancel with filled reco
 }
 
 TEST_CASE("survival: cancel with no fills -> CensoredCancel filled 0",
-          "[survival][tier3][cancel-nofill]") {
+          "[survival][cancel-nofill]") {
     sim::SurvivalConfig cfg{};
     cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4091,7 +4161,7 @@ TEST_CASE("survival: cancel with no fills -> CensoredCancel filled 0",
 }
 
 TEST_CASE("survival: event horizon closes before fill -> CensoredHorizon at start+H",
-          "[survival][tier3][horizon-event]") {
+          "[survival][horizon-event]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 100; cfg.original_qty = 10; cfg.horizon_events = 50;
     sim::SurvivalTracker t(cfg);
@@ -4101,7 +4171,7 @@ TEST_CASE("survival: event horizon closes before fill -> CensoredHorizon at star
 }
 
 TEST_CASE("survival: time horizon closes -> CensoredHorizon at start_ts+H",
-          "[survival][tier3][horizon-time]") {
+          "[survival][horizon-time]") {
     sim::SurvivalConfig cfg{};
     cfg.start_ts = 1000; cfg.original_qty = 10; cfg.horizon_ns = 200;
     sim::SurvivalTracker t(cfg);
@@ -4111,7 +4181,7 @@ TEST_CASE("survival: time horizon closes -> CensoredHorizon at start_ts+H",
 }
 
 TEST_CASE("survival: fill at the horizon boundary is too late -> CensoredHorizon",
-          "[survival][tier3][late-fill]") {
+          "[survival][late-fill]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 50;
     sim::SurvivalTracker t(cfg);
@@ -4121,7 +4191,7 @@ TEST_CASE("survival: fill at the horizon boundary is too late -> CensoredHorizon
 }
 
 TEST_CASE("survival: end-of-data before horizon -> CensoredEndOfData (not Horizon)",
-          "[survival][tier3][end-of-data]") {
+          "[survival][end-of-data]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 1000;
     sim::SurvivalTracker t(cfg);
@@ -4133,7 +4203,7 @@ TEST_CASE("survival: end-of-data before horizon -> CensoredEndOfData (not Horizo
 }
 
 TEST_CASE("survival: same-seq fill-before-cancel -> full fill wins, cancel ignored",
-          "[survival][tier3][same-seq]") {
+          "[survival][same-seq]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4147,7 +4217,7 @@ TEST_CASE("survival: same-seq fill-before-cancel -> full fill wins, cancel ignor
 #include <limits>
 
 TEST_CASE("exploitability: incumbent best -> zero gain, never a certificate",
-          "[exploitability][tier3][no-gain]") {
+          "[exploitability][no-gain]") {
     const double devs[3] = {0.5, 0.9, 1.0};   // none beat incumbent 1.5
     const auto r = sim::probe_exploitability(1.5, devs, 3);
     REQUIRE(r.gain_lower_bound == 0.0);
@@ -4157,7 +4227,7 @@ TEST_CASE("exploitability: incumbent best -> zero gain, never a certificate",
 }
 
 TEST_CASE("exploitability: profitable deviation yields positive lower bound",
-          "[exploitability][tier3][gain]") {
+          "[exploitability][gain]") {
     const double devs[3] = {1.0, 2.5, 1.2};   // best 2.5 beats incumbent 2.0
     const auto r = sim::probe_exploitability(2.0, devs, 3);
     REQUIRE(sim_test::approx_eq(r.best_deviation_payoff, 2.5));
@@ -4166,7 +4236,7 @@ TEST_CASE("exploitability: profitable deviation yields positive lower bound",
 }
 
 TEST_CASE("exploitability: non-finite deviation payoffs are rejected, not compared",
-          "[exploitability][tier3][reject]") {
+          "[exploitability][reject]") {
     const double inf = std::numeric_limits<double>::infinity();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double devs[4] = {1.0, inf, nan, 2.2};
@@ -4178,7 +4248,7 @@ TEST_CASE("exploitability: non-finite deviation payoffs are rejected, not compar
 }
 
 TEST_CASE("exploitability: zero deviations -> gain 0 flagged no-deviations-tested",
-          "[exploitability][tier3][zero-dev]") {
+          "[exploitability][zero-dev]") {
     const auto r = sim::probe_exploitability(1.0, nullptr, 0);
     REQUIRE(r.gain_lower_bound == 0.0);
     REQUIRE(r.no_deviations_tested);
@@ -4187,7 +4257,7 @@ TEST_CASE("exploitability: zero deviations -> gain 0 flagged no-deviations-teste
 }
 
 TEST_CASE("exploitability: non-finite incumbent invalidates the gap",
-          "[exploitability][tier3][bad-incumbent]") {
+          "[exploitability][bad-incumbent]") {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double devs[2] = {1.0, 5.0};
     const auto r = sim::probe_exploitability(nan, devs, 2);
@@ -4199,7 +4269,7 @@ TEST_CASE("exploitability: non-finite incumbent invalidates the gap",
 #include "sim/accelerator_parity.hpp"
 
 TEST_CASE("accelerator parity: integer outputs must match exactly",
-          "[accelerator][tier3][int]") {
+          "[accelerator][int]") {
     const std::int64_t ref[4] = {1, 2, 3, 4};
     const std::int64_t same[4] = {1, 2, 3, 4};
     const std::int64_t diff[4] = {1, 2, 9, 4};
@@ -4213,7 +4283,7 @@ TEST_CASE("accelerator parity: integer outputs must match exactly",
 }
 
 TEST_CASE("accelerator parity: doubles within / beyond tolerance",
-          "[accelerator][tier3][double-tol]") {
+          "[accelerator][double-tol]") {
     const double ref[3] = {1.0, 2.0, 1e6};
     const double close[3] = {1.0 + 1e-12, 2.0, 1e6 + 1e-4};  // abs+rel ok
     const double far[3] = {1.0, 2.5, 1e6};                    // 2.5 vs 2.0 fails
@@ -4224,7 +4294,7 @@ TEST_CASE("accelerator parity: doubles within / beyond tolerance",
 }
 
 TEST_CASE("accelerator parity: size mismatch fails immediately",
-          "[accelerator][tier3][size]") {
+          "[accelerator][size]") {
     const std::int64_t a[3] = {1, 2, 3};
     const std::int64_t b[2] = {1, 2};
     const auto r = sim::check_parity_int(a, 3, b, 2);
@@ -4234,7 +4304,7 @@ TEST_CASE("accelerator parity: size mismatch fails immediately",
 }
 
 TEST_CASE("accelerator parity: non-finite double semantics are explicit",
-          "[accelerator][tier3][nonfinite]") {
+          "[accelerator][nonfinite]") {
     const double inf = std::numeric_limits<double>::infinity();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     sim::ParityTolerance tol{};
@@ -4246,7 +4316,7 @@ TEST_CASE("accelerator parity: non-finite double semantics are explicit",
 }
 
 TEST_CASE("accelerator parity: fast-but-wrong accelerator is rejected",
-          "[accelerator][tier3][parity-gates-speed]") {
+          "[accelerator][parity-gates-speed]") {
     const std::int64_t ref[3] = {10, 20, 30};
     const std::int64_t wrong[3] = {10, 20, 31};
     const auto parity = sim::check_parity_int(ref, 3, wrong, 3);
@@ -4257,7 +4327,7 @@ TEST_CASE("accelerator parity: fast-but-wrong accelerator is rejected",
 }
 
 TEST_CASE("accelerator parity: correct + faster accelerator is accepted",
-          "[accelerator][tier3][accepted]") {
+          "[accelerator][accepted]") {
     const std::int64_t ref[3] = {10, 20, 30};
     const std::int64_t same[3] = {10, 20, 30};
     const auto parity = sim::check_parity_int(ref, 3, same, 3);
@@ -4269,7 +4339,7 @@ TEST_CASE("accelerator parity: correct + faster accelerator is accepted",
 #include "sim/join_manifest.hpp"
 
 TEST_CASE("join manifest: causally clean join is usable",
-          "[join][tier4][usable]") {
+          "[join][usable]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.feature_ts = 1000;
     r.label_start_seq = 102; r.label_start_ts = 1200;  // starts after embargo
@@ -4282,7 +4352,7 @@ TEST_CASE("join manifest: causally clean join is usable",
 }
 
 TEST_CASE("join manifest: label starting at embargo boundary is leaky (seq)",
-          "[join][tier4][leaky-seq]") {
+          "[join][leaky-seq]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.label_start_seq = 101;  // == feature_seq + embargo(1)
     r.label_eval_seq = 105;
@@ -4292,7 +4362,7 @@ TEST_CASE("join manifest: label starting at embargo boundary is leaky (seq)",
 }
 
 TEST_CASE("join manifest: time embargo violation is leaky (time)",
-          "[join][tier4][leaky-time]") {
+          "[join][leaky-time]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.label_start_seq = 110;  r.label_eval_seq = 120;  // seq clean
     r.feature_ts = 1000;  r.label_start_ts = 1050;  // < feature_ts + embargo_ns(100)
@@ -4301,7 +4371,7 @@ TEST_CASE("join manifest: time embargo violation is leaky (time)",
 }
 
 TEST_CASE("join manifest: eval before start is non-causal",
-          "[join][tier4][non-causal]") {
+          "[join][non-causal]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 10; r.label_start_seq = 20; r.label_eval_seq = 15;  // eval < start
     sim::JoinPolicy p{};
@@ -4309,7 +4379,7 @@ TEST_CASE("join manifest: eval before start is non-causal",
 }
 
 TEST_CASE("join manifest: cross-split join is rejected",
-          "[join][tier4][split]") {
+          "[join][split]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 1; r.label_start_seq = 5; r.label_eval_seq = 9;
     r.label_start_ts = 50; r.label_eval_ts = 90;
@@ -4321,7 +4391,7 @@ TEST_CASE("join manifest: cross-split join is rejected",
 }
 
 TEST_CASE("join manifest: diagnostic-only rows never count as training labels",
-          "[join][tier4][diagnostic]") {
+          "[join][diagnostic]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 1; r.label_start_seq = 100; r.label_eval_seq = 200;
     r.diagnostic_only = true;
@@ -4331,7 +4401,7 @@ TEST_CASE("join manifest: diagnostic-only rows never count as training labels",
 }
 
 TEST_CASE("join manifest: summary tallies outcomes deterministically",
-          "[join][tier4][summary]") {
+          "[join][summary]") {
     sim::JoinPolicy p{}; p.embargo_events = 1;
     sim::JoinManifestSummary s{};
     sim::JoinManifestRow clean{};
@@ -4348,7 +4418,7 @@ TEST_CASE("join manifest: summary tallies outcomes deterministically",
 }
 
 TEST_CASE("join manifest: schema meta declares event-time basis",
-          "[join][tier4][schema]") {
+          "[join][schema]") {
     const auto m = sim::join_manifest_schema_meta();
     REQUIRE(m.schema_name == "join_manifest");
     REQUIRE(m.timestamp_basis == sim::TimestampBasis::EventTime);
@@ -4359,7 +4429,7 @@ TEST_CASE("join manifest: schema meta declares event-time basis",
 // (a) A causal/embargoed join passes the hook, the frame is admitted to the
 // export sink, and the hook exports the join-manifest schema-meta.
 TEST_CASE("join wiring: causal join is admitted and exports the manifest meta",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::JoinPolicy p{};
     p.embargo_events = 1;
     p.embargo_ns = 100;
@@ -4391,7 +4461,7 @@ TEST_CASE("join wiring: causal join is admitted and exports the manifest meta",
 // contract: the labelled frame is DROPPED (never admitted to the sink) and the
 // leak is observable via the hook's summary / any_leak().
 TEST_CASE("join wiring: leaky join is flagged and dropped from the export path",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::JoinPolicy p{};
     p.embargo_events = 1;
     sim::JoinManifestExportHook hook(p);
@@ -4424,7 +4494,7 @@ TEST_CASE("join wiring: leaky join is flagged and dropped from the export path",
 // is byte-for-byte unchanged -- a plain sink fed via on_frame admits frames and
 // enforces prefix-hash parity exactly as before the wiring.
 TEST_CASE("join wiring: unused hook leaves existing export behaviour unchanged",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::SyncFeatureExportSink sink;
     sink.on_frame(sim::ExportFrame{.seq = 1, .replay_hash = 11});
     sink.on_frame(sim::ExportFrame{.seq = 2, .replay_hash = 22});
@@ -4441,10 +4511,7 @@ TEST_CASE("join wiring: unused hook leaves existing export behaviour unchanged",
     REQUIRE(sink.accepted_frames() == 2);
 }
 
-// ============================================================================
-// RTA-001: Reward ledger disjointness from TCA
-// ============================================================================
-TEST_CASE("RTA-001: reward ledger is disjoint from TCA", "[rta][reward][tca]") {
+TEST_CASE("reward ledger operations and conventions", "[reward][tca]") {
     sim::RewardLedger ledger;
     sim::RewardKey key{.parent_id = 1, .agent = 2, .source = 3};
 
@@ -4529,11 +4596,8 @@ TEST_CASE("RTA-001: reward ledger is disjoint from TCA", "[rta][reward][tca]") {
     }
 }
 
-// ============================================================================
-// RTA-005: Reward-contamination unit tests (replay-hash neutral)
-// ============================================================================
-TEST_CASE("RTA-005: reward ledger does not contaminate TCA",
-          "[rta][contamination][tca]") {
+TEST_CASE("reward ledger does not contaminate TCA",
+          "[reward][contamination][tca]") {
     sim::RewardLedger reward_ledger;
     sim::TcaSummary tca_summary{};
 
@@ -4564,11 +4628,8 @@ TEST_CASE("RTA-005: reward ledger does not contaminate TCA",
     REQUIRE(rs->cumulative_reward_x1e6 != tca_summary.passive_qty);  // different types, different meanings
 }
 
-// ============================================================================
-// RTA-004: Three-risk diagnostic triplet (no netting)
-// ============================================================================
-TEST_CASE("RTA-004: three-risk triplet has independent fields",
-          "[rta][three-risk][no-netting]") {
+TEST_CASE("three-risk triplet has independent fields",
+          "[three-risk][no-netting]") {
     sim::ThreeRiskTriplet triplet{};
 
     SECTION("default values are zero") {
@@ -4960,5 +5021,267 @@ TEST_CASE("Lean-aligned Bitwise vEB 128/256/512, ARM MSB-first, Offset-Binary, G
     sim::EliasFanoIndex ef(sorted_ts);
     for (std::size_t i = 0; i < sorted_ts.size(); ++i) {
         REQUIRE(ef.get(i) == sorted_ts[i]);
+    }
+}
+
+TEST_CASE("FlatLadderBook zero-allocation hot path across passive add, add_into, cancel, and queue_ahead",
+          "[flat-ladder][alloc-probe][hot-path]") {
+#ifndef QRLOB_SANITIZER_ACTIVE
+    {
+        sim::diag::ScopedAllocCounter positive_ctrl;
+        std::vector<int> dummy(64, 1);
+        REQUIRE(dummy[0] == 1);
+        REQUIRE(positive_ctrl.delta().allocations >= 1);
+    }
+#endif
+
+    sim::FlatLadderBook book(90, 110, 512);
+    sim::Trade trade_buf[16]{};
+
+    sim::diag::AllocStats hot_delta{};
+    {
+        sim::diag::ScopedAllocCounter counter;
+
+        // 1. Passive Limit adds via add() and add_into()
+        for (int i = 0; i < 64; ++i) {
+            const sim::Order bid = make_limit_order(1, sim::Side::Buy, static_cast<sim::Tick>(95 - (i & 3)), 10);
+            const sim::Order ask = make_limit_order(2, sim::Side::Sell, static_cast<sim::Tick>(105 + (i & 3)), 10);
+            const auto r_bid = book.add(bid, static_cast<sim::TimeNs>(i * 2 + 1));
+            const auto s_ask = book.add_into(ask, static_cast<sim::TimeNs>(i * 2 + 2), trade_buf, 16);
+            REQUIRE(r_bid.filled == 0);
+            REQUIRE(r_bid.remaining == 10);
+            REQUIRE(s_ask.filled == 0);
+            REQUIRE(s_ask.remaining == 10);
+            REQUIRE(s_ask.trade_count == 0);
+        }
+
+        // 2. PostOnly (passive and crossing-rejected) and rejected FOK/IOC
+        sim::Order po_ok{.qty = 15, .orig_qty = 15, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        REQUIRE(book.add(po_ok, 500).remaining == 15);
+        sim::Order po_rej{.qty = 15, .orig_qty = 15, .price = 105, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        REQUIRE(book.add(po_rej, 501).remaining == 0);
+        sim::Order fok_rej{.qty = 5000, .orig_qty = 5000, .price = 108, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        REQUIRE(book.add(fok_rej, 502).filled == 0);
+
+        // 3. L3 queue_ahead queries and top-of-book queries
+        for (sim::OrderId id = 1; id <= 32; ++id) {
+            auto qa = book.queue_ahead(id);
+            REQUIRE(qa.has_value());
+        }
+        sim::Tick bb = 0, ba = 0, mid2 = 0;
+        sim::Qty bv = 0, av = 0;
+        REQUIRE(book.best_bid(bb, bv));
+        REQUIRE(book.best_ask(ba, av));
+        REQUIRE(book.mid_tick_x2(mid2));
+        REQUIRE(book.volume_at(sim::Side::Buy, 99) == 15);
+
+        // 4. Multi-fill crossing orders via add_into()
+        sim::Order sweep_buy = make_limit_order(9, sim::Side::Buy, 108, 85);
+        const auto sweep = book.add_into(sweep_buy, 600, trade_buf, 16);
+        REQUIRE(sweep.filled == 85);
+        REQUIRE(sweep.remaining == 0);
+        REQUIRE(sweep.trade_count == 9);
+        REQUIRE(trade_buf[0].qty == 10);
+        REQUIRE(trade_buf[8].qty == 5);
+
+        // 5. O(1) cancellations
+        for (sim::OrderId id = 1; id <= 32; id += 2) {
+            REQUIRE(book.cancel(id, 700 + id));
+        }
+
+        hot_delta = counter.delta();
+    }
+
+    REQUIRE(hot_delta.allocations == 0);
+    REQUIRE(hot_delta.bytes == 0);
+    REQUIRE(book.check_invariants_report().ok);
+}
+
+TEST_CASE("Empty/invalid FlatLadderBook, Tick overflow guards, and non-positive qty handling",
+          "[flat-ladder][lob][edge-cases]") {
+    SECTION("Invalid FlatLadderBook(100, 90) queries and mutations are safe") {
+        sim::FlatLadderBook invalid(100, 90);
+        REQUIRE_FALSE(invalid.is_valid());
+        REQUIRE(invalid.tick_count() == 0);
+        REQUIRE(invalid.is_empty());
+
+        sim::Tick p = -1;
+        sim::Qty v = 99;
+        REQUIRE_FALSE(invalid.best_bid(p, v));
+        REQUIRE(p == 100);
+        REQUIRE(v == 0);
+        REQUIRE_FALSE(invalid.best_ask(p, v));
+        REQUIRE(p == 100);
+        REQUIRE(v == 0);
+
+        sim::Tick sum = 99;
+        REQUIRE_FALSE(invalid.mid_tick_x2(sum));
+        REQUIRE(sum == 0);
+
+        double mid = 99.0;
+        REQUIRE_FALSE(invalid.mid_price(mid));
+
+        REQUIRE(invalid.volume_at(sim::Side::Buy, 100) == 0);
+        REQUIRE(invalid.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min()) == 0);
+        REQUIRE(invalid.volume_at(sim::Side::Sell, std::numeric_limits<sim::Tick>::max()) == 0);
+
+        auto res = invalid.add(make_limit_order(1, sim::Side::Buy, 100, 10), 10);
+        REQUIRE(res.filled == 0);
+        REQUIRE(res.remaining == 0);
+        auto sum_res = invalid.add_into(make_limit_order(1, sim::Side::Buy, 100, 10), 10, nullptr, 0);
+        REQUIRE(sum_res.filled == 0);
+        REQUIRE(sum_res.remaining == 0);
+        REQUIRE(invalid.order_count() == 0);
+        REQUIRE(invalid.event_count() == 0);
+    }
+
+    SECTION("Extreme Tick values in volume_at do not overflow signed int32") {
+        sim::FlatLadderBook book(90, 110);
+        book.add(make_limit_order(1, sim::Side::Buy, 100, 25), 1);
+        REQUIRE(book.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min()) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min() + 1) == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, std::numeric_limits<sim::Tick>::max()) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 25);
+    }
+
+    SECTION("Zero and negative qty orders are rejected without resting or consuming OrderId") {
+        sim::FlatLadderBook flat(90, 110);
+        sim::LimitOrderBook tree;
+
+        for (sim::Qty bad_qty : {sim::Qty{0}, sim::Qty{-5}}) {
+            for (sim::OrderType tp : {sim::OrderType::Limit, sim::OrderType::PostOnly,
+                                      sim::OrderType::Market, sim::OrderType::IOC,
+                                      sim::OrderType::FOK}) {
+                sim::Order o{.qty = bad_qty, .orig_qty = bad_qty, .price = 100, .side = sim::Side::Buy, .type = tp};
+                auto rf = flat.add(o, 100);
+                auto sf = flat.add_into(o, 100, nullptr, 0);
+                auto rt = tree.add(o);
+                REQUIRE(rf.filled == 0);
+                REQUIRE(rf.remaining == 0);
+                REQUIRE(sf.filled == 0);
+                REQUIRE(sf.remaining == 0);
+                REQUIRE(rt.filled == 0);
+                REQUIRE(rt.remaining == 0);
+            }
+        }
+        REQUIRE(flat.order_count() == 0);
+        REQUIRE(tree.order_count() == 0);
+        REQUIRE(flat.check_invariants_report().ok);
+
+        // Next valid order still receives OrderId = 1 in both books
+        flat.add(make_limit_order(1, sim::Side::Buy, 100, 10), 200);
+        tree.add(make_limit_order(1, sim::Side::Buy, 100, 10));
+        REQUIRE(flat.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+        REQUIRE(tree.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+    }
+
+    SECTION("Out-of-range PostOnly does not rest and reports 0 remaining") {
+        sim::FlatLadderBook flat(90, 110);
+        sim::Order po_low{.qty = 20, .orig_qty = 20, .price = 80, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto r1 = flat.add(po_low, 10);
+        REQUIRE(r1.filled == 0);
+        REQUIRE(r1.remaining == 0);
+        REQUIRE(flat.order_count() == 0);
+    }
+}
+
+TEST_CASE("FOK + Self-Trade Prevention exact pre-flight parity in FlatLadderBook and LimitOrderBook",
+          "[flat-ladder][lob][fok][stp]") {
+    auto test_both = [](auto&& fn) {
+        sim::FlatLadderBook flat(90, 110);
+        sim::LimitOrderBook tree;
+        fn(flat, tree);
+        REQUIRE(flat.check_invariants_report().ok);
+        require_same_book_state(tree, flat, 90, 110);
+    };
+
+    SECTION("CancelAggressive: self-order blocking full fill rejects FOK with zero mutation") {
+        test_both([](auto& flat, auto& tree) {
+            // Agent 2 has 20 lots ahead of Agent 1's 30 lots at 100 Ask
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 100, 20), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 2);
+
+            // Agent 1 submits FOK Buy for 40 lots under CancelAggressive -> must reject!
+            sim::Order fok{.qty = 40, .agent = 1, .orig_qty = 40, .price = 100,
+                           .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                           .stp = sim::StpMode::CancelAggressive};
+            const auto rf = flat.add(fok, 3);
+            const auto rt = tree.add(fok);
+            REQUIRE(rf.trades.empty());
+            REQUIRE(rf.filled == 0);
+            REQUIRE(rf.remaining == 0);
+            REQUIRE(rt.trades.empty());
+            REQUIRE(rt.filled == 0);
+            REQUIRE(rt.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 50);
+
+            // Agent 1 submits FOK Buy for 20 lots under CancelAggressive -> fills 20 against Agent 2 before reaching self-order!
+            sim::Order fok_ok{.qty = 20, .agent = 1, .orig_qty = 20, .price = 100,
+                              .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                              .stp = sim::StpMode::CancelAggressive};
+            const auto rf2 = flat.add(fok_ok, 4);
+            const auto rt2 = tree.add(fok_ok);
+            REQUIRE(rf2.filled == 20);
+            REQUIRE(rf2.remaining == 0);
+            REQUIRE(rt2.filled == 20);
+            REQUIRE(rt2.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 30);
+        });
+    }
+
+    SECTION("DecrementAndCancel: self-order blocking full fill rejects FOK with zero mutation") {
+        test_both([](auto& flat, auto& tree) {
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 100, 20), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 2);
+
+            sim::Order fok{.qty = 30, .agent = 1, .orig_qty = 30, .price = 100,
+                           .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                           .stp = sim::StpMode::DecrementAndCancel};
+            const auto rf = flat.add(fok, 3);
+            const auto rt = tree.add(fok);
+            REQUIRE(rf.trades.empty());
+            REQUIRE(rf.filled == 0);
+            REQUIRE(rf.remaining == 0);
+            REQUIRE(rt.trades.empty());
+            REQUIRE(rt.filled == 0);
+            REQUIRE(rt.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 50);
+        });
+    }
+
+    SECTION("CancelPassive: FOK counts only non-self liquidity and cancels self-orders only when fillable") {
+        test_both([](auto& flat, auto& tree) {
+            // Agent 1 has 30 lots @ 100 Ask, Agent 2 has 25 lots @ 101 Ask
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 101, 25), 90, 110, 2);
+
+            // Agent 1 FOK Buy 40 @ 101 with CancelPassive: non-self liquidity is 25 < 40 -> rejected without cancelling Agent 1's ask!
+            sim::Order fok_rej{.qty = 40, .agent = 1, .orig_qty = 40, .price = 101,
+                               .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                               .stp = sim::StpMode::CancelPassive};
+            const auto rf1 = flat.add(fok_rej, 3);
+            const auto rt1 = tree.add(fok_rej);
+            REQUIRE(rf1.trades.empty());
+            REQUIRE(rf1.filled == 0);
+            REQUIRE(rt1.trades.empty());
+            REQUIRE(rt1.filled == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 30);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 101) == 25);
+
+            // Agent 1 FOK Buy 25 @ 101 with CancelPassive: non-self liquidity is 25 >= 25 -> cancels Agent 1's 30 @ 100 and fills 25 @ 101!
+            sim::Order fok_ok{.qty = 25, .agent = 1, .orig_qty = 25, .price = 101,
+                              .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                              .stp = sim::StpMode::CancelPassive};
+            const auto rf2 = flat.add(fok_ok, 4);
+            const auto rt2 = tree.add(fok_ok);
+            REQUIRE(rf2.trades.size() == 1);
+            REQUIRE(rf2.filled == 25);
+            REQUIRE(rf2.remaining == 0);
+            REQUIRE(rt2.trades.size() == 1);
+            REQUIRE(rt2.filled == 25);
+            REQUIRE(rt2.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 101) == 0);
+        });
     }
 }

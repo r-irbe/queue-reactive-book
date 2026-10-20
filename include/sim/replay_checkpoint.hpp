@@ -6,17 +6,8 @@
 
 namespace sim {
 
-// --- Checkpoint-verification Snapshot (Tier-2 PROTOTYPE, offline/replay) -------
-//
-// A verifiable checkpoint of replay progress for offline/replay paths (roadmap
-// replay R4). It binds the deterministic content digest (`replay_hash`, already
-// maintained by ReplayDiagnostics and EXCLUDING any of the cold-path observer
-// counters) with the progress counters and the last causal position, so a run
-// that is resumed, restored from a snapshot, or re-executed can VERIFY it
-// reproduced the same state instead of trusting that it did. It is derived
-// read-only from ReplayDiagnostics, never feeds back into matching, and the
-// frozen kernel never includes this header -- so taking a checkpoint cannot
-// change the replay it describes.
+// Verifiable replay progress snapshot binding `replay_hash`, event/trade counts,
+// last causal (seq, ts) position, and ordering-violation counters.
 
 struct ReplayCheckpoint {
     std::uint64_t input_events = 0;

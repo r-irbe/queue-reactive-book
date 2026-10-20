@@ -10,16 +10,10 @@
 
 namespace sim {
 
-// --- Offline market-impact DIAGNOSTIC scorer (Tier-3 item 12, diagnostics-only)
+// Market-impact residual scorer comparing direction-normalized post-trade mid
+// moves against a square-root participation law (`coef * sqrt(|participation|)`).
 //
-// Roadmap item 12 asks for "calibrated impact models". This scaffold deliberately
-// does NOT fit/calibrate anything and makes NO model claim: it is an offline
-// SCORER that, given a caller-supplied coefficient, measures how well a
-// square-root impact magnitude law tracks realized post-trade mid moves. Any
-// calibration/claim of correctness stays DEFERRED until real data exists. It is
-// header-only, cold-path, and never feeds back into the frozen matching kernel.
-//
-// Sign convention (FIXED, direction-normalized -- never mixed with raw signed):
+// Sign convention (direction-normalized):
 //   side_sign = +1 for Buy, -1 for Sell.
 //   realized_impact_ticks = side_sign * (post_mid_x2 - pre_mid_x2) / 2.0
 //     -> POSITIVE when the mid moves WITH the aggressing trade (buy pushes up,

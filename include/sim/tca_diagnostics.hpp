@@ -1,18 +1,8 @@
 #pragma once
 
-// tca_diagnostics.hpp -- RTA-004: Three-risk diagnostic triplet (no netting)
-//
-// Extends TCA/diagnostics export to emit three SEPARATE risk fields:
-//   1. Maker adversity risk (passive fill adverse selection)
-//   2. Taker adversity risk (aggressive fill adverse selection)
-//   3. Queue risk (queue-position/recognition risk)
-//
-// INVARIANT: These three risks are NEVER netted, summed, or averaged into a
-// single "total risk" number. Each is exported independently so downstream
-// consumers can weight them per their own risk policy.
-//
-// KERNEL: This header does NOT touch flat_ladder_book.cpp/.hpp. It lives in
-// the TCA/diagnostics export layer, consumed by offline analysis only.
+// Un-netted three-component execution risk export: maker adverse selection,
+// taker adverse selection, and queue-position opportunity cost (in doubled ticks).
+// Components are exported as separate columns without summing into a single scalar.
 
 #include "export_schema.hpp"
 #include "types.hpp"
@@ -66,15 +56,7 @@ inline constexpr std::array<ExportColumn, kThreeRiskExportCount>
         {"queue_risk_qty"}
     }};
 
-// --- No-netting invariant ------------------------------------------------------
-//
-// This function exists to be called from tests (RTA-005 family) to assert that
-// no downstream code ever adds or averages the three risk fields. If someone
-// writes `triplet.maker_adversity_x2 + triplet.taker_adversity_x2`, a test
-// calling this function with the result should FAIL.
-//
-// The function returns a string label that tests can check against expected
-// patterns. If a "total" label appears, the test fails.
+// Predicate verifying that a `ThreeRiskTriplet` preserves separate risk axes.
 
 inline constexpr std::string_view kNoNettingViolated = "NETTING_VIOLATION";
 

@@ -1,17 +1,8 @@
 #pragma once
 
-// Dataset-size guard (CXM-001, post-Tranche-4 code synthesis).
-//
-// Offline, opt-in pre-flight check that decides whether an expected replay
-// dataset fits the in-RAM budget BEFORE work starts, so an oversized job fails
-// loud instead of thrashing swap or being OOM-killed mid-run. This is a
-// STANDALONE utility: it is intentionally NOT wired into `ReplayPipelineConfig`
-// (no replay-input importer consumes it yet, so wiring it would create a dead,
-// misleading config field -- see rubber-duck critique). A caller that knows the
-// expected event/byte counts uses it explicitly at the edge of a job.
-//
-// The matching kernel (`flat_ladder_book.{hpp,cpp}`) is frozen and never
-// includes this header.
+// Pre-flight memory and event-count budget check for in-RAM replay datasets.
+// Classifies expected (events, bytes) into InRam, Warn, or Refuse against
+// caller-configured limits (0 = unbounded on that axis).
 
 #include <cstdint>
 #include <stdexcept>

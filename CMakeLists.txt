@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(QRLOB_BUILD_EXPERIMENTAL "Build experimental Project Q absorbed replay/SPSC/Hawkes/parity surface" ON)
+option(QRLOB_BUILD_EXPERIMENTAL "Build experimental replay, SPSC bridge, Hawkes calibration, and parity surface" ON)
 
 add_library(qrlob_core STATIC
     src/flat_ladder_book.cpp
@@ -19,7 +19,17 @@ target_compile_options(qrlob_core PRIVATE
 )
 
 add_executable(sim src/main.cpp)
+target_include_directories(sim PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 target_link_libraries(sim PRIVATE qrlob_core)
+
+add_executable(sim_bench bench/main.cpp)
+target_include_directories(sim_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/test_shim
+)
+target_link_libraries(sim_bench PRIVATE qrlob_core)
 
 enable_testing()
 

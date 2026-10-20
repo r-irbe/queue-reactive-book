@@ -203,11 +203,8 @@ private:
     }
 };
 
-// --- Deterministic risk accept/reject audit (Tier-1, non-kernel) --------------
-// Opt-in observer that records every RiskGuard decision so a replayed strategy
-// produces a stable, inspectable accept/reject trail with a per-reason
-// decomposition. It changes no RiskGuard logic and never feeds the matching
-// kernel; it is the closure evidence for stateful-risk replay scenarios.
+// Deterministic accept/reject decision log and per-reason reject tallies for
+// `RiskGuard` evaluations during strategy replay.
 struct RiskAuditRecord {
     EventSeq seq = 0;
     TimeNs ts = 0;

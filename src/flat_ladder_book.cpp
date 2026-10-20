@@ -5,8 +5,15 @@
 
 namespace sim {
 namespace {
-// Sentinel for "no best price index cached".
 constexpr std::size_t kNpos = std::numeric_limits<std::size_t>::max();
+
+constexpr std::size_t compute_tick_span(Tick min_tick, Tick max_tick) noexcept {
+  if (max_tick < min_tick) {
+    return 0;
+  }
+  return static_cast<std::size_t>(static_cast<std::int64_t>(max_tick) -
+                                  static_cast<std::int64_t>(min_tick) + 1);
+}
 } // namespace
 
 FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
@@ -15,37 +22,28 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
                                CompactionConfig /*compaction_cfg*/,
                                std::size_t arena_bytes) noexcept
     : arena_(arena_bytes == 0
-                 ? suggest_arena_bytes(
-                       expected_orders +
-                       static_cast<std::size_t>(max_tick >= min_tick
-                                                    ? (max_tick - min_tick + 1)
-                                                    : 0))
+                 ? suggest_arena_bytes(expected_orders +
+                                       compute_tick_span(min_tick, max_tick))
                  : arena_bytes,
              std::pmr::new_delete_resource()),
       pool_(&arena_), levels_(resource()), node_pool_(resource()),
       level_side_(resource()), level_bitmap_(resource()),
-      id_refs_(resource()), id_live_(resource()),
+      summary_bitmap_(resource()), id_refs_(resource()), id_live_(resource()),
       min_tick_(min_tick), max_tick_(max_tick),
-      tick_count_(max_tick >= min_tick
-                      ? static_cast<std::size_t>(max_tick - min_tick + 1)
-                      : 0),
+      tick_count_(compute_tick_span(min_tick, max_tick)),
       is_valid_(max_tick >= min_tick) {
   if (!is_valid_) {
     return;
   }
   levels_.resize(tick_count_);
   level_side_.assign(tick_count_, kNoSide);
-  // Bitmap: 1 bit per ladder slot; words are 64-bit so we round up.
   const std::size_t num_level_words = (tick_count_ + 63) / 64;
   level_bitmap_.assign(num_level_words, 0);
   summary_bitmap_.assign((num_level_words + 63) / 64, 0);
 
-  // Pre-reserve node pool and id index for expected orders
   node_pool_.reserve(expected_orders);
-  id_refs_.reserve(expected_orders + 1);
-  id_live_.reserve(expected_orders + 1);
-  id_refs_.resize(1);
-  id_live_.resize(1, 0);
+  id_refs_.resize(expected_orders + 1);
+  id_live_.assign(expected_orders + 1, 0);
 }
 
 std::unique_ptr<FlatLadderBook> FlatLadderBook::create(Tick min_tick,
@@ -53,7 +51,8 @@ std::unique_ptr<FlatLadderBook> FlatLadderBook::create(Tick min_tick,
                                                        std::size_t expected_orders,
                                                        std::size_t arena_bytes) noexcept {
   if (max_tick < min_tick) return nullptr;
-  return std::unique_ptr<FlatLadderBook>(new (std::nothrow) FlatLadderBook(min_tick, max_tick, expected_orders, false, {}, arena_bytes));
+  return std::unique_ptr<FlatLadderBook>(new (std::nothrow) FlatLadderBook(
+      min_tick, max_tick, expected_orders, false, {}, arena_bytes));
 }
 
 bool FlatLadderBook::has_order_ref(OrderId id) const noexcept {
@@ -63,9 +62,10 @@ bool FlatLadderBook::has_order_ref(OrderId id) const noexcept {
 
 void FlatLadderBook::set_order_ref(OrderId id, const OrderRef &ref) {
   const auto idx = static_cast<std::size_t>(id);
-  if (idx >= id_refs_.size()) {
-    id_refs_.resize(idx + 1);
-    id_live_.resize(idx + 1, 0);
+  if (idx >= id_refs_.size()) [[unlikely]] {
+    const std::size_t next_cap = std::max(idx + 1, id_refs_.size() * 2);
+    id_refs_.resize(next_cap);
+    id_live_.resize(next_cap, 0);
   }
   id_refs_[idx] = ref;
   if (id_live_[idx] == 0) {
@@ -87,15 +87,17 @@ OrderRef FlatLadderBook::get_order_ref(OrderId id) const noexcept {
 }
 
 bool FlatLadderBook::in_range(Tick price) const noexcept {
-  return (tick_count_ > 0) & (price >= min_tick_) & (price <= max_tick_);
+  return (tick_count_ > 0) && (price >= min_tick_) && (price <= max_tick_);
 }
 
 std::size_t FlatLadderBook::index_of(Tick price) const noexcept {
-  return static_cast<std::size_t>(price - min_tick_);
+  return static_cast<std::size_t>(static_cast<std::int64_t>(price) -
+                                  static_cast<std::int64_t>(min_tick_));
 }
 
 Tick FlatLadderBook::price_of(std::size_t idx) const noexcept {
-  return static_cast<Tick>(min_tick_ + static_cast<Tick>(idx));
+  return static_cast<Tick>(static_cast<std::int64_t>(min_tick_) +
+                           static_cast<std::int64_t>(idx));
 }
 
 IntrusiveLevel &FlatLadderBook::level_at(std::size_t idx) noexcept {
@@ -126,14 +128,44 @@ void FlatLadderBook::free_slot(std::uint32_t slot) noexcept {
   free_head_ = slot;
 }
 
-bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market) const noexcept {
+bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty,
+                                  bool is_market, AgentId taker_agent,
+                                  StpMode stp) const noexcept {
+  if (!is_valid_ || qty <= 0) {
+    return is_valid_ && qty == 0;
+  }
   Qty available = 0;
+
+  auto accumulate_level = [&](std::size_t idx, bool &aborted) noexcept -> bool {
+    if (stp == StpMode::None) {
+      available += levels_[idx].volume;
+      return available >= qty;
+    }
+    for (std::uint32_t curr = levels_[idx].head_slot; curr != kNullSlot;
+         curr = node_pool_[curr].next_slot) {
+      const IntrusiveOrderNode &maker = node_pool_[curr];
+      if (maker.qty <= 0) continue;
+      if (maker.agent == taker_agent) {
+        if (stp == StpMode::CancelAggressive ||
+            stp == StpMode::DecrementAndCancel) {
+          aborted = true;
+          return available >= qty;
+        }
+        continue;
+      }
+      available += maker.qty;
+      if (available >= qty) return true;
+    }
+    return false;
+  };
+
   if (is_buy(side)) {
     for (std::size_t idx = best_ask_idx_; idx != kNpos && idx < tick_count_;) {
       if (!is_market && price_of(idx) > price) break;
-      available += levels_[idx].volume;
-      if (available >= qty) return true;
-      // Seek next ask level via 2-level bitwise vEB summary
+      bool aborted = false;
+      if (accumulate_level(idx, aborted)) return true;
+      if (aborted) return false;
+
       const std::size_t next_idx = idx + 1;
       if (next_idx >= tick_count_) break;
       std::size_t word = next_idx >> 6;
@@ -143,19 +175,23 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
       std::size_t found = kNpos;
       if (w != 0) {
         found = (word << 6) + static_cast<std::size_t>(__builtin_ctzll(w));
+        if (found >= tick_count_) found = kNpos;
       } else {
-        const std::size_t nw_idx = word + 1;
-        if (nw_idx < level_bitmap_.size()) {
-          const std::size_t sw = nw_idx >> 6;
-          const std::size_t sb = nw_idx & 63;
+        const std::size_t nw = word + 1;
+        if (nw < level_bitmap_.size()) {
+          const std::size_t sw = nw >> 6;
+          const std::size_t sb = nw & 63;
           const std::uint64_t s_mask = (~std::uint64_t{0}) << sb;
           for (std::size_t s = sw; s < summary_bitmap_.size(); ++s) {
             std::uint64_t s_val = summary_bitmap_[s];
             if (s == sw) s_val &= s_mask;
             if (s_val != 0) {
-              const std::size_t tw = (s << 6) + static_cast<std::size_t>(__builtin_ctzll(s_val));
+              const std::size_t tw =
+                  (s << 6) + static_cast<std::size_t>(__builtin_ctzll(s_val));
               if (tw < level_bitmap_.size()) {
-                found = (tw << 6) + static_cast<std::size_t>(__builtin_ctzll(level_bitmap_[tw]));
+                found = (tw << 6) +
+                        static_cast<std::size_t>(__builtin_ctzll(level_bitmap_[tw]));
+                if (found >= tick_count_) found = kNpos;
                 break;
               }
             }
@@ -167,8 +203,10 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
   } else {
     for (std::size_t idx = best_bid_idx_; idx != kNpos;) {
       if (!is_market && price_of(idx) < price) break;
-      available += levels_[idx].volume;
-      if (available >= qty) return true;
+      bool aborted = false;
+      if (accumulate_level(idx, aborted)) return true;
+      if (aborted) return false;
+
       if (idx == 0) break;
       const std::size_t prev_idx = idx - 1;
       std::size_t word = prev_idx >> 6;
@@ -187,9 +225,12 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
           std::uint64_t s_val = summary_bitmap_[static_cast<std::size_t>(s)];
           if (static_cast<std::size_t>(s) == sw) s_val &= s_mask;
           if (s_val != 0) {
-            const std::size_t tw = (static_cast<std::size_t>(s) << 6) + static_cast<std::size_t>(63 - __builtin_clzll(s_val));
+            const std::size_t tw =
+                (static_cast<std::size_t>(s) << 6) +
+                static_cast<std::size_t>(63 - __builtin_clzll(s_val));
             if (tw < level_bitmap_.size()) {
-              found = (tw << 6) + static_cast<std::size_t>(63 - __builtin_clzll(level_bitmap_[tw]));
+              found = (tw << 6) +
+                      static_cast<std::size_t>(63 - __builtin_clzll(level_bitmap_[tw]));
               break;
             }
           }
@@ -202,82 +243,173 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty, bool is_market
 }
 
 ExecutionResult FlatLadderBook::add(Order order, TimeNs ts, StpMode stp) {
+  ExecutionResult result;
+  if (!is_valid_ || order.qty <= 0) [[unlikely]] {
+    return result;
+  }
+
   book_time_ = ts;
   order.id = next_id_++;
   order.orig_qty = order.qty;
-  const StpMode effective_stp = (stp != StpMode::None)
-                                    ? stp
-                                    : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
+  const StpMode effective_stp =
+      (stp != StpMode::None)
+          ? stp
+          : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
 
-  ExecutionResult result;
-  result.trades.reserve(8);
-
-  // 1. Post-Only Pre-flight Check:
-  // Must rest passively as a maker; if it would cross the spread, reject immediately.
   if (order.type == OrderType::PostOnly) {
     if (is_buy(order.side)) {
       if (best_ask_idx_ != kNpos && price_of(best_ask_idx_) <= order.price) {
-        result.remaining = 0;
-        result.filled = 0;
         ++event_count_;
         return result;
       }
     } else {
       if (best_bid_idx_ != kNpos && price_of(best_bid_idx_) >= order.price) {
-        result.remaining = 0;
-        result.filled = 0;
         ++event_count_;
         return result;
       }
     }
-    if (in_range(order.price)) {
-      rest(order);
+    if (!in_range(order.price)) {
+      ++event_count_;
+      return result;
     }
+    rest(order);
     result.remaining = order.qty;
-    result.filled = 0;
     ++event_count_;
     return result;
   }
 
-  // 2. Fill-Or-Kill (FOK) Pre-flight Liquidity Check:
   if (order.type == OrderType::FOK) {
-    if (!can_fill_fok(order.side, order.price, order.qty, false)) {
-      result.remaining = 0;
-      result.filled = 0;
+    if (!can_fill_fok(order.side, order.price, order.qty, false, order.agent,
+                      effective_stp)) {
       ++event_count_;
       return result;
     }
   }
 
-  // 3. Matching Dispatch:
   const bool is_limit = (order.type == OrderType::Limit ||
                          order.type == OrderType::IOC ||
                          order.type == OrderType::FOK);
 
+  auto record_trade = [&](const Trade &tr) {
+    if (result.trades.empty()) {
+      result.trades.reserve(4);
+    }
+    result.trades.push_back(tr);
+    result.filled += tr.qty;
+  };
+
   if (is_buy(order.side)) {
-    if (is_limit) match_incoming<Side::Buy,  true >(order, result, order.price, ts, effective_stp);
-    else          match_incoming<Side::Buy,  false>(order, result, order.price, ts, effective_stp);
+    if (is_limit)
+      match_incoming<Side::Buy, true>(order, record_trade, order.price, ts,
+                                      effective_stp);
+    else
+      match_incoming<Side::Buy, false>(order, record_trade, order.price, ts,
+                                       effective_stp);
   } else {
-    if (is_limit) match_incoming<Side::Sell, true >(order, result, order.price, ts, effective_stp);
-    else          match_incoming<Side::Sell, false>(order, result, order.price, ts, effective_stp);
+    if (is_limit)
+      match_incoming<Side::Sell, true>(order, record_trade, order.price, ts,
+                                       effective_stp);
+    else
+      match_incoming<Side::Sell, false>(order, record_trade, order.price, ts,
+                                        effective_stp);
   }
 
-  // 4. Residual Resting Policy:
-  // Standard Limit rests if unfilled and in-range.
-  // Market, IOC, and FOK NEVER rest any remaining quantity.
   if (order.type == OrderType::Limit && order.qty > 0 && in_range(order.price)) {
     rest(order);
   }
 
   result.remaining = order.qty;
-  result.filled = order.orig_qty - order.qty;
   ++event_count_;
   return result;
 }
 
-template <Side TakerSide, bool IsLimit>
+MatchSummary FlatLadderBook::add_into(Order order, TimeNs ts, Trade *trade_buf,
+                                      std::size_t trade_cap,
+                                      StpMode stp) noexcept {
+  MatchSummary summary{};
+  if (!is_valid_ || order.qty <= 0) [[unlikely]] {
+    return summary;
+  }
+
+  book_time_ = ts;
+  order.id = next_id_++;
+  order.orig_qty = order.qty;
+  summary.id = order.id;
+  const StpMode effective_stp =
+      (stp != StpMode::None)
+          ? stp
+          : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
+
+  if (order.type == OrderType::PostOnly) {
+    if (is_buy(order.side)) {
+      if (best_ask_idx_ != kNpos && price_of(best_ask_idx_) <= order.price) {
+        ++event_count_;
+        return summary;
+      }
+    } else {
+      if (best_bid_idx_ != kNpos && price_of(best_bid_idx_) >= order.price) {
+        ++event_count_;
+        return summary;
+      }
+    }
+    if (!in_range(order.price)) {
+      ++event_count_;
+      return summary;
+    }
+    rest(order);
+    summary.remaining = order.qty;
+    ++event_count_;
+    return summary;
+  }
+
+  if (order.type == OrderType::FOK) {
+    if (!can_fill_fok(order.side, order.price, order.qty, false, order.agent,
+                      effective_stp)) {
+      ++event_count_;
+      return summary;
+    }
+  }
+
+  const bool is_limit = (order.type == OrderType::Limit ||
+                         order.type == OrderType::IOC ||
+                         order.type == OrderType::FOK);
+
+  auto record_trade = [&](const Trade &tr) noexcept {
+    if (trade_buf != nullptr && summary.trade_count < trade_cap) {
+      trade_buf[summary.trade_count] = tr;
+    }
+    ++summary.trade_count;
+    summary.filled += tr.qty;
+  };
+
+  if (is_buy(order.side)) {
+    if (is_limit)
+      match_incoming<Side::Buy, true>(order, record_trade, order.price, ts,
+                                      effective_stp);
+    else
+      match_incoming<Side::Buy, false>(order, record_trade, order.price, ts,
+                                       effective_stp);
+  } else {
+    if (is_limit)
+      match_incoming<Side::Sell, true>(order, record_trade, order.price, ts,
+                                       effective_stp);
+    else
+      match_incoming<Side::Sell, false>(order, record_trade, order.price, ts,
+                                        effective_stp);
+  }
+
+  if (order.type == OrderType::Limit && order.qty > 0 && in_range(order.price)) {
+    rest(order);
+  }
+
+  summary.remaining = order.qty;
+  ++event_count_;
+  return summary;
+}
+
+template <Side TakerSide, bool IsLimit, typename TradeSink>
 [[gnu::hot]]
-void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
+void FlatLadderBook::match_incoming(Order &incoming, TradeSink &&on_trade,
                                     Tick limit_price, TimeNs ts, StpMode stp) {
   constexpr bool kBuy = (TakerSide == Side::Buy);
 
@@ -300,7 +432,6 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
       const std::uint32_t slot = level.head_slot;
       IntrusiveOrderNode &maker = node_pool_[slot];
 
-      // Self-Trade Prevention (STP) check
       if (incoming.agent == maker.agent && stp != StpMode::None) {
         if (stp == StpMode::CancelPassive) {
           const Qty c_qty = maker.qty;
@@ -347,15 +478,16 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
       }
 
       const Qty fill = std::min(incoming.qty, maker.qty);
-      out.trades.push_back(Trade{.maker_id   = maker.id,
-                                 .taker_id   = incoming.id,
-                                 .maker      = maker.agent,
-                                 .taker      = incoming.agent,
-                                 .taker_side = incoming.side,
-                                 .price      = maker_price,
-                                 .qty        = fill,
-                                 .ts         = ts});
-      maker.qty    -= fill;
+      on_trade(Trade{.maker_id   = maker.id,
+                     .taker_id   = incoming.id,
+                     .maker      = maker.agent,
+                     .taker      = incoming.agent,
+                     .taker_side = incoming.side,
+                     .price      = maker_price,
+                     .qty        = fill,
+                     .ts         = ts});
+
+      maker.qty -= fill;
       level.volume -= fill;
       incoming.qty -= fill;
       constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
@@ -387,11 +519,6 @@ void FlatLadderBook::match_incoming(Order &incoming, ExecutionResult &out,
     }
   }
 }
-
-template void FlatLadderBook::match_incoming<Side::Buy,  true >(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
-template void FlatLadderBook::match_incoming<Side::Buy,  false>(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
-template void FlatLadderBook::match_incoming<Side::Sell, true >(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
-template void FlatLadderBook::match_incoming<Side::Sell, false>(Order &, ExecutionResult &, Tick, TimeNs, StpMode);
 
 void FlatLadderBook::rest(Order &order) {
   order.enqueue_ts = book_time_;
@@ -431,7 +558,7 @@ void FlatLadderBook::rest(Order &order) {
   }
 }
 
-bool FlatLadderBook::cancel(OrderId id, TimeNs ts) {
+bool FlatLadderBook::cancel(OrderId id, TimeNs ts) noexcept {
   book_time_ = ts;
   if (!has_order_ref(id)) [[unlikely]]
     return false;
@@ -449,7 +576,6 @@ bool FlatLadderBook::cancel(OrderId id, TimeNs ts) {
   total_vol_[static_cast<std::uint8_t>(ref.side) & 1] -= cancelled_qty;
   --level.live_orders;
 
-  // True O(1) unlinking in intrusive doubly-linked list
   if (node.prev_slot != kNullSlot) {
     node_pool_[node.prev_slot].next_slot = node.next_slot;
   } else {
@@ -489,43 +615,51 @@ std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
   if (node_pool_[target_slot].qty == 0) return std::nullopt;
 
   Qty ahead = 0;
-  for (std::uint32_t curr = lvl.head_slot; curr != kNullSlot && curr != target_slot; curr = node_pool_[curr].next_slot) {
+  for (std::uint32_t curr = lvl.head_slot;
+       curr != kNullSlot && curr != target_slot;
+       curr = node_pool_[curr].next_slot) {
     ahead += node_pool_[curr].qty;
   }
   return ahead;
 }
 
 bool FlatLadderBook::best_bid(Tick &price, Qty &volume) const noexcept {
-  const bool has = (best_bid_idx_ != kNpos);
-  const std::size_t idx = has ? best_bid_idx_ : 0;
-  price = price_of(idx);
-  volume = levels_[idx].volume * has;
-  return has;
+  if (best_bid_idx_ == kNpos || tick_count_ == 0) {
+    price = min_tick_;
+    volume = 0;
+    return false;
+  }
+  price = price_of(best_bid_idx_);
+  volume = levels_[best_bid_idx_].volume;
+  return true;
 }
 
 bool FlatLadderBook::best_ask(Tick &price, Qty &volume) const noexcept {
-  const bool has = (best_ask_idx_ != kNpos);
-  const std::size_t idx = has ? best_ask_idx_ : 0;
-  price = price_of(idx);
-  volume = levels_[idx].volume * has;
-  return has;
+  if (best_ask_idx_ == kNpos || tick_count_ == 0) {
+    price = min_tick_;
+    volume = 0;
+    return false;
+  }
+  price = price_of(best_ask_idx_);
+  volume = levels_[best_ask_idx_].volume;
+  return true;
 }
 
 bool FlatLadderBook::mid_tick_x2(Tick &sum) const noexcept {
-  const bool has_bid = (best_bid_idx_ != kNpos);
-  const bool has_ask = (best_ask_idx_ != kNpos);
-  const bool valid = has_bid & has_ask;
-  const std::size_t bid_idx = has_bid ? best_bid_idx_ : 0;
-  const std::size_t ask_idx = has_ask ? best_ask_idx_ : 0;
-  sum = static_cast<Tick>(price_of(bid_idx) + price_of(ask_idx));
-  return valid;
+  if (best_bid_idx_ == kNpos || best_ask_idx_ == kNpos || tick_count_ == 0) {
+    sum = 0;
+    return false;
+  }
+  sum = static_cast<Tick>(price_of(best_bid_idx_) + price_of(best_ask_idx_));
+  return true;
 }
 
 Qty FlatLadderBook::volume_at(Side side, Tick price) const noexcept {
-  const bool in_b = (price >= min_tick_) & (price <= max_tick_);
-  const std::size_t idx = static_cast<std::size_t>(price - min_tick_) * in_b;
-  const bool side_match = (level_side_[idx] == side_tag(side)) & in_b;
-  return levels_[idx].volume * side_match;
+  if (!in_range(price)) {
+    return 0;
+  }
+  const std::size_t idx = index_of(price);
+  return level_side_[idx] == side_tag(side) ? levels_[idx].volume : 0;
 }
 
 bool FlatLadderBook::mid_price(double &price) const noexcept {
@@ -660,7 +794,6 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
     return;
   }
 
-  // 2-level bitwise vEB summary jump for lower words
   if (word == 0) {
     best_bid_idx_ = kNpos;
     return;
@@ -705,7 +838,6 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
     return;
   }
 
-  // 2-level bitwise vEB summary jump for higher words
   const std::size_t next_word = word + 1;
   if (next_word >= level_bitmap_.size()) {
     best_ask_idx_ = kNpos;

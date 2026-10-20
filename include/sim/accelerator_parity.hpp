@@ -6,19 +6,10 @@
 
 namespace sim {
 
-// --- Offline accelerator PARITY + benchmark gate (Tier-3 item 16) --------------
-//
-// Roadmap item 16 (offline CUDA/cache accelerators): "parity + benchmark FIRST".
-// This scaffold is the acceptance gate, not an accelerator: it compares a trusted
-// reference output against a candidate accelerator output and decides
-// acceptability. The HARD INVARIANT is that acceptance is gated on PARITY ALONE
-// -- a faster-but-wrong accelerator is always rejected, no matter the speedup.
-// Header-only, cold-path; never feeds the frozen matching kernel.
-//
-// Integer outputs must match EXACTLY. Double outputs match within a combined
-// absolute + relative tolerance. Non-finite semantics are explicit: two NaNs
-// agree, same-signed infinities agree, a finite-vs-non-finite pair is a
-// mismatch. A size mismatch fails parity immediately (no out-of-bounds compare).
+// Numerical parity and speedup acceptance checks comparing candidate accelerator
+// outputs against a reference output. Integer arrays must match exactly;
+// floating-point arrays match within combined absolute/relative tolerance with
+// explicit NaN/Inf agreement. Acceptance requires parity regardless of speedup.
 
 struct ParityTolerance {
     double abs_tol = 1e-9;

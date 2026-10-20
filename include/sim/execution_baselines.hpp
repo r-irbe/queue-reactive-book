@@ -109,16 +109,9 @@ inline std::vector<StrategyIntent> make_twap_limit_schedule(
     return out;
 }
 
-// --- Execution-baseline taxonomy under one harness (Tier-2 PROTOTYPE) ---------
-//
-// PROTOTYPE. The point of a baseline taxonomy is that execution baselines are
-// only meaningful when compared under the SAME fees, latency, arrival/terminal
-// benchmark, and residual convention -- i.e. the same `TcaConventions`. This
-// taxonomy labels each baseline family and binds a run to the conventions it was
-// evaluated under, and `baselines_comparable()` enforces that two baseline
-// results sit on one footing before they are ranked. Every generator emits
-// ordinary tick-valid `StrategyIntent`s through the frozen kernel/replay path --
-// never model-implied (phantom) fills.
+// Execution baseline schedule generators (NoTrade, MarketLiquidation, TWAP,
+// TwapLimit, VWAP, POV) and comparability check (`baselines_comparable`) tying
+// each schedule to a parent order and `TcaConventions`.
 
 enum class ExecutionBaselineKind : std::uint8_t {
     NoTrade = 0,

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -141,7 +142,15 @@ inline BenchmarkTarget* RegisterBenchmark(const char* name, BenchmarkFn fn) {
     return t;
 }
 
-inline int RunSpecifiedBenchmarks() {
+inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
+    std::string filter;
+    for (int i = 1; i < argc && argv != nullptr; ++i) {
+        const char* arg = argv[i];
+        if (std::strncmp(arg, "--benchmark_filter=", 19) == 0) {
+            filter = arg + 19;
+        }
+    }
+
     std::cout << "--------------------------------------------------------------------------------\n";
     std::cout << std::left << std::setw(42) << "Benchmark"
               << std::right << std::setw(14) << "Time (ns)"
@@ -162,6 +171,10 @@ inline int RunSpecifiedBenchmarks() {
                     label += std::to_string(args[k]);
                 }
             }
+            if (!filter.empty() && label.find(filter) == std::string::npos &&
+                target->name.find(filter) == std::string::npos) {
+                continue;
+            }
 
             State state(args, 25);
             target->fn(state);
@@ -181,6 +194,14 @@ inline int RunSpecifiedBenchmarks() {
             } else {
                 std::cout << std::setw(16) << "-";
             }
+
+            for (const auto& [k, c] : state.counters) {
+                double val = c.value;
+                if ((c.flags & Counter::kAvgIterations) != 0) {
+                    val /= static_cast<double>(iters);
+                }
+                std::cout << "  " << k << "=" << std::fixed << std::setprecision(1) << val;
+            }
             std::cout << "\n";
         }
     }
@@ -195,6 +216,6 @@ inline int RunSpecifiedBenchmarks() {
         ::benchmark::RegisterBenchmark(#fn, fn)
 
 #define BENCHMARK_MAIN() \
-    int main(int, char*[]) { \
-        return ::benchmark::RunSpecifiedBenchmarks(); \
+    int main(int argc, char* argv[]) { \
+        return ::benchmark::RunSpecifiedBenchmarks(argc, argv); \
     }

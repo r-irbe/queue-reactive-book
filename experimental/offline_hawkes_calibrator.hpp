@@ -1,9 +1,5 @@
-// Copyright (c) 2026 Open-WebUI & Project Q Systems Engineering
-// SPDX-License-Identifier: Apache-2.0
-//
-// Experimental offline Hawkes/queue-reactive calibrator and VPIN toxicity
-// replay surface absorbed from /home/radu/code/q (commit f190d0a4).
-// Isolated from the -fno-exceptions matching core behind QRLOB_BUILD_EXPERIMENTAL.
+// Offline dyadic Hawkes point-process intensity replay, moment-based
+// branching-ratio calibrator, and equal-volume VPIN flow-toxicity evaluator.
 
 #pragma once
 

@@ -14,14 +14,9 @@ struct ExportColumn {
     std::size_t col = 0;
 };
 
-// --- Export schema metadata contract (Tier-1, non-kernel, cold path) ----------
-// Additive descriptor that travels with any exported feature/label/TCA frame so
-// a downstream consumer can interpret the numbers WITHOUT out-of-band knowledge.
-// Motivating failure (roadmap T1 counterexample): two byte-identical numeric
-// tensors -- one ticks/event-time/no-labels, the other notional/wall-clock with
-// a future label horizon -- compare equal yet mean different things. This
-// metadata makes that difference explicit and machine-checkable. It changes no
-// existing column array and never feeds back into the frozen matching kernel.
+// Schema metadata descriptor for exported feature, label, and TCA frames.
+// Records schema version, timestamp basis, price/quantity units, missing-value
+// policy, and forward label horizon so consumers can verify compatibility.
 
 enum class TimestampBasis : std::uint8_t {
     Unspecified = 0,

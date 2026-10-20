@@ -11,28 +11,10 @@
 
 namespace sim {
 
-// --- Queue-state / per-order lifecycle observability (Tier-2 PROTOTYPE) -------
-//
-// PROTOTYPE, GATED. This is a cold-path OBSERVER surface: it reconstructs a
-// best-estimate per-order queue position and lifecycle from observations the
-// caller supplies (resting qty ahead at submit, aggregate level trades/cancels,
-// own fills/cancels). It NEVER holds a `FlatLadderBook` handle, never mutates
-// matching, and is replay-hash invariant by construction -- driving it changes
-// no book state or matching output (demonstrated by an A/B fixture).
-//
-// Honesty boundary (roadmap T3): `queue_ahead_qty` is EXACT only while
-// `queue_ahead_censored == false`. Real market data rarely exposes true order
-// rank, so any ambiguous event (unknown-position cancel, an aggregate trade that
-// reaches/crosses the order, or an own fill that proves the queue-ahead estimate
-// was stale) sets `queue_ahead_censored`, after which the field is a lower-
-// confidence estimate, not ground-truth rank. Aggregate level trades update
-// queue-ahead ONLY; per-order fill/lifecycle is driven solely by `on_own_fill`/
-// `on_own_cancel` so aggregate prints can never fabricate own executions.
-//
-// FIFO assumption: trades consume the front of a price-time queue, so a level
-// trade reduces every tracked order's queue-ahead by the consumed amount. This
-// holds for the discrete-tick FIFO sim; it does NOT hold under pro-rata,
-// scope for this prototype and, where observable, should set the censor flag.
+// Per-order queue-position and lifecycle observer driven by level trades,
+// level cancels, and own execution callbacks. `queue_ahead_qty` is exact while
+// `queue_ahead_censored == false`; ambiguous cancels or trades reaching the
+// estimated position set `queue_ahead_censored = true`.
 
 enum class QueueLifecycle : std::uint8_t {
     Resting = 0,

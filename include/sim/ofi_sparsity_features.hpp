@@ -9,13 +9,8 @@
 
 namespace sim {
 
-// --- Consecutive-snapshot OFI + actual-depth sparsity (Tier-2 PROTOTYPE) ------
-//
-// PROTOTYPE addressing the roadmap critique "OFI is not yet OFI": the existing
-// `BookObservables::imbalance_l1` is a single-snapshot VOLUME imbalance
-// (bid_qty-ask_qty)/(bid_qty+ask_qty), NOT order-flow imbalance. True OFI
-// (Cont-Kukanov-Stoikov 2014, "The price impact of order book events") is a
-// signed quantity derived from TWO consecutive L1 snapshots:
+// Consecutive-snapshot L1 Order Flow Imbalance (Cont, Kukanov, Stoikov 2014)
+// and populated-depth sparsity metrics across a fixed-K level grid:
 //
 //   bid term:  P_b up   -> +q_b(t)
 //              P_b same -> +(q_b(t) - q_b(t-1))

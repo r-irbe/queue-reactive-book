@@ -1,31 +1,8 @@
 #pragma once
 
-// Feature-export contract (CC-002, post-Tranche-4 code synthesis).
-//
-// DESIGN-ONLY contract for streaming per-event feature frames out of the
-// replay/observability layer to a downstream feature sink. This header
-// deliberately defines no threads, queues, buffering, backpressure, or
-// lifecycle. It fixes the *shape* and the *determinism contract* that any
-// future async exporter must honour, and ships one synchronous reference sink
-// used as a test oracle.
-//
-// The matching kernel (`flat_ladder_book.{hpp,cpp}`) is frozen; this layer sits
-// strictly around the book and never feeds back into matching.
-//
-// Determinism contract (PREFIX-HASH, per rubber-duck critique):
-//   Each `ExportFrame` carries the replay hash AS OF the event it describes --
-//   i.e. the deterministic `ReplayDiagnostics::replay_hash` after that event has
-//   been applied (a "prefix" hash of the event stream so far). Consequences:
-//     * Frame `seq` values are strictly monotonically increasing.
-//     * The hash on the final frame equals the replay's final `replay_hash`.
-//     * A correct exporter, replayed twice on the same input, emits an
-//       identical sequence of (seq, replay_hash) pairs.
-//   This is strictly stronger than only checking the final hash: it pins every
-//   prefix, so a frame dropped/duplicated/reordered in the middle is detectable.
-//
-// A real asynchronous exporter (ring buffer + consumer thread) is DEFERRED.
-// When built, it must reproduce the exact (seq, replay_hash) sequence this
-// synchronous oracle produces; any divergence is a contract violation.
+// Deterministic feature-export frame contract and synchronous reference sink.
+// Each `ExportFrame` binds book observables at `seq` to the cumulative
+// `replay_hash` after that event, enforcing strictly increasing sequence order.
 
 #include "book_observables.hpp"
 #include "event_trace.hpp"
@@ -89,21 +66,8 @@ private:
     bool have_last_ = false;
 };
 
-// --- T4-1 wiring: opt-in feature->label join-manifest validation hook ---------
-//
-// OPT-IN, NON-BREAKING. This hook lets a feature/label exporter gate each frame's
-// feature->label join against a causality/embargo/split policy BEFORE a labelled
-// row is admitted downstream, and surfaces the JoinValidity verdict plus the
-// join-manifest schema-meta through the export-contract path. It is purely
-// additive: constructing (or not constructing) it changes no `ExportFrame`, no
-// `SyncFeatureExportSink` behaviour, and no existing export output. When unused,
-// the export path is byte-identical to before. It never touches the frozen
-// matching kernel, imputes, reorders, or mutates any exported column; it only
-// inspects already-exported feature/label row coordinates.
-//
-// Determinism: a pure function of the integer seq/time/split inputs (delegates to
-// `validate_join`). Allocation-conscious: holds a fixed-size running summary and
-// allocates nothing per validation.
+// Gates exported feature frames against a `JoinPolicy` causality and embargo
+// check before forwarding usable rows to a `FeatureExportSink`.
 class JoinManifestExportHook {
 public:
     JoinManifestExportHook() noexcept = default;

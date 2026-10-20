@@ -1,8 +1,7 @@
 #pragma once
-// Lean-Aligned Bitwise van Emde Boas (vEB) Templates, Cross-ISA MSB-First Bitboard,
-// Boustrophedon Reflection, Offset-Binary, Knuth Gray Subset Basket, and Elias-Fano Coding.
-// Aligned with Lean 4 module: Rules.BitwiseVebWarpCodec
-// Strict 7-bit ASCII compliance (INV-001).
+// Fixed-width bitwise van Emde Boas (vEB) bitsets (128/256/512-bit), MSB-first
+// bitboard, offset-binary tick codec, Gray-code subset evaluator, and Elias-Fano
+// monotone sequence index.
 
 #include <array>
 #include <bit>
@@ -170,7 +169,7 @@ struct KnuthGrayBasket {
     }
 };
 
-// 7. Elias-Fano Quasi-Succinct Monotonic Sequence Index (Tier 1.5 Bridge)
+// 7. Elias-Fano Quasi-Succinct Monotonic Sequence Index
 class EliasFanoIndex {
 public:
     explicit EliasFanoIndex(const std::vector<std::uint64_t>& sorted) {
