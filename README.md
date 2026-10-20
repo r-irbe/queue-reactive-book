@@ -8,31 +8,31 @@ The matching core compiles cleanly under `-fno-exceptions` and runs without heap
 
 How does order-entry latency shift the balance between spread capture and adverse selection?
 
-Faster cancels shed resting quotes before a mid-price move sweeps them. Slower cancels hold queue priority longer when the inside level remains stable. Holding the matching rules fixed while varying quote latency, spread width, and inventory penalties exposes how those quantities trade off on the same order book.
+Faster cancels shed resting quotes before a mid-price move sweeps them. Slower cancels hold queue priority longer when the inside level remains stable. Holding the matching rules fixed while sweeping quote latency against spread width and inventory penalties exposes how those quantities trade off on the same order book.
 
 ## Book Implementations
 
-Two order book engines implement the same price-time (FIFO) matching semantics, order types, and self-trade prevention modes:
+Two order book engines share the same price-time (FIFO) matching rules across all supported order types and self-trade prevention modes:
 
-1. `FlatLadderBook` (`include/sim/flat_ladder_book.hpp`, `src/flat_ladder_book.cpp`) maps a bounded `[min_price, max_price]` tick range onto a flat `std::pmr` level array paired with a 64-bit word summary bitmap (`ctzll`/`clzll` inside-price discovery in `O(N/64)` words). Resting orders live in a pre-reserved intrusive doubly-linked slot pool (`Node`), so `cancel(OrderId)` unlinks in `O(1)` time without tombstones or compaction sweeps. For callers that supply a pre-allocated `Trade*` buffer, `add_into(...)` executes both passive placement and multi-fill crosses with zero heap allocations.
+1. `FlatLadderBook` (`include/sim/flat_ladder_book.hpp`, `src/flat_ladder_book.cpp`) maps a bounded `[min_price, max_price]` tick range onto a flat `std::pmr` level array paired with a two-level 64-bit word summary bitmap (`ctzll`/`clzll` inside-price discovery). Resting orders live in a pre-reserved intrusive doubly-linked slot pool (`IntrusiveOrderNode`), so `cancel(OrderId)` unlinks in `O(1)` time without tombstones or compaction sweeps. When callers supply a pre-allocated `Trade*` buffer via `add_into(...)`, both passive placement and multi-fill crosses execute with zero heap allocations.
 2. `LimitOrderBook` (`include/sim/lob.hpp`, `src/lob.cpp`) stores active price levels in a `std::pmr::map` backed by an upstream `monotonic_buffer_resource` and `unsynchronized_pool_resource`. Cancelled orders mark tombstone slots that compact lazily when dead slots exceed configurable thresholds (`CompactionConfig`), making it a general-purpose reference engine for unbounded tick ranges.
 
 Both engines support five order types (`Limit`, `Market`, `PostOnly`, `IOC`, `FOK`) and four self-trade prevention policies (`None`, `CancelPassive`, `CancelAggressive`, `DecrementAndCancel`). Calling `FlatLadderBook::queue_ahead(OrderId)` walks the intrusive FIFO list from `head_slot` to the target node in `O(k)` steps (where `k` is the number of resting orders ahead at that tick) to report exact volume ahead of a resting quote.
 
 ## Modules
 
- Headers under `include/sim/` group into four layers:
+Headers under `include/sim/` group into four layers:
 
 - Core matching and arrival process: `types.hpp`, `flat_ladder_book.hpp`, `lob.hpp`, and `queue_reactive.hpp` (`QueueReactiveProcess`, coupling Huang-Lehalle-Rosenbaum queue-size tables with a dyadic Hawkes arrival intensity).
-- Observation, quoting, and risk controls: `queue_state_observer.hpp` (normalized queue depletion and touch imbalance), `ofi_sparsity_features.hpp` (multi-level order flow imbalance and gap ratios), `quote_adapters.hpp` (discrete tick-offset and continuous Avellaneda-Stoikov targets), and `risk_guard.hpp` (hard position limits, inventory skew, and drawdown circuit breakers).
-- Evaluation, TCA, and RL accounting: `reward_ledger.hpp` (per-step PnL decomposition into cash flow, mark-to-mid, inventory penalty, and terminal liquidation), `execution_baselines.hpp` (TWAP, passive-pegged, and immediate-sweep benchmarks), `tca.hpp` and `tca_diagnostics.hpp` (implementation shortfall and adverse selection attribution), `impact_diagnostics.hpp` (response and cross-impact curves), `survival_labels.hpp` (competing-risks fill vs. cancel labels), and `exploitability_probe.hpp` (frozen-opponent best-response probes).
+- Observation and quoting controls: `queue_state_observer.hpp` (normalized queue depletion and touch imbalance), `ofi_sparsity_features.hpp` (multi-level order flow imbalance and gap ratios), `quote_adapters.hpp` (discrete tick-offset and continuous Avellaneda-Stoikov targets), and `risk_guard.hpp` (hard position limits paired with inventory skew and drawdown circuit breakers).
+- Evaluation and transaction-cost accounting: `reward_ledger.hpp` (per-step PnL decomposition into cash flow and mark-to-mid changes net of inventory penalties and terminal liquidation), `execution_baselines.hpp` (TWAP schedules alongside passive-pegged and immediate-sweep benchmarks), `tca.hpp` and `tca_diagnostics.hpp` (implementation shortfall and adverse selection attribution), `impact_diagnostics.hpp` (response and cross-impact curves), `survival_labels.hpp` (competing-risks fill vs. cancel labels), and `exploitability_probe.hpp` (frozen-opponent best-response probes).
 - Replay and schema contracts: `replay_checkpoint.hpp` (deterministic book and PRNG snapshot validation), `export_schema.hpp`, `feature_export_contract.hpp`, `join_manifest.hpp`, `dataset_size_guard.hpp`, `alloc_probe.hpp`, and `bitwise_veb_codings.hpp`.
 
 Offline replay and cross-implementation parity harnesses live in [`experimental/`](experimental/README.md) behind the `QRLOB_BUILD_EXPERIMENTAL` build flag. Nothing in `src/` or `include/sim/` depends on `experimental/`.
 
 ## Benchmarks
 
-Measured with `./build/sim_bench` on a dual AMD EPYC 7453 (56 cores / 112 threads, Linux x86_64, GCC 13):
+Measured with `./build/sim_bench` on a dual AMD EPYC 7453 (56 cores / 112 threads, Linux x86_64, GCC 16):
 
 | Benchmark (`N = 4096` unless noted) | Default (`-O2`) | Release LTO (`-O3 -flto=auto -march=native`) | Heap Allocs / Op |
 | --- | --- | --- | --- |
@@ -88,5 +88,5 @@ ctest --test-dir build_cmake --output-on-failure
 
 Dual-licensed under [`LICENSE`](LICENSE):
 
-1. **PolyForm Noncommercial License 1.0.0** for non-commercial, academic research, educational study, and evaluation use with attribution.
-2. **Commercial License & AI/Automated-Translation Provenance Notice** for commercial or proprietary trading deployment, quantitative fund use, or automated/AI-assisted translation into another language. Commercial inquiries: Radu Irbe (GitHub: `r-irbe`).
+1. **PolyForm Noncommercial License 1.0.0** for non-commercial academic research and educational evaluation with attribution.
+2. **Commercial License & AI/Automated-Translation Provenance Notice** for commercial or proprietary trading deployment (including quantitative fund production use and automated or AI-assisted code translation). Commercial inquiries: Radu Irbe (GitHub: `r-irbe`).
