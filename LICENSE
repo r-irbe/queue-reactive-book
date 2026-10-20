@@ -3,79 +3,117 @@ https://polyformproject.org/licenses/noncommercial/1.0.0/
 
 Copyright (c) 2026 Radu Irbe. All rights reserved.
 
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
+================================================================================
+PART I: POLYFORM NONCOMMERCIAL LICENSE 1.0.0
+(Non-Commercial, Academic Research, and Non-Production Evaluation Use)
+================================================================================
 
-1. Purpose: You may only use, copy, modify, and distribute this software for
-   Noncommercial Purposes. "Noncommercial Purposes" means purposes that are
-   not Commercial Purposes.
+Acceptance: In order to get any license under these terms, you must agree to
+them as both strict obligations and conditions to all your licenses.
 
-2. Commercial Purpose Restriction: You may not use this software for any
-   Commercial Purpose without obtaining a separate commercial license from the
-   licensor. "Commercial Purposes" means any use of this software, or any work
-   derived from it, in any manner that is intended for or directed toward
-   commercial advantage or monetary compensation, including but not limited to
-   direct or indirect financial gain, proprietary trading, high-frequency
-   trading, algorithmic execution, commercial hosting, proprietary market
-   simulation, SaaS offerings, consulting services, or internal use by
-   for-profit business entities.
+Copyright License: The licensor grants you a copyright license for the software
+to do everything you might do with the software that would otherwise infringe
+the licensor's copyright in it for any permitted purpose. However, you may
+only distribute the software according to Distribution License and make changes
+or new works based on the software according to Changes and New Works License.
 
-3. Attribution and Notices: You must retain the copyright notice above and this
-   license text in all copies or substantial portions of the software.
+Distribution License: The licensor grants you an additional copyright license
+to distribute copies of the software. Your license to distribute covers
+distributing the software with changes and new works permitted by Changes and
+New Works License.
 
-4. No Warranty: THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
-   CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
-   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
-   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
-   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Notices: You must ensure that anyone who gets a copy of any part of the
+software from you also gets a copy of these terms or the URL for them above, as
+well as copies of any plain-text lines beginning with "Required Notice:" that
+the licensor provided with the software.
+
+Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
+Changes and New Works License: The licensor grants you an additional copyright
+license to make changes and new works based on the software for any permitted
+purpose.
+
+Noncommercial Purposes Only: Any purpose is a permitted purpose, except for
+any commercial purpose. Specifically:
+
+1. Non-Commercial, Academic Research, and Non-Production Evaluation Use:
+   You may only use, copy, modify, and distribute this software for
+   Noncommercial Purposes, including academic research, peer-reviewed
+   scientific benchmarking, university coursework, and non-production
+   evaluation use.
+
+2. Commercial Purpose Restriction:
+   You may not use this software for any Commercial Purpose without obtaining
+   a separate written commercial license from the copyright holder. "Commercial
+   Purposes" means any use of this software, or any work derived from it, in
+   any manner that is intended for or directed toward commercial advantage or
+   monetary compensation, including but not limited to direct or indirect
+   financial gain, proprietary trading, high-frequency trading (HFT),
+   market-making deployment, algorithmic execution, quantitative fund
+   research, commercial hosting, proprietary market simulation, SaaS
+   offerings, consulting services, or internal use by for-profit business
+   entities.
+
+3. Personal Uses:
+   Personal study and non-commercial academic experimentation, without any
+   commercial application or compensation, are Noncommercial Purposes.
+
+4. No Liability / As-Is Warranty Disclaimer:
+   AS FAR AS THE LAW ALLOWS, THE SOFTWARE COMES AS IS, WITHOUT ANY WARRANTY OR
+   CONDITION, AND THE LICENSOR WILL NOT BE LIABLE TO YOU FOR ANY DAMAGES
+   ARISING OUT OF THESE TERMS OR THE USE OR NATURE OF THE SOFTWARE, UNDER ANY
+   KIND OF LEGAL CLAIM.
 
 ================================================================================
-AUTOMATED CODE SYNTHESIS & AI REIMPLEMENTATION COVENANT
+PART II: COMMERCIAL LICENSE & AI/AUTOMATED-TRANSLATION PROVENANCE NOTICE
+(Automated Code Synthesis & AI Reimplementation Covenant)
 ================================================================================
 
 1. Purpose and Intent:
-   This covenant establishes binding restrictions on the automated, machine-
-   assisted, or artificial-intelligence-driven harvesting, decompilation,
-   translation, synthesis, or reimplementation of this software's proprietary
-   algorithms, zero-allocation data structures, queue-reactive models, and
-   matching engine architectures for commercial exploitation.
+   This Commercial License & AI/Automated-Translation Provenance Notice
+   establishes binding restrictions on commercial deployment and on the
+   automated, machine-assisted, or artificial-intelligence-driven harvesting,
+   decompilation, translation, synthesis, or reimplementation of this
+   software's proprietary algorithms, zero-allocation data structures,
+   queue-reactive models, and matching engine architectures for commercial
+   exploitation.
 
-2. Commercial AI Synthesis Restriction:
-   You may NOT input, prompt, fine-tune, ingest, embed, or process this source
-   code, its architecture specifications, algorithmic structures, or non-public
-   benchmarks into any generative artificial intelligence system, large language
-   model (LLM), neural code translation engine, or automated code synthesis tool
-   for the purpose of generating, deriving, or outputting a commercial derivative
-   work, clean-room commercial reimplementation, or functional clone in any
-   programming language (including C++, Rust, C, Java, Go, Zig, or Python)
-   without an explicit, executed commercial license from the copyright holder.
+2. Commercial License Requirement & Automated Derivative Translation Restriction:
+   A separate commercial license from the copyright holder is strictly required
+   for any commercial / proprietary trading deployment or automated derivative
+   translation. You may NOT input, prompt, fine-tune, ingest, embed, or process
+   this source code, its architecture specifications, algorithmic structures,
+   or benchmarks into any generative artificial intelligence system, large
+   language model (LLM), neural code translation engine, or automated code
+   synthesis tool for the purpose of generating, deriving, translating, or
+   outputting a commercial derivative work, clean-room commercial
+   reimplementation, or functional clone in any programming language (including
+   C++, Rust, C, Java, Go, Zig, Python, or Lean) without an explicit, executed
+   commercial license from the copyright holder.
 
 3. Contractual Enforceability and Derivative Work Definition:
-   Under state and federal contract law, the copyright regimes of Berne
-   Convention signatory nations, and the Trade Secrets framework:
-   (a) Any functional reproduction or semantic translation produced by an AI
-       or LLM that reproduces the algorithmic structures, sequence-form
-       microstructure dynamics, zero-tombstone slotmap unlinking, or state-
-       dependent intensity formulas of this software shall be deemed a
-       derivative work governed by this license.
+   Under applicable contract law, the copyright regimes of Berne Convention
+   signatory nations, and trade secret frameworks:
+   (a) Any functional reproduction or automated derivative translation produced
+       by an AI, LLM, or automated synthesis pipeline that reproduces the
+       algorithmic structures, sequence-form microstructure dynamics,
+       zero-tombstone intrusive slotmap unlinking, bitwise van Emde Boas /
+       Elias-Fano structures, or state-dependent queue-reactive intensity
+       formulas of this software shall be deemed a derivative work governed by
+       this license.
    (b) Using this software to prompt or instruct an AI model to produce
        unlicensed commercial software constitutes a direct breach of this
        license agreement and intentional interference with intellectual
        property rights.
 
-4. Academic and Open Research Use:
+4. Academic and Non-Production Evaluation Exemption:
    Academic analysis, non-commercial peer-reviewed research, educational study,
-   and open scientific citation of this codebase by researchers and non-profit
-   academic institutions are expressly permitted under Section 1, provided
-   source attribution is preserved.
+   and non-production evaluation use of this codebase by researchers and
+   non-profit academic institutions are expressly permitted under Part I,
+   provided source attribution and this notice are preserved in full.
 
 5. Commercial Licensing Inquiries:
-   For commercial licensing, enterprise deployment rights, algorithmic trading
-   integration, or proprietary use exemptions, contact the author:
-   Radu Irbe (license inquiries: r-irbe on GitHub).
+   For commercial licensing, proprietary trading / HFT deployment rights,
+   algorithmic execution integration, or automated translation exemptions,
+   contact the copyright holder:
+   Radu Irbe (GitHub: r-irbe).

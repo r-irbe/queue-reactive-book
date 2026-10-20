@@ -108,13 +108,16 @@ bench/             Google Benchmark microbenchmarks
 
 ## License
 
-This software is licensed under the **PolyForm Noncommercial License 1.0.0**
-with an explicit **Automated Code Synthesis & AI Reimplementation Covenant**.
+This repository uses a dual-licensing model governed by [`LICENSE`](LICENSE):
 
-- **Academic, Educational, and Non-Commercial Research**: Free and open to use,
-  modify, and redistribute with source attribution.
-- **Commercial Use & Commercial AI Reimplementation**: Prohibited without a separate
-  commercial license from the author. Using this software to prompt or instruct AI/LLM
-  systems to generate commercial derivative works or functional clones constitutes
-  an unlicensed derivative work.
+1. **PolyForm Noncommercial License 1.0.0**: Permits non-commercial, academic
+   research, educational study, and non-production evaluation use with full
+   source attribution.
+2. **Commercial License & AI/Automated-Translation Provenance Notice**
+   (*Automated Code Synthesis & AI Reimplementation Covenant*): Requires a
+   separate written commercial license from the copyright holder for any
+   commercial or proprietary trading / HFT deployment, quantitative fund use,
+   or automated/AI-assisted derivative translation into any programming
+   language.
+
 - **Commercial Licensing Inquiries**: Contact Radu Irbe (GitHub: `r-irbe`).
