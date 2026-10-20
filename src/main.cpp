@@ -1,75 +1,61 @@
-#include "sim/alloc_probe.hpp"
+#include "qr/alloc_guard.hpp"
 #include "sim/sim.hpp"
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <new>
 #include <vector>
 
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
 namespace {
-inline void* aligned_alloc_main(std::size_t size, std::size_t align) noexcept {
-    if (align < sizeof(void*)) align = sizeof(void*);
-    void* p = nullptr;
-    if (posix_memalign(&p, align, size == 0 ? 1 : size) != 0) return nullptr;
-    return p;
+
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " [OPTIONS] [STEPS]\n"
+              << "\n"
+              << "Options:\n"
+              << "  -h, --help        Show this help message and exit\n"
+              << "  --steps <N>       Number of simulation events to run (default: 10000, min: 100)\n"
+              << "  --seed <S>        PRNG seed for QueueReactiveProcess (default: 0x9E3779B97F4A7C15)\n";
 }
+
 } // namespace
 
-void* operator new(std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new(std::size_t size, std::align_val_t al) {
-    void* p = aligned_alloc_main(size, static_cast<std::size_t>(al));
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size, std::align_val_t al) {
-    void* p = aligned_alloc_main(size, static_cast<std::size_t>(al));
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void operator delete(void* ptr) noexcept { std::free(ptr); }
-void operator delete[](void* ptr) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-
 int main(int argc, char* argv[]) {
+    int sim_events = 10000;
+    std::uint64_t seed = sim::rng_constants::kDefaultSeed;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (std::strcmp(argv[i], "--steps") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --steps requires a numeric argument\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+            sim_events = std::max(100, std::atoi(argv[++i]));
+        } else if (std::strncmp(argv[i], "--steps=", 8) == 0) {
+            sim_events = std::max(100, std::atoi(argv[i] + 8));
+        } else if (std::strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --seed requires a numeric argument\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+            seed = std::strtoull(argv[++i], nullptr, 0);
+        } else if (std::strncmp(argv[i], "--seed=", 7) == 0) {
+            seed = std::strtoull(argv[i] + 7, nullptr, 0);
+        } else if (argv[i][0] != '-') {
+            sim_events = std::max(100, std::atoi(argv[i]));
+        } else {
+            std::cerr << "Error: unknown option '" << argv[i] << "'\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
     std::cout << "Queue-Reactive Limit Order Book Simulator (C++20)\n";
     std::cout << "--------------------------------------------------------------------\n\n";
 
@@ -136,8 +122,7 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
     }
 
-    const int sim_events = (argc > 1) ? std::max(100, std::atoi(argv[1])) : 10000;
-    std::cout << "[3] Queue-Reactive Simulation (" << sim_events << " events via add_into):\n";
+    std::cout << "[3] Queue-Reactive Simulation (" << sim_events << " events via add_into, seed=" << seed << "):\n";
     {
         sim::FlatLadderBook sim_book(80, 120, static_cast<std::size_t>(sim_events * 2 + 64));
         sim_book.add_into(
@@ -147,7 +132,7 @@ int main(int argc, char* argv[]) {
             sim::Order{.qty = 100, .orig_qty = 100, .price = 101, .side = sim::Side::Sell, .type = sim::OrderType::Limit},
             100, nullptr, 0);
 
-        sim::QueueReactiveProcess qrp;
+        sim::QueueReactiveProcess qrp({}, sim::HawkesMatrix::default_microstructure(), seed);
         sim::Trade trade_buf[32]{};
         std::uint64_t total_trades = 0;
         std::uint64_t total_volume = 0;

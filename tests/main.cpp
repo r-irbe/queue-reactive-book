@@ -42,76 +42,7 @@
 #include <limits>
 #include <new>
 
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define QRLOB_SANITIZER_ACTIVE 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define QRLOB_SANITIZER_ACTIVE 1
-#endif
-#endif
-
-#ifndef QRLOB_SANITIZER_ACTIVE
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
-namespace {
-inline void* test_aligned_alloc(std::size_t size, std::size_t align) noexcept {
-    if (align < sizeof(void*)) align = sizeof(void*);
-    void* p = nullptr;
-    if (posix_memalign(&p, align, size == 0 ? 1 : size) != 0) return nullptr;
-    return p;
-}
-} // namespace
-
-void* operator new(std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new(std::size_t size, std::align_val_t al) {
-    void* p = test_aligned_alloc(size, static_cast<std::size_t>(al));
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size, std::align_val_t al) {
-    void* p = test_aligned_alloc(size, static_cast<std::size_t>(al));
-    if (!p) throw std::bad_alloc();
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void operator delete(void* ptr) noexcept { std::free(ptr); }
-void operator delete[](void* ptr) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-#endif
+#include "qr/alloc_guard.hpp"
 
 namespace {
 

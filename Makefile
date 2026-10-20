@@ -160,7 +160,7 @@ example: example-bin
 	@./$(BIN_EXAMPLE)
 
 example-bin: dirs
-	$(call BUILD_IF_SOURCES,EXAMPLE_SRC,No examples/*.cpp yet.,$(COMPILE_BASE) $(EXAMPLE_SRC) $(SRC) $(EXAMPLE_LDLIBS) -o $(BIN_EXAMPLE))
+	$(call BUILD_IF_SOURCES,EXAMPLE_SRC,No examples/*.cpp yet.,$(COMPILE_BASE) $(EXAMPLE_SRC) $(LIB_SRC) $(EXAMPLE_LDLIBS) -o $(BIN_EXAMPLE))
 
 asan ubsan tsan debug:
 	@$(MAKE) --no-print-directory clean

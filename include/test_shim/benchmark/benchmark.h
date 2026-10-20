@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -131,15 +132,16 @@ struct BenchmarkTarget {
     BenchmarkTarget* Unit(int) { return this; }
 };
 
-inline std::vector<BenchmarkTarget*>& get_bench_registry() {
-    static std::vector<BenchmarkTarget*> reg;
+inline std::vector<std::unique_ptr<BenchmarkTarget>>& get_bench_registry() {
+    static std::vector<std::unique_ptr<BenchmarkTarget>> reg;
     return reg;
 }
 
 inline BenchmarkTarget* RegisterBenchmark(const char* name, BenchmarkFn fn) {
-    auto* t = new BenchmarkTarget{name, fn, {}};
-    get_bench_registry().push_back(t);
-    return t;
+    auto t = std::make_unique<BenchmarkTarget>(BenchmarkTarget{name, fn, {}});
+    auto* ptr = t.get();
+    get_bench_registry().push_back(std::move(t));
+    return ptr;
 }
 
 inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
@@ -158,7 +160,7 @@ inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
               << std::setw(16) << "Throughput" << "\n";
     std::cout << "--------------------------------------------------------------------------------\n";
 
-    for (auto* target : get_bench_registry()) {
+    for (const auto& target : get_bench_registry()) {
         std::vector<std::vector<int64_t>> runs = target->arg_lists;
         if (runs.empty()) runs.push_back({0});
 
