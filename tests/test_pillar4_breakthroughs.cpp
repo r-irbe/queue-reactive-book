@@ -483,3 +483,233 @@ TEST_CASE("Pillar 4.4b: Nested ReversibleSubgameScope (depth >= 2), STP Decremen
     REQUIRE(guard.delta().allocations == 0);
   }
 }
+
+TEST_CASE("Pillar 4.7: Register-Packed MatchOutcome (16B) and CancelOutcome (8B) FOOP contracts", "[pillar4][foop][outcome]") {
+  static_assert(sizeof(MatchOutcome) == 16);
+  static_assert(alignof(MatchOutcome) == 16);
+  static_assert(sizeof(CancelOutcome) == 8);
+  static_assert(alignof(CancelOutcome) == 8);
+  static_assert(sizeof(CompactDeltaToken) == 32);
+  static_assert(sizeof(ReversibleSubgameScope) <= 32);
+
+  FlatLadderBook flat(100, 200, 1024);
+  LimitOrderBook tree(1024);
+  Trade tbuf[8];
+
+  // 1. RejectedInvalid (qty <= 0 or invalid book)
+  {
+    Order bad{}; bad.agent = 1; bad.side = Side::Buy; bad.type = OrderType::Limit; bad.price = 150; bad.qty = 0;
+    const MatchOutcome m_flat = flat.add_outcome(bad, 1);
+    const MatchOutcome m_tree = tree.add_outcome(bad);
+    REQUIRE(m_flat.status == OrderStatus::RejectedInvalid);
+    REQUIRE(m_flat.is_rejected());
+    REQUIRE_FALSE(m_flat.is_accepted());
+    REQUIRE(m_flat.remaining(10) == 0);
+    REQUIRE(m_tree.status == OrderStatus::RejectedInvalid);
+
+    FlatLadderBook invalid_book(200, 100);
+    Order good{}; good.agent = 1; good.side = Side::Buy; good.type = OrderType::Limit; good.price = 150; good.qty = 10;
+    const MatchOutcome m_inv = invalid_book.add_outcome(good, 1);
+    REQUIRE(m_inv.status == OrderStatus::RejectedInvalid);
+  }
+
+  // 2. RejectedOutOfRange on out-of-bounds Limit and PostOnly orders (fixes flat_ladder_book.cpp:409 bug!)
+  {
+    Order oob_limit{}; oob_limit.agent = 1; oob_limit.side = Side::Buy; oob_limit.type = OrderType::Limit; oob_limit.price = 95; oob_limit.qty = 25;
+    const MatchOutcome mo = flat.add_outcome(oob_limit, 2);
+    REQUIRE(mo.status == OrderStatus::RejectedOutOfRange);
+    REQUIRE(mo.filled == 0);
+    REQUIRE(mo.remaining(25) == 0);
+    REQUIRE(mo.is_rejected());
+    REQUIRE_FALSE(mo.has_rested());
+
+    const MatchSummary ms = flat.add_into(oob_limit, 3, tbuf, 8);
+    REQUIRE(ms.status == OrderStatus::RejectedOutOfRange);
+    REQUIRE(ms.filled == 0);
+    REQUIRE(ms.remaining == 0);
+    REQUIRE(flat.order_count() == 0);
+  }
+
+  // 3. AcceptedRested
+  Order sell_rest{}; sell_rest.agent = 2; sell_rest.side = Side::Sell; sell_rest.type = OrderType::Limit; sell_rest.price = 150; sell_rest.qty = 40;
+  const MatchOutcome mo_rest_flat = flat.add_outcome(sell_rest, 10);
+  const MatchOutcome mo_rest_tree = tree.add_outcome(sell_rest);
+  REQUIRE(mo_rest_flat.status == OrderStatus::AcceptedRested);
+  REQUIRE(mo_rest_flat.has_rested());
+  REQUIRE(mo_rest_flat.remaining(40) == 40);
+  REQUIRE(mo_rest_tree.status == OrderStatus::AcceptedRested);
+
+  // 4. RejectedPostOnly & AcceptedRested PostOnly
+  {
+    Order po_cross{}; po_cross.agent = 3; po_cross.side = Side::Buy; po_cross.type = OrderType::PostOnly; po_cross.price = 150; po_cross.qty = 10;
+    REQUIRE(flat.add_outcome(po_cross, 11).status == OrderStatus::RejectedPostOnly);
+    REQUIRE(tree.add_outcome(po_cross).status == OrderStatus::RejectedPostOnly);
+
+    Order po_passive{}; po_passive.agent = 3; po_passive.side = Side::Buy; po_passive.type = OrderType::PostOnly; po_passive.price = 140; po_passive.qty = 10;
+    const auto po_ok_f = flat.add_outcome(po_passive, 12);
+    const auto po_ok_t = tree.add_outcome(po_passive);
+    REQUIRE(po_ok_f.status == OrderStatus::AcceptedRested);
+    REQUIRE(po_ok_t.status == OrderStatus::AcceptedRested);
+    REQUIRE(flat.cancel_outcome(po_ok_f.id, 13).status == CancelStatus::Cancelled);
+    REQUIRE(tree.cancel_outcome(po_ok_t.id).status == CancelStatus::Cancelled);
+  }
+
+  // 5. RejectedFok
+  {
+    Order fok_big{}; fok_big.agent = 3; fok_big.side = Side::Buy; fok_big.type = OrderType::FOK; fok_big.price = 150; fok_big.qty = 100;
+    REQUIRE(flat.add_outcome(fok_big, 14).status == OrderStatus::RejectedFok);
+    REQUIRE(tree.add_outcome(fok_big).status == OrderStatus::RejectedFok);
+  }
+
+  // 6. ExpiredIocZero & FilledPartialIoc
+  {
+    Order ioc_miss{}; ioc_miss.agent = 3; ioc_miss.side = Side::Buy; ioc_miss.type = OrderType::IOC; ioc_miss.price = 145; ioc_miss.qty = 10;
+    REQUIRE(flat.add_outcome(ioc_miss, 15).status == OrderStatus::ExpiredIocZero);
+    REQUIRE(tree.add_outcome(ioc_miss).status == OrderStatus::ExpiredIocZero);
+
+    Order ioc_part{}; ioc_part.agent = 3; ioc_part.side = Side::Buy; ioc_part.type = OrderType::IOC; ioc_part.price = 150; ioc_part.qty = 60;
+    // Wait: let us add another 30 at 155 first so 150 only has 40
+    Order ask_155{}; ask_155.agent = 2; ask_155.side = Side::Sell; ask_155.type = OrderType::Limit; ask_155.price = 155; ask_155.qty = 30;
+    flat.add_outcome(ask_155, 16);
+    tree.add_outcome(ask_155);
+
+    const auto ioc_f = flat.add_outcome_into(ioc_part, 17, tbuf, 8);
+    const auto ioc_t = tree.add_outcome_into(ioc_part, tbuf, 8);
+    REQUIRE(ioc_f.status == OrderStatus::FilledPartialIoc);
+    REQUIRE(ioc_f.filled == 40);
+    REQUIRE(ioc_f.trade_count == 1);
+    REQUIRE(ioc_f.remaining(60) == 0);
+    REQUIRE(ioc_t.status == OrderStatus::FilledPartialIoc);
+    REQUIRE(ioc_t.filled == 40);
+  }
+
+  // 7. FilledPartialRest & FilledComplete
+  {
+    // Currently ask_155 has 30 at 155. Submit Limit Buy at 155 for 50 -> fills 30, rests 20 at 155!
+    Order lim_part{}; lim_part.agent = 4; lim_part.side = Side::Buy; lim_part.type = OrderType::Limit; lim_part.price = 155; lim_part.qty = 50;
+    const auto lp_f = flat.add_outcome_into(lim_part, 18, tbuf, 8);
+    const auto lp_t = tree.add_outcome_into(lim_part, tbuf, 8);
+    REQUIRE(lp_f.status == OrderStatus::FilledPartialRest);
+    REQUIRE(lp_f.filled == 30);
+    REQUIRE(lp_f.remaining(50) == 20);
+    REQUIRE(lp_t.status == OrderStatus::FilledPartialRest);
+    REQUIRE(lp_t.remaining(50) == 20);
+
+    // Now Sell 20 at 155 -> FilledComplete!
+    Order sell_comp{}; sell_comp.agent = 5; sell_comp.side = Side::Sell; sell_comp.type = OrderType::Limit; sell_comp.price = 155; sell_comp.qty = 20;
+    const auto sc_f = flat.add_outcome_into(sell_comp, 19, tbuf, 8);
+    const auto sc_t = tree.add_outcome_into(sell_comp, tbuf, 8);
+    REQUIRE(sc_f.status == OrderStatus::FilledComplete);
+    REQUIRE(sc_f.filled == 20);
+    REQUIRE(sc_f.remaining(20) == 0);
+    REQUIRE(sc_t.status == OrderStatus::FilledComplete);
+  }
+
+  // 8. CancelledByStp (CancelAggressive and DecrementAndCancel)
+  {
+    Order self_ask{}; self_ask.agent = 77; self_ask.side = Side::Sell; self_ask.type = OrderType::Limit; self_ask.price = 160; self_ask.qty = 25;
+    flat.add_outcome(self_ask, 20);
+    tree.add_outcome(self_ask);
+
+    Order self_buy{}; self_buy.agent = 77; self_buy.side = Side::Buy; self_buy.type = OrderType::Limit; self_buy.price = 160; self_buy.qty = 25;
+    const auto stp_f = flat.add_outcome(self_buy, 21, StpMode::CancelAggressive);
+    const auto stp_t = tree.add_outcome(self_buy, StpMode::CancelAggressive);
+    REQUIRE(stp_f.status == OrderStatus::CancelledByStp);
+    REQUIRE(stp_f.stp_cancels == 1);
+    REQUIRE(stp_f.filled == 0);
+    REQUIRE(stp_t.status == OrderStatus::CancelledByStp);
+    REQUIRE(stp_t.stp_cancels == 1);
+  }
+
+  // 9. CancelOutcome: Cancelled, AlreadyInactive, NotFound
+  {
+    Order rest_bid{}; rest_bid.agent = 9; rest_bid.side = Side::Buy; rest_bid.type = OrderType::Limit; rest_bid.price = 120; rest_bid.qty = 33;
+    const auto rb_f = flat.add_outcome(rest_bid, 30);
+    const auto rb_t = tree.add_outcome(rest_bid);
+
+    const CancelOutcome c1_f = flat.cancel_outcome(rb_f.id, 31);
+    const CancelOutcome c1_t = tree.cancel_outcome(rb_t.id);
+    REQUIRE(static_cast<bool>(c1_f));
+    REQUIRE(c1_f.status == CancelStatus::Cancelled);
+    REQUIRE(c1_f.cancelled_qty == 33);
+    REQUIRE(c1_f.side == Side::Buy);
+    REQUIRE(c1_f.price_offset == 20); // 120 - 100
+    REQUIRE(static_cast<bool>(c1_t));
+    REQUIRE(c1_t.status == CancelStatus::Cancelled);
+    REQUIRE(c1_t.cancelled_qty == 33);
+
+    // Second cancel of same OrderId -> AlreadyInactive
+    const CancelOutcome c2_f = flat.cancel_outcome(rb_f.id, 32);
+    const CancelOutcome c2_t = tree.cancel_outcome(rb_t.id);
+    REQUIRE_FALSE(static_cast<bool>(c2_f));
+    REQUIRE(c2_f.status == CancelStatus::AlreadyInactive);
+    REQUIRE_FALSE(static_cast<bool>(c2_t));
+    REQUIRE(c2_t.status == CancelStatus::AlreadyInactive);
+
+    // Cancel of never-issued OrderId -> NotFound
+    const CancelOutcome c3_f = flat.cancel_outcome(999999ULL, 33);
+    const CancelOutcome c3_t = tree.cancel_outcome(999999ULL);
+    REQUIRE_FALSE(static_cast<bool>(c3_f));
+    REQUIRE(c3_f.status == CancelStatus::NotFound);
+    REQUIRE_FALSE(static_cast<bool>(c3_t));
+    REQUIRE(c3_t.status == CancelStatus::NotFound);
+  }
+}
+
+TEST_CASE("Pillar 4.8: Zero-Allocation levels_into, make_top_k_snapshot<K>, and QueueReactiveProcess Q16 path", "[pillar4][levels_into][q16]") {
+  FlatLadderBook flat(1000, 2000, 1024);
+  LimitOrderBook tree(1024);
+
+  for (int i = 0; i < 12; ++i) {
+    Order b{}; b.agent = 1; b.side = Side::Buy; b.type = OrderType::Limit; b.price = 1400 - i * 3; b.qty = 10 + i;
+    Order a{}; a.agent = 2; a.side = Side::Sell; a.type = OrderType::Limit; a.price = 1410 + i * 3; a.qty = 15 + i;
+    flat.add_outcome(b, i * 2 + 1);
+    flat.add_outcome(a, i * 2 + 2);
+    tree.add_outcome(b);
+    tree.add_outcome(a);
+  }
+
+  BookLevelView f_bids[8]{};
+  BookLevelView f_asks[8]{};
+  BookLevelView t_bids[8]{};
+  BookLevelView t_asks[8]{};
+  TopKBookSnapshot<8> snap{};
+
+  {
+    sim::diag::ScopedAllocCounter guard;
+    const std::size_t nb_f = flat.levels_into(Side::Buy, f_bids, 8);
+    const std::size_t na_f = flat.levels_into(Side::Sell, f_asks, 8);
+    const std::size_t nb_t = tree.levels_into(Side::Buy, t_bids, 8);
+    const std::size_t na_t = tree.levels_into(Side::Sell, t_asks, 8);
+    snap = make_top_k_snapshot<8>(flat, 42);
+    REQUIRE(guard.delta().allocations == 0);
+    REQUIRE(nb_f == 8);
+    REQUIRE(na_f == 8);
+    REQUIRE(nb_t == 8);
+    REQUIRE(na_t == 8);
+  }
+
+  const auto vec_bids = flat.levels(Side::Buy, 8);
+  const auto vec_asks = flat.levels(Side::Sell, 8);
+  for (std::size_t i = 0; i < 8; ++i) {
+    REQUIRE(f_bids[i].price == vec_bids[i].price);
+    REQUIRE(f_bids[i].volume == vec_bids[i].volume);
+    REQUIRE(t_bids[i].price == vec_bids[i].price);
+    REQUIRE(snap.bids[i].price == vec_bids[i].price);
+    REQUIRE(snap.asks[i].price == vec_asks[i].price);
+  }
+
+  // QueueReactiveProcess Q16 zero-libm fast path verification
+  QueueReactiveProcess qrp;
+  {
+    sim::diag::ScopedAllocCounter guard;
+    for (int step = 0; step < 256; ++step) {
+      const auto ev = qrp.next_event_q16(1400, 120, 1410, 150);
+      REQUIRE(ev.qty >= 1);
+      REQUIRE(ev.inter_arrival_ns >= 1);
+    }
+    REQUIRE(guard.delta().allocations == 0);
+  }
+  REQUIRE(qrp.current_time() > 0);
+  REQUIRE(qrp.hawkes_q16().event_count() == 256);
+}

@@ -90,29 +90,33 @@ inline BookObservables make_book_observables(const FlatLadderBook& book,
 
 template <std::size_t K>
 inline TopKBookSnapshot<K> make_top_k_snapshot(const FlatLadderBook& book,
-                                               EventSeq seq = 0) {
+                                               EventSeq seq = 0) noexcept {
     TopKBookSnapshot<K> out{};
     out.ts = book.time();
     out.seq = seq;
 
-    const auto bids = book.levels(Side::Buy, K);
-    const auto asks = book.levels(Side::Sell, K);
-    const auto bid_count = std::min<std::size_t>(bids.size(), K);
-    const auto ask_count = std::min<std::size_t>(asks.size(), K);
-    out.bid_count = static_cast<std::uint8_t>(std::min<std::size_t>(
-        bid_count, std::numeric_limits<std::uint8_t>::max()));
-    out.ask_count = static_cast<std::uint8_t>(std::min<std::size_t>(
-        ask_count, std::numeric_limits<std::uint8_t>::max()));
+    if constexpr (K == 0) {
+        return out;
+    } else {
+        BookLevelView bid_buf[K];
+        BookLevelView ask_buf[K];
+        const std::size_t bid_count = book.levels_into(Side::Buy, bid_buf, K);
+        const std::size_t ask_count = book.levels_into(Side::Sell, ask_buf, K);
+        out.bid_count = static_cast<std::uint8_t>(std::min<std::size_t>(
+            bid_count, std::numeric_limits<std::uint8_t>::max()));
+        out.ask_count = static_cast<std::uint8_t>(std::min<std::size_t>(
+            ask_count, std::numeric_limits<std::uint8_t>::max()));
 
-    for (std::size_t i = 0; i < bid_count; ++i) {
-        out.bids[i] = {bids[i].price, bids[i].volume,
-                       detail::clamp_order_count(bids[i].orders)};
+        for (std::size_t i = 0; i < bid_count; ++i) {
+            out.bids[i] = {bid_buf[i].price, bid_buf[i].volume,
+                           detail::clamp_order_count(bid_buf[i].orders)};
+        }
+        for (std::size_t i = 0; i < ask_count; ++i) {
+            out.asks[i] = {ask_buf[i].price, ask_buf[i].volume,
+                           detail::clamp_order_count(ask_buf[i].orders)};
+        }
+        return out;
     }
-    for (std::size_t i = 0; i < ask_count; ++i) {
-        out.asks[i] = {asks[i].price, asks[i].volume,
-                       detail::clamp_order_count(asks[i].orders)};
-    }
-    return out;
 }
 
 } // namespace sim

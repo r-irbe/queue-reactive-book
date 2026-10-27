@@ -13,226 +13,6 @@
 namespace sim {
 
 // ----------------------------------------------------------------------------
-// Queue-Reactive Model (Huang, Lehalle & Rosenbaum, 2015)
-// and Hawkes Point-Process Arrival Generator
-//
-// Models limit order book event intensities as state-dependent functions of
-// the resting queue depth at the best quotes, coupled with mutually-exciting
-// Hawkes feedback dynamics.
-// ----------------------------------------------------------------------------
-
-enum class QueueEventType : std::uint8_t {
-    BuyLimit    = 0,
-    SellLimit   = 1,
-    BuyCancel   = 2,
-    SellCancel  = 3,
-    BuyMarket   = 4,
-    SellMarket  = 5,
-    Count       = 6
-};
-
-inline constexpr std::size_t kEventTypes = static_cast<std::size_t>(QueueEventType::Count);
-
-struct QueueReactiveConfig {
-    // Base exogenous intensities (events / microsecond)
-    double base_limit_rate   = 0.05;
-    double base_cancel_rate  = 0.002;
-    double base_market_rate  = 0.01;
-
-    // Queue depth saturation parameters: lambda_L(q) = base_L / (1 + c_L * q^gamma)
-    double limit_depth_decay = 0.01;
-    double limit_gamma       = 0.75;
-
-    // Cancel sensitivity: lambda_C(q) = base_C * q^delta
-    double cancel_delta      = 1.0;
-
-    // Market order depth affinity: lambda_M(q) = base_M * (1 + c_M * ln(1 + q))
-    double market_affinity   = 0.15;
-
-    // Mean order size and standard deviation (log-normal or bounded uniform)
-    Qty min_qty              = 1;
-    Qty max_qty              = 100;
-};
-
-struct HawkesMatrix {
-    // Self and cross-excitation matrix alpha[i][j]: event j excites event i
-    std::array<std::array<double, kEventTypes>, kEventTypes> alpha{};
-    // Decay rates beta[i][j] (1 / nanosecond)
-    std::array<std::array<double, kEventTypes>, kEventTypes> beta{};
-
-    static HawkesMatrix default_microstructure() noexcept {
-        HawkesMatrix hm{};
-        for (std::size_t i = 0; i < kEventTypes; ++i) {
-            for (std::size_t j = 0; j < kEventTypes; ++j) {
-                hm.beta[i][j] = 0.001; // 1 us half-life scale
-            }
-        }
-        // Market orders strongly excite same-direction market orders (momentum)
-        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyMarket)][static_cast<std::size_t>(QueueEventType::BuyMarket)] = 0.35;
-        hm.alpha[static_cast<std::size_t>(QueueEventType::SellMarket)][static_cast<std::size_t>(QueueEventType::SellMarket)] = 0.35;
-        // Large market orders excite opposite-side cancellations (fleeting quotes)
-        hm.alpha[static_cast<std::size_t>(QueueEventType::SellCancel)][static_cast<std::size_t>(QueueEventType::BuyMarket)] = 0.25;
-        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyCancel)][static_cast<std::size_t>(QueueEventType::SellMarket)] = 0.25;
-        // Cancellations excite further cancellations (cascading withdrawals)
-        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyCancel)][static_cast<std::size_t>(QueueEventType::BuyCancel)] = 0.20;
-        hm.alpha[static_cast<std::size_t>(QueueEventType::SellCancel)][static_cast<std::size_t>(QueueEventType::SellCancel)] = 0.20;
-        return hm;
-    }
-};
-
-struct GeneratedEvent {
-    QueueEventType type = QueueEventType::BuyLimit;
-    Side           side = Side::Buy;
-    OrderType      order_type = OrderType::Limit;
-    Tick           price = 0;
-    Qty            qty = 1;
-    TimeNs         inter_arrival_ns = 1000;
-};
-
-class QueueReactiveProcess {
-public:
-    explicit QueueReactiveProcess(QueueReactiveConfig cfg = {},
-                                 HawkesMatrix hawkes = HawkesMatrix::default_microstructure(),
-                                 std::uint64_t seed = rng_constants::kDefaultSeed)
-        : cfg_(cfg), hawkes_(hawkes), rng_(seed), current_time_ns_(0) {
-        for (auto& row : state_) {
-            row.fill(0.0);
-        }
-    }
-
-    // Compute instantaneous event intensities given current best bid and ask volumes
-    std::array<double, kEventTypes> compute_intensities(Qty bid_volume, Qty ask_volume) const noexcept {
-        std::array<double, kEventTypes> lambda{};
-
-        const double q_bid = static_cast<double>(std::max<Qty>(0, bid_volume));
-        const double q_ask = static_cast<double>(std::max<Qty>(0, ask_volume));
-
-        // Queue-reactive baseline intensities (Huang et al. 2015)
-        lambda[static_cast<std::size_t>(QueueEventType::BuyLimit)] =
-            cfg_.base_limit_rate / (1.0 + cfg_.limit_depth_decay * std::pow(q_bid + 1.0, cfg_.limit_gamma));
-        lambda[static_cast<std::size_t>(QueueEventType::SellLimit)] =
-            cfg_.base_limit_rate / (1.0 + cfg_.limit_depth_decay * std::pow(q_ask + 1.0, cfg_.limit_gamma));
-
-        lambda[static_cast<std::size_t>(QueueEventType::BuyCancel)] =
-            cfg_.base_cancel_rate * std::pow(q_bid, cfg_.cancel_delta);
-        lambda[static_cast<std::size_t>(QueueEventType::SellCancel)] =
-            cfg_.base_cancel_rate * std::pow(q_ask, cfg_.cancel_delta);
-
-        lambda[static_cast<std::size_t>(QueueEventType::BuyMarket)] =
-            cfg_.base_market_rate * (1.0 + cfg_.market_affinity * std::log1p(q_ask));
-        lambda[static_cast<std::size_t>(QueueEventType::SellMarket)] =
-            cfg_.base_market_rate * (1.0 + cfg_.market_affinity * std::log1p(q_bid));
-
-        // Add Hawkes self- and cross-excitation state
-        for (std::size_t i = 0; i < kEventTypes; ++i) {
-            double exc = 0.0;
-            for (std::size_t j = 0; j < kEventTypes; ++j) {
-                exc += state_[i][j];
-            }
-            lambda[i] += exc;
-            if (lambda[i] < 1e-9) lambda[i] = 1e-9;
-        }
-
-        return lambda;
-    }
-
-    // Advance time and generate the next market event
-    GeneratedEvent next_event(Tick best_bid_price, Qty best_bid_vol,
-                             Tick best_ask_price, Qty best_ask_vol) {
-        const auto lambda = compute_intensities(best_bid_vol, best_ask_vol);
-        double total_rate = 0.0;
-        for (double r : lambda) total_rate += r;
-
-        // Sample inter-arrival time: delta_t ~ Exp(total_rate)
-        const double u = std::max(1e-12, 1.0 - distributions::next_unit_double(rng_));
-        const double dt_us = -std::log(u) / total_rate;
-        const TimeNs dt_ns = std::max<TimeNs>(1, static_cast<TimeNs>(dt_us * 1000.0));
-
-        // Decay Hawkes excitation state over dt
-        for (std::size_t i = 0; i < kEventTypes; ++i) {
-            for (std::size_t j = 0; j < kEventTypes; ++j) {
-                state_[i][j] *= std::exp(-hawkes_.beta[i][j] * static_cast<double>(dt_ns));
-            }
-        }
-        current_time_ns_ += dt_ns;
-
-        // Sample which event occurred according to relative intensity
-        const double pick = distributions::next_unit_double(rng_) * total_rate;
-        double accum = 0.0;
-        QueueEventType selected = QueueEventType::BuyLimit;
-        for (std::size_t i = 0; i < kEventTypes; ++i) {
-            accum += lambda[i];
-            if (pick <= accum || i == kEventTypes - 1) {
-                selected = static_cast<QueueEventType>(i);
-                break;
-            }
-        }
-
-        // Excite Hawkes state with the selected event
-        const std::size_t sel_idx = static_cast<std::size_t>(selected);
-        for (std::size_t i = 0; i < kEventTypes; ++i) {
-            state_[i][sel_idx] += hawkes_.alpha[i][sel_idx];
-        }
-
-        // Sample order quantity
-        const Qty qty = static_cast<Qty>(cfg_.min_qty +
-            (rng_.next_u64() % static_cast<std::uint64_t>(std::max<Qty>(1, cfg_.max_qty - cfg_.min_qty + 1))));
-
-        GeneratedEvent ev{};
-        ev.type = selected;
-        ev.qty = qty;
-        ev.inter_arrival_ns = dt_ns;
-
-        switch (selected) {
-            case QueueEventType::BuyLimit:
-                ev.side = Side::Buy;
-                ev.order_type = OrderType::Limit;
-                ev.price = best_bid_price;
-                break;
-            case QueueEventType::SellLimit:
-                ev.side = Side::Sell;
-                ev.order_type = OrderType::Limit;
-                ev.price = best_ask_price;
-                break;
-            case QueueEventType::BuyCancel:
-                ev.side = Side::Buy;
-                ev.order_type = OrderType::Cancel;
-                ev.price = best_bid_price;
-                break;
-            case QueueEventType::SellCancel:
-                ev.side = Side::Sell;
-                ev.order_type = OrderType::Cancel;
-                ev.price = best_ask_price;
-                break;
-            case QueueEventType::BuyMarket:
-                ev.side = Side::Buy;
-                ev.order_type = OrderType::Market;
-                ev.price = 0; // sweeps ask
-                break;
-            case QueueEventType::SellMarket:
-                ev.side = Side::Sell;
-                ev.order_type = OrderType::Market;
-                ev.price = 0; // sweeps bid
-                break;
-            default:
-                break;
-        }
-
-        return ev;
-    }
-
-    TimeNs current_time() const noexcept { return current_time_ns_; }
-
-private:
-    QueueReactiveConfig cfg_;
-    HawkesMatrix hawkes_;
-    Xoshiro256StarStar rng_;
-    TimeNs current_time_ns_ = 0;
-    // state_[i][j] = current excitation on event i due to past events of type j
-    std::array<std::array<double, kEventTypes>, kEventTypes> state_{};
-};
-
-// ----------------------------------------------------------------------------
 // Lean-Verified SWAR 4-Bit Nibble LUTs & Branchless Primitives
 // (`generated_verified_kernels.rs`, `Rules.MarketSubgameGpu`, `Common.BitwiseSWAR`)
 // ----------------------------------------------------------------------------
@@ -253,9 +33,10 @@ constexpr std::uint64_t is_zero_mask(std::uint64_t x) noexcept {
 }
 
 // Branchless sign-mask ReLU (`family4_cfr_branchless_relu64_exact`).
-constexpr std::uint64_t verified_cfr_branchless_relu64(std::uint64_t w) noexcept {
-    const auto sign_mask = static_cast<std::uint64_t>(static_cast<std::int64_t>(w) >> 63);
-    return w & (sign_mask ^ 0xFFFFFFFFFFFFFFFFULL);
+constexpr std::int64_t verified_cfr_branchless_relu64(std::int64_t v) noexcept {
+    const auto w = static_cast<std::uint64_t>(v);
+    const auto sign_mask = static_cast<std::uint64_t>(v >> 63);
+    return static_cast<std::int64_t>(w & (sign_mask ^ 0xFFFFFFFFFFFFFFFFULL));
 }
 
 struct SwarQueueReactiveRegimeLut {
@@ -396,7 +177,7 @@ public:
     constexpr std::uint64_t decay_dt(std::uint64_t dt_scaled_q16) noexcept {
         const std::uint64_t decay_q16 = eval_hawkes_q16_horner_decay(dt_scaled_q16);
         excitation_q16_ = (excitation_q16_ * decay_q16 + 32768ULL) >> 16ULL;
-        return mu_q16_ + excitation_q16_; 
+        return mu_q16_ + excitation_q16_;
     }
     static constexpr double q16_to_double(std::uint64_t v_q16) noexcept {
         return static_cast<double>(v_q16) / static_cast<double>(kQ16One);
@@ -416,6 +197,347 @@ private:
     std::uint64_t excitation_q16_;
     TimeNs last_ts_ns_;
     std::uint64_t event_count_;
+};
+
+// ----------------------------------------------------------------------------
+// Queue-Reactive Model (Huang, Lehalle & Rosenbaum, 2015)
+// and Hawkes Point-Process Arrival Generator
+//
+// Models limit order book event intensities as state-dependent functions of
+// the resting queue depth at the best quotes, coupled with mutually-exciting
+// Hawkes feedback dynamics.
+// ----------------------------------------------------------------------------
+
+enum class QueueEventType : std::uint8_t {
+    BuyLimit    = 0,
+    SellLimit   = 1,
+    BuyCancel   = 2,
+    SellCancel  = 3,
+    BuyMarket   = 4,
+    SellMarket  = 5,
+    Count       = 6
+};
+
+inline constexpr std::size_t kEventTypes = static_cast<std::size_t>(QueueEventType::Count);
+
+struct QueueReactiveConfig {
+    // Base exogenous intensities (events / microsecond)
+    double base_limit_rate   = 0.05;
+    double base_cancel_rate  = 0.002;
+    double base_market_rate  = 0.01;
+
+    // Queue depth saturation parameters: lambda_L(q) = base_L / (1 + c_L * q^gamma)
+    double limit_depth_decay = 0.01;
+    double limit_gamma       = 0.75;
+
+    // Cancel sensitivity: lambda_C(q) = base_C * q^delta
+    double cancel_delta      = 1.0;
+
+    // Market order depth affinity: lambda_M(q) = base_M * (1 + c_M * ln(1 + q))
+    double market_affinity   = 0.15;
+
+    // Mean order size and standard deviation (log-normal or bounded uniform)
+    Qty min_qty              = 1;
+    Qty max_qty              = 100;
+};
+
+struct HawkesMatrix {
+    // Self and cross-excitation matrix alpha[i][j]: event j excites event i
+    std::array<std::array<double, kEventTypes>, kEventTypes> alpha{};
+    // Decay rates beta[i][j] (1 / nanosecond)
+    std::array<std::array<double, kEventTypes>, kEventTypes> beta{};
+
+    static HawkesMatrix default_microstructure() noexcept {
+        HawkesMatrix hm{};
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            for (std::size_t j = 0; j < kEventTypes; ++j) {
+                hm.beta[i][j] = 0.001; // 1 us half-life scale
+            }
+        }
+        // Market orders strongly excite same-direction market orders (momentum)
+        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyMarket)][static_cast<std::size_t>(QueueEventType::BuyMarket)] = 0.35;
+        hm.alpha[static_cast<std::size_t>(QueueEventType::SellMarket)][static_cast<std::size_t>(QueueEventType::SellMarket)] = 0.35;
+        // Large market orders excite opposite-side cancellations (fleeting quotes)
+        hm.alpha[static_cast<std::size_t>(QueueEventType::SellCancel)][static_cast<std::size_t>(QueueEventType::BuyMarket)] = 0.25;
+        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyCancel)][static_cast<std::size_t>(QueueEventType::SellMarket)] = 0.25;
+        // Cancellations excite further cancellations (cascading withdrawals)
+        hm.alpha[static_cast<std::size_t>(QueueEventType::BuyCancel)][static_cast<std::size_t>(QueueEventType::BuyCancel)] = 0.20;
+        hm.alpha[static_cast<std::size_t>(QueueEventType::SellCancel)][static_cast<std::size_t>(QueueEventType::SellCancel)] = 0.20;
+        return hm;
+    }
+};
+
+struct GeneratedEvent {
+    QueueEventType type = QueueEventType::BuyLimit;
+    Side           side = Side::Buy;
+    OrderType      order_type = OrderType::Limit;
+    Tick           price = 0;
+    Qty            qty = 1;
+    TimeNs         inter_arrival_ns = 1000;
+};
+
+class QueueReactiveProcess {
+public:
+    explicit QueueReactiveProcess(QueueReactiveConfig cfg = {},
+                                 HawkesMatrix hawkes = HawkesMatrix::default_microstructure(),
+                                 std::uint64_t seed = rng_constants::kDefaultSeed)
+        : cfg_(cfg), hawkes_(hawkes), rng_(seed), current_time_ns_(0),
+          hawkes_q16_(
+              static_cast<std::uint64_t>(std::max(1.0, (2.0 * cfg.base_limit_rate + 2.0 * cfg.base_cancel_rate + 2.0 * cfg.base_market_rate) * static_cast<double>(kQ16One))),
+              static_cast<std::uint64_t>(std::max(1.0, 0.25 * static_cast<double>(kQ16One))),
+              kQ16One) {
+        for (auto& row : state_) {
+            row.fill(0.0);
+        }
+        init_q16_tables();
+    }
+
+    // Compute instantaneous event intensities given current best bid and ask volumes
+    std::array<double, kEventTypes> compute_intensities(Qty bid_volume, Qty ask_volume) const noexcept {
+        std::array<double, kEventTypes> lambda{};
+
+        const double q_bid = static_cast<double>(std::max<Qty>(0, bid_volume));
+        const double q_ask = static_cast<double>(std::max<Qty>(0, ask_volume));
+
+        // Queue-reactive baseline intensities (Huang et al. 2015)
+        lambda[static_cast<std::size_t>(QueueEventType::BuyLimit)] =
+            cfg_.base_limit_rate / (1.0 + cfg_.limit_depth_decay * std::pow(q_bid + 1.0, cfg_.limit_gamma));
+        lambda[static_cast<std::size_t>(QueueEventType::SellLimit)] =
+            cfg_.base_limit_rate / (1.0 + cfg_.limit_depth_decay * std::pow(q_ask + 1.0, cfg_.limit_gamma));
+
+        lambda[static_cast<std::size_t>(QueueEventType::BuyCancel)] =
+            cfg_.base_cancel_rate * std::pow(q_bid, cfg_.cancel_delta);
+        lambda[static_cast<std::size_t>(QueueEventType::SellCancel)] =
+            cfg_.base_cancel_rate * std::pow(q_ask, cfg_.cancel_delta);
+
+        lambda[static_cast<std::size_t>(QueueEventType::BuyMarket)] =
+            cfg_.base_market_rate * (1.0 + cfg_.market_affinity * std::log1p(q_ask));
+        lambda[static_cast<std::size_t>(QueueEventType::SellMarket)] =
+            cfg_.base_market_rate * (1.0 + cfg_.market_affinity * std::log1p(q_bid));
+
+        // Add Hawkes self- and cross-excitation state
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            double exc = 0.0;
+            for (std::size_t j = 0; j < kEventTypes; ++j) {
+                exc += state_[i][j];
+            }
+            lambda[i] += exc;
+            if (lambda[i] < 1e-9) lambda[i] = 1e-9;
+        }
+
+        return lambda;
+    }
+
+    // Zero-libm Q48.16 + SWAR LUT intensity evaluation (`OnlineHawkesQ16` + `SwarQueueReactiveRegimeLut`).
+    [[gnu::hot]] std::array<std::uint64_t, kEventTypes> compute_intensities_q16(
+        Qty bid_volume, Qty ask_volume) const noexcept {
+        std::array<std::uint64_t, kEventTypes> lambda_q16{};
+        const std::uint32_t bid_reg = SwarQueueReactiveRegimeLut::classify_regime(bid_volume, 0);
+        const std::uint32_t ask_reg = SwarQueueReactiveRegimeLut::classify_regime(0, ask_volume);
+
+        const std::uint64_t add_b = SwarQueueReactiveRegimeLut::add_nibble(bid_reg);
+        const std::uint64_t add_a = SwarQueueReactiveRegimeLut::add_nibble(ask_reg);
+        const std::uint64_t can_b = SwarQueueReactiveRegimeLut::cancel_nibble(bid_reg);
+        const std::uint64_t can_a = SwarQueueReactiveRegimeLut::cancel_nibble(ask_reg);
+        const std::uint64_t exe_b = SwarQueueReactiveRegimeLut::exec_nibble(ask_reg);
+        const std::uint64_t exe_a = SwarQueueReactiveRegimeLut::exec_nibble(bid_reg);
+
+        lambda_q16[static_cast<std::size_t>(QueueEventType::BuyLimit)] =
+            std::max<std::uint64_t>(1ULL, ((base_limit_q16_ * add_b) >> 2ULL) + state_q16_[0]);
+        lambda_q16[static_cast<std::size_t>(QueueEventType::SellLimit)] =
+            std::max<std::uint64_t>(1ULL, ((base_limit_q16_ * add_a) >> 2ULL) + state_q16_[1]);
+        lambda_q16[static_cast<std::size_t>(QueueEventType::BuyCancel)] =
+            std::max<std::uint64_t>(1ULL, (base_cancel_q16_ * (1ULL + can_b)) + state_q16_[2]);
+        lambda_q16[static_cast<std::size_t>(QueueEventType::SellCancel)] =
+            std::max<std::uint64_t>(1ULL, (base_cancel_q16_ * (1ULL + can_a)) + state_q16_[3]);
+        lambda_q16[static_cast<std::size_t>(QueueEventType::BuyMarket)] =
+            std::max<std::uint64_t>(1ULL, ((base_market_q16_ * (4ULL + exe_b)) >> 2ULL) + state_q16_[4]);
+        lambda_q16[static_cast<std::size_t>(QueueEventType::SellMarket)] =
+            std::max<std::uint64_t>(1ULL, ((base_market_q16_ * (4ULL + exe_a)) >> 2ULL) + state_q16_[5]);
+
+        return lambda_q16;
+    }
+
+    // Zero-libm fast event generator powered by `OnlineHawkesQ16` and `SwarQueueReactiveRegimeLut`.
+    [[gnu::hot]] GeneratedEvent next_event_q16(Tick best_bid_price, Qty best_bid_vol,
+                                               Tick best_ask_price, Qty best_ask_vol) noexcept {
+        const auto lambda_q16 = compute_intensities_q16(best_bid_vol, best_ask_vol);
+        std::uint64_t total_q16 = 0ULL;
+        for (std::uint64_t r : lambda_q16) total_q16 += r;
+        if (total_q16 == 0ULL) total_q16 = 1ULL;
+
+        // Deterministic integer inter-arrival sampling without std::log / std::exp:
+        // sample u_q16 in [1, 65536] and approximate -ln(u) via leading-zero + fractional mantissa.
+        const std::uint64_t raw = rng_.next_u64();
+        const std::uint64_t u_q16 = (raw & 65535ULL) + 1ULL;
+        const auto lz = static_cast<std::uint64_t>(std::countl_zero(u_q16) - 48);
+        const std::uint64_t rem_q16 = ((1ULL << (16ULL - lz)) - u_q16) << lz;
+        const std::uint64_t neg_ln_u_q16 = lz * kLn2Q16 + rem_q16;
+        const std::uint64_t dt_ns_u64 = std::max<std::uint64_t>(
+            1ULL, (neg_ln_u_q16 * 1000ULL) / total_q16);
+        const TimeNs dt_ns = static_cast<TimeNs>(dt_ns_u64);
+
+        // Decay per-channel Q16 excitation state via Horner Q48.16 exponential kernel
+        const std::uint64_t dt_scaled_q16 = (dt_ns_u64 * beta_per_us_q16_) / 1000ULL;
+        const std::uint64_t decay_q16 = eval_hawkes_q16_horner_decay(dt_scaled_q16);
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            state_q16_[i] = (state_q16_[i] * decay_q16 + 32768ULL) >> 16ULL;
+        }
+        current_time_ns_ += dt_ns;
+
+        // Categorical event selection in integer Q16 space
+        const std::uint64_t pick_q16 = ((raw >> 16ULL) % total_q16);
+        std::uint64_t accum_q16 = 0ULL;
+        QueueEventType selected = QueueEventType::BuyLimit;
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            accum_q16 += lambda_q16[i];
+            if (pick_q16 < accum_q16 || i == kEventTypes - 1) {
+                selected = static_cast<QueueEventType>(i);
+                break;
+            }
+        }
+
+        const std::size_t sel_idx = static_cast<std::size_t>(selected);
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            state_q16_[i] += alpha_q16_[i][sel_idx];
+        }
+        const std::uint32_t regime = SwarQueueReactiveRegimeLut::classify_regime(best_bid_vol, best_ask_vol);
+        (void)hawkes_q16_.record_event(current_time_ns_, regime);
+
+        const Qty qty = static_cast<Qty>(cfg_.min_qty +
+            (rng_.next_u64() % static_cast<std::uint64_t>(std::max<Qty>(1, cfg_.max_qty - cfg_.min_qty + 1))));
+
+        return build_generated_event(selected, qty, dt_ns, best_bid_price, best_ask_price);
+    }
+
+    // Advance time and generate the next market event
+    GeneratedEvent next_event(Tick best_bid_price, Qty best_bid_vol,
+                             Tick best_ask_price, Qty best_ask_vol) {
+        const auto lambda = compute_intensities(best_bid_vol, best_ask_vol);
+        double total_rate = 0.0;
+        for (double r : lambda) total_rate += r;
+
+        // Sample inter-arrival time: delta_t ~ Exp(total_rate)
+        const double u = std::max(1e-12, 1.0 - distributions::next_unit_double(rng_));
+        const double dt_us = -std::log(u) / total_rate;
+        const TimeNs dt_ns = std::max<TimeNs>(1, static_cast<TimeNs>(dt_us * 1000.0));
+
+        // Decay Hawkes excitation state over dt
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            for (std::size_t j = 0; j < kEventTypes; ++j) {
+                state_[i][j] *= std::exp(-hawkes_.beta[i][j] * static_cast<double>(dt_ns));
+            }
+        }
+        current_time_ns_ += dt_ns;
+        const std::uint32_t regime = SwarQueueReactiveRegimeLut::classify_regime(best_bid_vol, best_ask_vol);
+        (void)hawkes_q16_.record_event(current_time_ns_, regime);
+
+        // Sample which event occurred according to relative intensity
+        const double pick = distributions::next_unit_double(rng_) * total_rate;
+        double accum = 0.0;
+        QueueEventType selected = QueueEventType::BuyLimit;
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            accum += lambda[i];
+            if (pick <= accum || i == kEventTypes - 1) {
+                selected = static_cast<QueueEventType>(i);
+                break;
+            }
+        }
+
+        // Excite Hawkes state with the selected event
+        const std::size_t sel_idx = static_cast<std::size_t>(selected);
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            state_[i][sel_idx] += hawkes_.alpha[i][sel_idx];
+        }
+
+        // Sample order quantity
+        const Qty qty = static_cast<Qty>(cfg_.min_qty +
+            (rng_.next_u64() % static_cast<std::uint64_t>(std::max<Qty>(1, cfg_.max_qty - cfg_.min_qty + 1))));
+
+        return build_generated_event(selected, qty, dt_ns, best_bid_price, best_ask_price);
+    }
+
+    TimeNs current_time() const noexcept { return current_time_ns_; }
+    const OnlineHawkesQ16& hawkes_q16() const noexcept { return hawkes_q16_; }
+    OnlineHawkesQ16& hawkes_q16() noexcept { return hawkes_q16_; }
+
+private:
+    static constexpr GeneratedEvent build_generated_event(
+        QueueEventType selected, Qty qty, TimeNs dt_ns,
+        Tick best_bid_price, Tick best_ask_price) noexcept {
+        GeneratedEvent ev{};
+        ev.type = selected;
+        ev.qty = qty;
+        ev.inter_arrival_ns = dt_ns;
+
+        switch (selected) {
+            case QueueEventType::BuyLimit:
+                ev.side = Side::Buy;
+                ev.order_type = OrderType::Limit;
+                ev.price = best_bid_price;
+                break;
+            case QueueEventType::SellLimit:
+                ev.side = Side::Sell;
+                ev.order_type = OrderType::Limit;
+                ev.price = best_ask_price;
+                break;
+            case QueueEventType::BuyCancel:
+                ev.side = Side::Buy;
+                ev.order_type = OrderType::Cancel;
+                ev.price = best_bid_price;
+                break;
+            case QueueEventType::SellCancel:
+                ev.side = Side::Sell;
+                ev.order_type = OrderType::Cancel;
+                ev.price = best_ask_price;
+                break;
+            case QueueEventType::BuyMarket:
+                ev.side = Side::Buy;
+                ev.order_type = OrderType::Market;
+                ev.price = 0; // sweeps ask
+                break;
+            case QueueEventType::SellMarket:
+                ev.side = Side::Sell;
+                ev.order_type = OrderType::Market;
+                ev.price = 0; // sweeps bid
+                break;
+            default:
+                break;
+        }
+        return ev;
+    }
+
+    void init_q16_tables() noexcept {
+        base_limit_q16_ = static_cast<std::uint64_t>(
+            std::max<long long>(1LL, std::llround(cfg_.base_limit_rate * static_cast<double>(kQ16One))));
+        base_cancel_q16_ = static_cast<std::uint64_t>(
+            std::max<long long>(1LL, std::llround(cfg_.base_cancel_rate * static_cast<double>(kQ16One))));
+        base_market_q16_ = static_cast<std::uint64_t>(
+            std::max<long long>(1LL, std::llround(cfg_.base_market_rate * static_cast<double>(kQ16One))));
+        beta_per_us_q16_ = static_cast<std::uint64_t>(
+            std::max<long long>(1LL, std::llround(hawkes_.beta[0][0] * 1000.0 * static_cast<double>(kQ16One))));
+        state_q16_.fill(0ULL);
+        for (std::size_t i = 0; i < kEventTypes; ++i) {
+            for (std::size_t j = 0; j < kEventTypes; ++j) {
+                alpha_q16_[i][j] = static_cast<std::uint64_t>(
+                    std::max<long long>(0LL, std::llround(hawkes_.alpha[i][j] * static_cast<double>(kQ16One))));
+            }
+        }
+    }
+
+    QueueReactiveConfig cfg_;
+    HawkesMatrix hawkes_;
+    Xoshiro256StarStar rng_;
+    TimeNs current_time_ns_ = 0;
+    // state_[i][j] = current excitation on event i due to past events of type j
+    std::array<std::array<double, kEventTypes>, kEventTypes> state_{};
+    OnlineHawkesQ16 hawkes_q16_;
+    std::uint64_t base_limit_q16_ = 3277ULL;
+    std::uint64_t base_cancel_q16_ = 131ULL;
+    std::uint64_t base_market_q16_ = 655ULL;
+    std::uint64_t beta_per_us_q16_ = kQ16One;
+    std::array<std::uint64_t, kEventTypes> state_q16_{};
+    std::array<std::array<std::uint64_t, kEventTypes>, kEventTypes> alpha_q16_{};
 };
 
 } // namespace sim

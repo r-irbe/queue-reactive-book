@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory_resource>
 #include <optional>
@@ -19,8 +20,10 @@ struct BookLevelView {
 
 struct ExecutionResult {
     std::vector<Trade> trades;
-    Qty filled    = 0;
-    Qty remaining = 0;
+    Qty filled        = 0;
+    Qty remaining     = 0;
+    OrderStatus status = OrderStatus::RejectedInvalid;
+    OrderId id        = 0;
 };
 
 struct MatchSummary {
@@ -28,6 +31,8 @@ struct MatchSummary {
     Qty         filled      = 0;
     Qty         remaining   = 0;
     std::size_t trade_count = 0;
+    OrderStatus status      = OrderStatus::RejectedInvalid;
+    std::uint8_t stp_cancels = 0;
 };
 
 struct CompactionConfig {
@@ -80,7 +85,37 @@ public:
 
     ExecutionResult add(Order order, StpMode stp = StpMode::None);
 
-    bool cancel(OrderId id);
+    MatchOutcome add_outcome_into(const Order& order,
+                                  Trade* out,
+                                  std::size_t max_trades,
+                                  StpMode stp = StpMode::None) noexcept;
+
+    MatchOutcome add_outcome(const Order& order,
+                             StpMode stp = StpMode::None) noexcept {
+        return add_outcome_into(order, nullptr, 0, stp);
+    }
+
+    MatchSummary add_into(Order order,
+                          Trade* trade_buf,
+                          std::size_t trade_cap,
+                          StpMode stp = StpMode::None) noexcept {
+        const Qty orig_qty = order.qty;
+        const MatchOutcome out = add_outcome_into(order, trade_buf, trade_cap, stp);
+        MatchSummary summary{};
+        summary.id = out.id;
+        summary.filled = out.filled;
+        summary.remaining = out.remaining(orig_qty);
+        summary.trade_count = out.trade_count;
+        summary.status = out.status;
+        summary.stp_cancels = out.stp_cancels;
+        return summary;
+    }
+
+    CancelOutcome cancel_outcome(OrderId id) noexcept;
+
+    bool cancel(OrderId id) noexcept {
+        return static_cast<bool>(cancel_outcome(id));
+    }
 
     void set_default_stp_mode(StpMode mode) noexcept { default_stp_mode_ = mode; }
     StpMode default_stp_mode() const noexcept { return default_stp_mode_; }
@@ -95,6 +130,7 @@ public:
 
     Qty volume_at(Side side, Tick price) const noexcept;
 
+    std::size_t levels_into(Side side, BookLevelView* out, std::size_t max_levels) const noexcept;
     std::vector<BookLevelView> levels(Side side, std::size_t depth = 0) const;
 
     bool        empty()       const noexcept;

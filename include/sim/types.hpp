@@ -98,6 +98,75 @@ namespace sim {
         DecrementAndCancel = 3, // Decrement both orders by min(taker, maker) qty without trade
     };
 
+    // Exhaustive FOOP order execution status (side-effects and errors as data).
+    enum class OrderStatus : std::uint8_t {
+        AcceptedRested     = 0,
+        FilledComplete     = 1,
+        FilledPartialRest  = 2,
+        FilledPartialIoc   = 3,
+        ExpiredIocZero     = 4,
+        RejectedInvalid    = 5,
+        RejectedOutOfRange = 6,
+        RejectedPostOnly   = 7,
+        RejectedFok        = 8,
+        CancelledByStp     = 9,
+    };
+
+    // Register-packed 16-byte match outcome returned in (rax:rdx) under System V AMD64 ABI.
+    struct alignas(16) MatchOutcome {
+        OrderId       id          = 0;                             // offset  0 (8B)
+        Qty           filled      = 0;                             // offset  8 (4B)
+        std::uint16_t trade_count = 0;                             // offset 12 (2B)
+        OrderStatus   status      = OrderStatus::RejectedInvalid;  // offset 14 (1B)
+        std::uint8_t  stp_cancels = 0;                             // offset 15 (1B)
+
+        constexpr bool is_accepted() const noexcept {
+            return status == OrderStatus::AcceptedRested ||
+                   status == OrderStatus::FilledComplete ||
+                   status == OrderStatus::FilledPartialRest ||
+                   status == OrderStatus::FilledPartialIoc ||
+                   status == OrderStatus::ExpiredIocZero ||
+                   status == OrderStatus::CancelledByStp;
+        }
+
+        constexpr bool is_rejected() const noexcept {
+            return status == OrderStatus::RejectedInvalid ||
+                   status == OrderStatus::RejectedOutOfRange ||
+                   status == OrderStatus::RejectedPostOnly ||
+                   status == OrderStatus::RejectedFok;
+        }
+
+        constexpr bool has_rested() const noexcept {
+            return status == OrderStatus::AcceptedRested ||
+                   status == OrderStatus::FilledPartialRest;
+        }
+
+        constexpr Qty remaining(Qty orig_qty) const noexcept {
+            return has_rested() ? ((orig_qty > filled) ? (orig_qty - filled) : 0) : 0;
+        }
+    };
+    static_assert(sizeof(MatchOutcome) == 16, "MatchOutcome must be 16B for rax:rdx register return");
+
+    // Exhaustive FOOP cancellation status.
+    enum class CancelStatus : std::uint8_t {
+        Cancelled       = 0,
+        NotFound        = 1,
+        AlreadyInactive = 2,
+    };
+
+    // Register-packed 8-byte cancel outcome returned in a single GP register (rax).
+    struct alignas(8) CancelOutcome {
+        Qty          cancelled_qty = 0;                       // offset 0 (4B)
+        std::int16_t price_offset  = 0;                       // offset 4 (2B)
+        Side         side          = Side::Buy;               // offset 6 (1B)
+        CancelStatus status        = CancelStatus::NotFound;  // offset 7 (1B)
+
+        constexpr explicit operator bool() const noexcept {
+            return status == CancelStatus::Cancelled;
+        }
+    };
+    static_assert(sizeof(CancelOutcome) == 8, "CancelOutcome must be 8B for single-register return");
+
     // Hot matching fields first (id, qty, agent, price) fit in 24 bytes -- one cache line access.
     struct Order {
         OrderId   id         = 0;                // offset  0

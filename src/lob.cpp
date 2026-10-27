@@ -21,11 +21,13 @@ LimitOrderBook::LimitOrderBook(std::size_t expected_orders,
 ExecutionResult LimitOrderBook::add(Order order, StpMode stp) {
     ExecutionResult result;
     if (order.qty <= 0) {
+        result.status = OrderStatus::RejectedInvalid;
         return result;
     }
 
     order.id       = next_id_++;
     order.orig_qty = order.qty;
+    result.id      = order.id;
     const StpMode effective_stp = (stp != StpMode::None)
                                       ? stp
                                       : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
@@ -33,15 +35,18 @@ ExecutionResult LimitOrderBook::add(Order order, StpMode stp) {
     if (order.type == OrderType::PostOnly) {
         if (is_buy(order.side)) {
             if (!asks_.empty() && asks_.begin()->first <= order.price) {
+                result.status = OrderStatus::RejectedPostOnly;
                 return result;
             }
         } else {
             if (!bids_.empty() && bids_.begin()->first >= order.price) {
+                result.status = OrderStatus::RejectedPostOnly;
                 return result;
             }
         }
         rest(order);
         result.remaining = order.qty;
+        result.status = OrderStatus::AcceptedRested;
         return result;
     }
 
@@ -76,6 +81,7 @@ ExecutionResult LimitOrderBook::add(Order order, StpMode stp) {
                             ? can_fill(asks_, [&](Tick p) { return p <= order.price; })
                             : can_fill(bids_, [&](Tick p) { return p >= order.price; });
         if (!ok) {
+            result.status = OrderStatus::RejectedFok;
             return result;
         }
     }
@@ -89,11 +95,191 @@ ExecutionResult LimitOrderBook::add(Order order, StpMode stp) {
     else
         match_against_bids(order, result, is_limit, order.price, effective_stp);
 
-    if (order.type == OrderType::Limit && order.qty > 0)
+    if (order.type == OrderType::Limit && order.qty > 0) {
         rest(order);
-
+        result.status = (result.filled > 0) ? OrderStatus::FilledPartialRest
+                                            : OrderStatus::AcceptedRested;
+    } else {
+        if (result.filled == order.orig_qty) {
+            result.status = OrderStatus::FilledComplete;
+        } else if (result.filled > 0) {
+            result.status = OrderStatus::FilledPartialIoc;
+        } else {
+            result.status = OrderStatus::ExpiredIocZero;
+        }
+    }
     result.remaining = order.qty;
     return result;
+}
+
+MatchOutcome LimitOrderBook::add_outcome_into(const Order& in_order,
+                                              Trade* out_trades,
+                                              std::size_t max_trades,
+                                              StpMode stp) noexcept {
+    MatchOutcome outcome{};
+    Order order = in_order;
+    if (order.qty <= 0) {
+        outcome.status = OrderStatus::RejectedInvalid;
+        return outcome;
+    }
+
+    order.id       = next_id_++;
+    order.orig_qty = order.qty;
+    outcome.id     = order.id;
+    const StpMode effective_stp = (stp != StpMode::None)
+                                      ? stp
+                                      : (order.stp != StpMode::None ? order.stp : default_stp_mode_);
+
+    if (order.type == OrderType::PostOnly) {
+        if (is_buy(order.side)) {
+            if (!asks_.empty() && asks_.begin()->first <= order.price) {
+                outcome.status = OrderStatus::RejectedPostOnly;
+                return outcome;
+            }
+        } else {
+            if (!bids_.empty() && bids_.begin()->first >= order.price) {
+                outcome.status = OrderStatus::RejectedPostOnly;
+                return outcome;
+            }
+        }
+        rest(order);
+        outcome.status = OrderStatus::AcceptedRested;
+        return outcome;
+    }
+
+    if (order.type == OrderType::FOK) {
+        Qty available = 0;
+        auto can_fill = [&](const auto& book_map, auto price_ok) -> bool {
+            for (const auto& [lvl_price, level] : book_map) {
+                if (!price_ok(lvl_price)) break;
+                if (effective_stp == StpMode::None) {
+                    available += level.volume;
+                    if (available >= order.qty) return true;
+                } else {
+                    for (std::size_t i = level.head; i < level.orders.size(); ++i) {
+                        const Order& maker = level.orders[i];
+                        if (maker.qty <= 0) continue;
+                        if (maker.agent == order.agent) {
+                            if (effective_stp == StpMode::CancelAggressive ||
+                                effective_stp == StpMode::DecrementAndCancel) {
+                                return available >= order.qty;
+                            }
+                            continue;
+                        }
+                        available += maker.qty;
+                        if (available >= order.qty) return true;
+                    }
+                }
+            }
+            return available >= order.qty;
+        };
+
+        const bool ok = is_buy(order.side)
+                            ? can_fill(asks_, [&](Tick p) { return p <= order.price; })
+                            : can_fill(bids_, [&](Tick p) { return p >= order.price; });
+        if (!ok) {
+            outcome.status = OrderStatus::RejectedFok;
+            return outcome;
+        }
+    }
+
+    const bool is_limit = (order.type == OrderType::Limit ||
+                           order.type == OrderType::IOC ||
+                           order.type == OrderType::FOK);
+
+    bool stp_cancelled_taker = false;
+    auto match_side = [&](auto& book_map, Side opp_side, auto price_stop) {
+        while (order.qty > 0 && !book_map.empty()) {
+            auto it = book_map.begin();
+            if (is_limit && price_stop(it->first)) break;
+
+            Level& level = it->second;
+            while (level.head < level.orders.size() && level.orders[level.head].qty == 0)
+                ++level.head;
+
+            while (order.qty > 0 && level.head < level.orders.size()) {
+                Order& maker = level.orders[level.head];
+                if (maker.qty == 0) { ++level.head; continue; }
+
+                if (order.agent == maker.agent && effective_stp != StpMode::None) {
+                    if (outcome.stp_cancels < 255U) ++outcome.stp_cancels;
+                    if (effective_stp == StpMode::CancelPassive) {
+                        level.volume -= maker.qty;
+                        id_index_.erase(maker.id);
+                        --level.live_orders;
+                        maker.qty = 0;
+                        ++level.head;
+                        continue;
+                    } else if (effective_stp == StpMode::CancelAggressive) {
+                        order.qty = 0;
+                        stp_cancelled_taker = true;
+                        break;
+                    } else if (effective_stp == StpMode::DecrementAndCancel) {
+                        const Qty dec = std::min(order.qty, maker.qty);
+                        maker.qty -= dec;
+                        level.volume -= dec;
+                        order.qty -= dec;
+                        if (maker.qty == 0) {
+                            id_index_.erase(maker.id);
+                            --level.live_orders;
+                            ++level.head;
+                        }
+                        if (order.qty == 0) {
+                            stp_cancelled_taker = true;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                const Qty fill = std::min(order.qty, maker.qty);
+                if (out_trades != nullptr && outcome.trade_count < max_trades) {
+                    out_trades[outcome.trade_count] = Trade{
+                        maker.id, order.id, maker.agent, order.agent,
+                        order.side, it->first, fill, book_time_};
+                }
+                if (outcome.trade_count < std::numeric_limits<std::uint16_t>::max()) {
+                    ++outcome.trade_count;
+                }
+                outcome.filled += fill;
+                maker.qty      -= fill;
+                level.volume   -= fill;
+                order.qty      -= fill;
+
+                if (maker.qty == 0) {
+                    id_index_.erase(maker.id);
+                    --level.live_orders;
+                    ++level.head;
+                }
+            }
+
+            if (level.volume == 0) book_map.erase(it);
+            else maybe_compact_level(opp_side, it->first, level);
+        }
+    };
+
+    if (is_buy(order.side)) {
+        match_side(asks_, Side::Sell, [&](Tick p) { return p > order.price; });
+    } else {
+        match_side(bids_, Side::Buy, [&](Tick p) { return p < order.price; });
+    }
+
+    if (order.type == OrderType::Limit && order.qty > 0) {
+        rest(order);
+        outcome.status = (outcome.filled > 0) ? OrderStatus::FilledPartialRest
+                                              : OrderStatus::AcceptedRested;
+    } else {
+        if (outcome.filled == order.orig_qty) {
+            outcome.status = OrderStatus::FilledComplete;
+        } else if (stp_cancelled_taker) {
+            outcome.status = OrderStatus::CancelledByStp;
+        } else if (outcome.filled > 0) {
+            outcome.status = OrderStatus::FilledPartialIoc;
+        } else {
+            outcome.status = OrderStatus::ExpiredIocZero;
+        }
+    }
+    return outcome;
 }
 
 void LimitOrderBook::match_against_asks(Order& incoming, ExecutionResult& out, bool is_limit, Tick limit_price, StpMode stp) {
@@ -266,18 +452,33 @@ void LimitOrderBook::rest(Order& order) {
     }
 }
 
-bool LimitOrderBook::cancel(OrderId id) {
+CancelOutcome LimitOrderBook::cancel_outcome(OrderId id) noexcept {
+    CancelOutcome out{};
+    if (id == 0 || id >= next_id_) {
+        out.status = CancelStatus::NotFound;
+        return out;
+    }
     const auto idx_it = id_index_.find(id);
-    if (idx_it == id_index_.end()) return false;
+    if (idx_it == id_index_.end()) {
+        out.status = CancelStatus::AlreadyInactive;
+        return out;
+    }
 
     const OrderRef ref = idx_it->second;
     id_index_.erase(idx_it);
+    out.side = ref.side;
+    const auto clamped_price = std::clamp<std::int64_t>(
+        ref.price,
+        std::numeric_limits<std::int16_t>::min(),
+        std::numeric_limits<std::int16_t>::max());
+    out.price_offset = static_cast<std::int16_t>(clamped_price);
 
     auto tombstone = [&](auto& book_map) {
         const auto it = book_map.find(ref.price);
         if (it == book_map.end()) return;
         Level& level  = it->second;
         Order& o      = level.orders[ref.slot];
+        out.cancelled_qty = o.qty;
         level.volume -= o.qty;
         --level.live_orders;
         o.qty         = 0;
@@ -292,7 +493,8 @@ bool LimitOrderBook::cancel(OrderId id) {
 
     if (is_buy(ref.side)) tombstone(bids_);
     else                  tombstone(asks_);
-    return true;
+    out.status = (out.cancelled_qty > 0) ? CancelStatus::Cancelled : CancelStatus::AlreadyInactive;
+    return out;
 }
 
 std::optional<Qty> LimitOrderBook::queue_ahead(OrderId id) const noexcept {
@@ -332,6 +534,21 @@ Qty LimitOrderBook::volume_at(Side side, Tick price) const noexcept {
         const auto it = asks_.find(price);
         return it != asks_.end() ? it->second.volume : 0;
     }
+}
+
+std::size_t LimitOrderBook::levels_into(Side side, BookLevelView* out, std::size_t max_levels) const noexcept {
+    if (out == nullptr || max_levels == 0) return 0;
+    std::size_t count = 0;
+    auto collect = [&](const auto& book_map) noexcept {
+        for (const auto& [price, level] : book_map) {
+            if (count >= max_levels) break;
+            if (level.empty()) continue;
+            out[count++] = BookLevelView{price, level.volume, level.live_orders};
+        }
+    };
+    if (side == Side::Buy) collect(bids_);
+    else                   collect(asks_);
+    return count;
 }
 
 std::vector<BookLevelView> LimitOrderBook::levels(Side side, std::size_t depth) const {
