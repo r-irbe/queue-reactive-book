@@ -638,21 +638,46 @@ public:
         out.buy_market     = l1[static_cast<std::size_t>(QueueEventType::BuyMarket)];
         out.sell_market    = l1[static_cast<std::size_t>(QueueEventType::SellMarket)];
 
+        const double q1_bid = static_cast<double>(std::max<Qty>(0, bid_vols[0]));
+        const double q1_ask = static_cast<double>(std::max<Qty>(0, ask_vols[0]));
+        const double tot_l1 = q1_bid + q1_ask;
+        const double imb_l1 = (tot_l1 > 0.0) ? ((q1_bid - q1_ask) / tot_l1) : 0.0;
+        const double opp_bid_mod = 1.0 + cfg_.opposite_queue_beta * std::tanh(q1_ask / 200.0);
+        const double opp_ask_mod = 1.0 + cfg_.opposite_queue_beta * std::tanh(q1_bid / 200.0);
+        const double imb_add_bid = std::exp(-cfg_.imbalance_sensitivity * imb_l1);
+        const double imb_add_ask = std::exp(+cfg_.imbalance_sensitivity * imb_l1);
+
         for (std::size_t m = 1; m < out.num_levels; ++m) {
             const double qb = static_cast<double>(std::max<Qty>(0, bid_vols[m]));
             const double qa = static_cast<double>(std::max<Qty>(0, ask_vols[m]));
             const double lim_mult = cfg_.level_limit_multipliers[m];
             const double can_mult = cfg_.level_cancel_multipliers[m];
 
-            out.buy_limit[m] = std::max(1e-9,
-                (cfg_.base_limit_rate * lim_mult) /
-                (1.0 + cfg_.limit_depth_decay * std::pow(qb + 1.0, cfg_.limit_gamma) + cfg_.theta_ergodic * qb));
-            out.sell_limit[m] = std::max(1e-9,
-                (cfg_.base_limit_rate * lim_mult) /
-                (1.0 + cfg_.limit_depth_decay * std::pow(qa + 1.0, cfg_.limit_gamma) + cfg_.theta_ergodic * qa));
+            if (cfg_.use_empirical_3d_table) {
+                const Empirical3DCell& cell = table_3d_.lookup(bid_vols[0], ask_vols[0], spread_ticks);
+                const double imb_skew_bid = std::exp(-0.25 * imb_l1);
+                const double imb_skew_ask = std::exp(+0.25 * imb_l1);
+                out.buy_limit[m] = std::max(1e-9, 0.5 * cell.lambda_add_per_us * lim_mult * imb_skew_bid);
+                out.sell_limit[m] = std::max(1e-9, 0.5 * cell.lambda_add_per_us * lim_mult * imb_skew_ask);
+                out.buy_cancel[m] = (qb > 0.0)
+                    ? std::max(1e-9, 0.5 * cell.lambda_cancel_per_us * can_mult * (1.0 + 0.2 * std::log1p(qb)))
+                    : 1e-9;
+                out.sell_cancel[m] = (qa > 0.0)
+                    ? std::max(1e-9, 0.5 * cell.lambda_cancel_per_us * can_mult * (1.0 + 0.2 * std::log1p(qa)))
+                    : 1e-9;
+            } else {
+                out.buy_limit[m] = std::max(1e-9,
+                    (cfg_.base_limit_rate * lim_mult * opp_bid_mod * imb_add_bid) /
+                    (1.0 + cfg_.limit_depth_decay * std::pow(qb + 1.0, cfg_.limit_gamma) + cfg_.theta_ergodic * qb));
+                out.sell_limit[m] = std::max(1e-9,
+                    (cfg_.base_limit_rate * lim_mult * opp_ask_mod * imb_add_ask) /
+                    (1.0 + cfg_.limit_depth_decay * std::pow(qa + 1.0, cfg_.limit_gamma) + cfg_.theta_ergodic * qa));
 
-            out.buy_cancel[m]  = std::max(1e-9, cfg_.base_cancel_rate * can_mult * std::pow(qb, cfg_.cancel_delta));
-            out.sell_cancel[m] = std::max(1e-9, cfg_.base_cancel_rate * can_mult * std::pow(qa, cfg_.cancel_delta));
+                out.buy_cancel[m]  = std::max(1e-9,
+                    cfg_.base_cancel_rate * can_mult * (std::pow(qb, cfg_.cancel_delta) + cfg_.theta_ergodic * qb * qb * 0.01) * opp_bid_mod);
+                out.sell_cancel[m] = std::max(1e-9,
+                    cfg_.base_cancel_rate * can_mult * (std::pow(qa, cfg_.cancel_delta) + cfg_.theta_ergodic * qa * qa * 0.01) * opp_ask_mod);
+            }
         }
 
         if (cfg_.enable_inside_spread_orders && spread_ticks > 1) {
@@ -1003,12 +1028,94 @@ public:
         return next_event_multilevel(best_bid_price, best_ask_price, bid_vols, ask_vols);
     }
 
-    // Overload for exact Ogata thinning accepting multi-level arrays
+    // Multi-level (K <= 5) exact Ogata thinning generator across all 4*K + 4 event channels
     GeneratedEvent next_event_ogata_thinning(Tick best_bid_price,
                                              const std::array<Qty, kMaxQrLevels>& bid_vols,
                                              Tick best_ask_price,
                                              const std::array<Qty, kMaxQrLevels>& ask_vols) {
-        return next_event_ogata_thinning(best_bid_price, bid_vols[0], best_ask_price, ask_vols[0]);
+        if (cfg_.num_levels <= 1 && !cfg_.enable_inside_spread_orders) {
+            return next_event_ogata_thinning(best_bid_price, bid_vols[0], best_ask_price, ask_vols[0]);
+        }
+        const Tick spread_ticks = std::max<Tick>(1, best_ask_price - best_bid_price);
+        double integrated_tau = 0.0;
+        TimeNs total_dt_ns = 0;
+        QueueEventType selected = QueueEventType::BuyLimit;
+        std::uint8_t sel_level = 1;
+
+        for (int step = 0; step < 64; ++step) {
+            const MultiLevelEventRates rates_upper = compute_multilevel_intensities(bid_vols, ask_vols, spread_ticks);
+            const double upper_rate = rates_upper.total_rate();
+            const auto l1_upper = compute_intensities(bid_vols[0], ask_vols[0], spread_ticks);
+            const double l1_upper_sum = l1_upper[0] + l1_upper[1] + l1_upper[2] + l1_upper[3] + l1_upper[4] + l1_upper[5];
+            const double extra_upper = std::max(0.0, upper_rate - l1_upper_sum);
+
+            const double u1 = std::max(1e-12, 1.0 - distributions::next_unit_double(rng_));
+            const double dt_us = -std::log(u1) / upper_rate;
+            const TimeNs dt_ns = std::max<TimeNs>(1, static_cast<TimeNs>(dt_us * 1000.0));
+
+            integrated_tau += advance_and_integrate_state(l1_upper, dt_ns, dt_us, bid_vols[0], ask_vols[0], false)
+                            + extra_upper * dt_us;
+            total_dt_ns += dt_ns;
+
+            const MultiLevelEventRates rates_cand = compute_multilevel_intensities(bid_vols, ask_vols, spread_ticks);
+            const double cand_rate = rates_cand.total_rate();
+
+            const double u2 = distributions::next_unit_double(rng_) * upper_rate;
+            if (u2 <= cand_rate || step == 63) {
+                const double pick = (u2 <= cand_rate) ? u2 : (distributions::next_unit_double(rng_) * cand_rate);
+                double accum = 0.0;
+                bool chosen = false;
+                for (std::size_t m = 0; m < rates_cand.num_levels && !chosen; ++m) {
+                    const auto lvl = static_cast<std::uint8_t>(m + 1);
+                    accum += rates_cand.buy_limit[m];
+                    if (pick <= accum) { selected = QueueEventType::BuyLimit; sel_level = lvl; chosen = true; break; }
+                    accum += rates_cand.sell_limit[m];
+                    if (pick <= accum) { selected = QueueEventType::SellLimit; sel_level = lvl; chosen = true; break; }
+                    accum += rates_cand.buy_cancel[m];
+                    if (pick <= accum) { selected = QueueEventType::BuyCancel; sel_level = lvl; chosen = true; break; }
+                    accum += rates_cand.sell_cancel[m];
+                    if (pick <= accum) { selected = QueueEventType::SellCancel; sel_level = lvl; chosen = true; break; }
+                }
+                if (!chosen) {
+                    accum += rates_cand.buy_market;
+                    if (pick <= accum) {
+                        selected = QueueEventType::BuyMarket;
+                        sel_level = 1;
+                    } else {
+                        accum += rates_cand.sell_market;
+                        if (pick <= accum) {
+                            selected = QueueEventType::SellMarket;
+                            sel_level = 1;
+                        } else {
+                            accum += rates_cand.create_bid;
+                            if (pick <= accum) {
+                                selected = QueueEventType::CreateBid;
+                                sel_level = 0;
+                            } else {
+                                selected = QueueEventType::CreateAsk;
+                                sel_level = 0;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if (cfg_.record_ogata_residuals && ogata_residuals_.size() < 100000U) {
+            ogata_residuals_.push_back(integrated_tau);
+        }
+        const QueueEventType hawkes_ev =
+            (selected == QueueEventType::CreateBid) ? QueueEventType::BuyLimit :
+            (selected == QueueEventType::CreateAsk) ? QueueEventType::SellLimit : selected;
+        excite_hawkes(hawkes_ev);
+
+        const std::size_t lvl_idx = (sel_level > 0) ? static_cast<std::size_t>(sel_level - 1) : 0U;
+        const Qty qty = sample_order_qty(lvl_idx);
+        GeneratedEvent ev = build_generated_event(selected, qty, total_dt_ns, best_bid_price, best_ask_price, sel_level);
+        ev.rescaled_tau = integrated_tau;
+        apply_hlr_model_iii_depletion_and_impact(ev, bid_vols[0], ask_vols[0]);
+        return ev;
     }
 
     void set_empirical_3d_table(const Empirical3DIntensityTable& table) noexcept {
@@ -1043,8 +1150,8 @@ private:
         const std::size_t n = std::min<std::size_t>(impact_count_, kImpactWindowCap);
         for (std::size_t i = 0; i < n; ++i) {
             const auto& ev = impact_ring_[i];
-            const double dt_us = std::max(0.0, now_us - static_cast<double>(ev.ts_ns) * 1e-3);
-            sum += ev.signed_vol * std::pow(dt_us + cfg_.impact_tau0_us, -cfg_.impact_gamma);
+            const double dt_us = std::max(0.0, ( static_cast<double>(current_time_ns_) - static_cast<double>(ev.ts_ns) ) * 1e-3);
+            sum += ev.signed_vol * std::pow(dt_us + std::max(1e-6, cfg_.impact_tau0_us), -cfg_.impact_gamma);
         }
         return sum;
     }

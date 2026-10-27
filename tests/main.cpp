@@ -5388,3 +5388,79 @@ TEST_CASE("Zero steady-state heap allocations in QueueReactiveProcess + FlatLadd
     }
     REQUIRE(allocs.allocations == 0);
 }
+
+
+TEST_CASE("Multi-level Ogata thinning generates deeper level events and CreateBid/CreateAsk",
+          "[qr][multilevel][ogata]") {
+    sim::QRParams cfg{};
+    cfg.num_levels = 5;
+    cfg.enable_inside_spread_orders = true;
+    cfg.opposite_queue_beta = 0.25;
+    cfg.imbalance_sensitivity = 0.35;
+    cfg.enable_transient_impact = true;
+    cfg.enable_ou_alpha_drift = true;
+
+    sim::QueueReactiveProcess qrp(cfg, sim::HawkesMatrix::default_microstructure(), 7777ULL);
+    std::array<sim::Qty, sim::kMaxQRLevels> bq{120, 90, 70, 50, 30};
+    std::array<sim::Qty, sim::kMaxQRLevels> aq{60, 80, 70, 50, 30};
+
+    std::size_t deeper_levels = 0;
+    std::size_t inside_spread = 0;
+    for (int i = 0; i < 600; ++i) {
+        const auto ev = qrp.next_event_ogata_thinning(98, bq, 102, aq); // spread = 4 ticks
+        if (ev.level >= 2 && ev.level <= 5) {
+            ++deeper_levels;
+        }
+        if (ev.type == sim::QueueEventType::CreateBid || ev.type == sim::QueueEventType::CreateAsk) {
+            ++inside_spread;
+            REQUIRE(ev.level == 0);
+            REQUIRE(ev.price > 98);
+            REQUIRE(ev.price < 102);
+        }
+    }
+    REQUIRE(deeper_levels > 50);
+    REQUIRE(inside_spread > 10);
+    REQUIRE(qrp.ogata_residuals().size() == 600);
+    double sum_tau = 0.0;
+    for (double r : qrp.ogata_residuals()) sum_tau += r;
+    const double mean_tau = sum_tau / 600.0;
+    REQUIRE(mean_tau > 0.85);
+    REQUIRE(mean_tau < 1.15);
+
+    // Verify HLR Model IIb opposite-queue and imbalance coupling on deeper levels m >= 1
+    const auto rates_pos_imb = qrp.compute_multilevel_intensities(bq, aq, 2);
+    const auto rates_neg_imb = qrp.compute_multilevel_intensities(aq, bq, 2);
+    REQUIRE(rates_pos_imb.buy_limit[1] != rates_neg_imb.buy_limit[1]);
+    REQUIRE(rates_pos_imb.sell_limit[2] != rates_neg_imb.sell_limit[2]);
+}
+
+TEST_CASE("SimulationSession survives total 5-level side depletion with in-flight taker orders",
+          "[simulation][depletion][edge_case]") {
+    sim::SimulationSessionConfig scfg{};
+    scfg.num_events = 400;
+    scfg.initial_depth_per_level = 5; // very thin book so 5 levels deplete rapidly
+    scfg.qr_params.min_qty = 20;
+    scfg.qr_params.max_qty = 80;
+    scfg.qr_params.base_market_rate = 0.08; // heavy market sweeps
+    scfg.qr_params.theta_reinit = 0.90;
+
+    sim::StrategicAgentConfig taker{};
+    taker.agent_id = 30;
+    taker.kind = sim::StrategicAgentKind::TwapExecution;
+    taker.execution_target_qty = 200;
+    taker.execution_slices = 20;
+    taker.latency = sim::LatencyConfig{1000, 500, 1000};
+
+    sim::StrategicAgentConfig mm{};
+    mm.agent_id = 31;
+    mm.kind = sim::StrategicAgentKind::CjpHeuristic;
+    mm.latency = sim::LatencyConfig{2000, 500, 2000};
+
+    sim::SimulationSession session(scfg, {taker, mm});
+    const auto res = session.run();
+    REQUIRE(res.events_processed == 400);
+    REQUIRE(res.invariants_ok);
+    REQUIRE(res.export_parity_ok);
+    REQUIRE(res.join_manifest_clean);
+    REQUIRE(res.total_trades > 0);
+}

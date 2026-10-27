@@ -151,6 +151,15 @@ def load_ffi_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)
     ]
     lib.qrlob_ffi_run_mm_tournament.restype = ctypes.c_int
+
+    lib.qrlob_ffi_calibrate_lobster_csv.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.qrlob_ffi_calibrate_lobster_csv.restype = ctypes.c_int
     return lib
 
 def run_ffi_microbenchmarks(num_ops: int = 100000, seed: int = 42) -> Dict[str, object]:
@@ -342,3 +351,23 @@ def ks_statistic_exp1(samples: np.ndarray) -> Tuple[float, float]:
         pval += 2.0 * ((-1) ** (k - 1)) * math.exp(-2.0 * (k * lam) ** 2)
     pval = max(0.0, min(1.0, pval))
     return d, pval
+
+
+def calibrate_lobster_csv_ffi(csv_path: str) -> Dict[str, float]:
+    lib = load_ffi_library()
+    rate_hz = ctypes.c_double(0.0)
+    br = ctypes.c_double(0.0)
+    mu_hz = ctypes.c_double(0.0)
+    vpin = ctypes.c_double(0.0)
+    b_path = csv_path.encode("ascii") if csv_path else None
+    rc = lib.qrlob_ffi_calibrate_lobster_csv(
+        b_path, ctypes.byref(rate_hz), ctypes.byref(br), ctypes.byref(mu_hz), ctypes.byref(vpin)
+    )
+    if rc != 0:
+        raise RuntimeError(f"qrlob_ffi_calibrate_lobster_csv failed with rc={rc}")
+    return {
+        "empirical_rate_hz": float(rate_hz.value),
+        "branching_ratio": float(br.value),
+        "baseline_mu_hz": float(mu_hz.value),
+        "vpin": float(vpin.value),
+    }

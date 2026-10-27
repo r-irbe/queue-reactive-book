@@ -120,6 +120,16 @@ int qrlob_ffi_run_mm_tournament(
     double* out_exploitability_gain_lb,
     double* out_impact_rmse);
 
+
+// Calibrate StateDependentHawkesCalibrator & VPIN on a LOBSTER message CSV file.
+// Returns 0 on success, negative on error (e.g. non-existent or empty CSV).
+int qrlob_ffi_calibrate_lobster_csv(
+    const char* csv_path,
+    double* out_empirical_rate_hz,
+    double* out_branching_ratio,
+    double* out_baseline_mu_hz,
+    double* out_vpin);
+
 #ifdef __cplusplus
 }
 #endif

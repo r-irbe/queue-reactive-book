@@ -245,14 +245,16 @@ int run_qr_stylized_mode(int sim_events, std::uint64_t seed,
         sim::Qty bv = 0, av = 0;
         if (!book.best_bid(bb, bv) || bv == 0) {
             bb = 99;
-            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = bb,
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = bb,
                                      .side = sim::Side::Buy, .type = sim::OrderType::Limit},
                           qrp.current_time(), tbuf, 32);
             book.best_bid(bb, bv);
         }
         if (!book.best_ask(ba, av) || av == 0) {
             ba = std::max<sim::Tick>(bb + 2, 101);
-            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = ba,
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = ba,
                                      .side = sim::Side::Sell, .type = sim::OrderType::Limit},
                           qrp.current_time(), tbuf, 32);
             book.best_ask(ba, av);
@@ -542,9 +544,12 @@ int run_calibrate_mode(const std::string& dataset_path) {
     std::cout << "[calibrate] dataset=" << path
               << " events=" << arrivals.size()
               << " trades=" << trades.size()
-              << " empirical_rate=" << std::fixed << std::setprecision(4) << hawkes_cal.empirical_rate
+              << " empirical_rate_hz=" << std::fixed << std::setprecision(2) << (hawkes_cal.empirical_rate * 1e6)
+              << " empirical_rate_per_us=" << std::scientific << std::setprecision(4) << hawkes_cal.empirical_rate
+              << std::fixed << std::setprecision(4)
               << " branching_ratio=" << hawkes_cal.branching_ratio
-              << " baseline_mu=" << hawkes_cal.baseline_mu
+              << " baseline_mu_hz=" << std::setprecision(2) << (hawkes_cal.baseline_mu * 1e6)
+              << std::setprecision(4)
               << " vpin_buckets=" << vpin_res.n_buckets
               << " vpin=" << (static_cast<double>(vpin_res.vpin_scaled) / 1e6) << "\n";
     return 0;

@@ -270,7 +270,7 @@ public:
             execute_background_qr_event(qrev, now_ns, bb, ba);
 
             // Replenish book if either side completely depleted to preserve realistic two-sided BBO
-            ensure_two_sided_liquidity(now_ns, bb, ba);
+            ensure_two_sided_liquidity(now_ns, bb, ba, qrev.reprice_ticks);
 
             // Compute updated BBO & OFI after background event
             Tick new_bb = bb, new_ba = ba;
@@ -321,7 +321,7 @@ public:
             // Periodic feature export through JoinManifestExportHook -> SyncFeatureExportSink
             if (cfg_.enable_feature_export &&
                 cfg_.feature_export_stride > 0 &&
-                (step % cfg_.feature_export_stride == 0 || step + 1 == cfg_.num_events)) {
+                (step % cfg_.feature_export_stride == 0)) {
                 ExportFrame frame{};
                 frame.seq = seq_;
                 frame.replay_hash = pipeline_.replay().book().state_digest();
@@ -344,6 +344,25 @@ public:
         // Final drain of remaining in-flight actions
         const TimeNs final_ns = qrp_.current_time() * 1000LL + 10000000LL;
         drain_in_flight_actions(final_ns);
+
+        if (cfg_.enable_feature_export) {
+            ExportFrame final_frame{};
+            final_frame.seq = ++seq_;
+            final_frame.replay_hash = pipeline_.replay().book().state_digest();
+            final_frame.snapshot = make_book_observables(pipeline_.replay().book(), final_frame.seq);
+
+            JoinManifestRow jrow{};
+            jrow.feature_seq = final_frame.seq;
+            jrow.feature_ts = final_ns;
+            jrow.label_start_seq = final_frame.seq + 2;
+            jrow.label_start_ts = final_ns + 200;
+            jrow.label_eval_seq = final_frame.seq + cfg_.markout_horizon_events;
+            jrow.label_eval_ts = final_ns + cfg_.markout_horizon_ns;
+            jrow.feature_split_id = 0;
+            jrow.label_split_id = 0;
+            jrow.diagnostic_only = false;
+            join_hook_.emit_if_usable(export_sink_, final_frame, jrow);
+        }
 
         // Finalize survival trackers and queue state observer
         for (auto& tracker : survival_trackers_) {
@@ -447,6 +466,14 @@ private:
         ++events_processed_;
         if (qrev.reprice_ticks != 0) {
             ++price_shifts_;
+            if (cfg_.qr_params.theta_reinit > 0.0) {
+                const Qty redraw_qty = qrp_.sample_stationary_queue_depth(0);
+                const Tick new_px = (qrev.reprice_ticks > 0)
+                    ? std::clamp<Tick>(bb + 1, cfg_.min_tick + 1, cfg_.max_tick - 2)
+                    : std::clamp<Tick>(ba - 1, cfg_.min_tick + 2, cfg_.max_tick - 1);
+                const Side new_side = (qrev.reprice_ticks > 0) ? Side::Buy : Side::Sell;
+                submit_background_limit(new_side, new_px, std::max<Qty>(1, redraw_qty), now_ns);
+            }
         }
 
         if (qrev.order_type == OrderType::Limit) {
@@ -498,18 +525,26 @@ private:
         }
     }
 
-    void ensure_two_sided_liquidity(TimeNs now_ns, Tick fallback_bb, Tick fallback_ba) {
+    void ensure_two_sided_liquidity(TimeNs now_ns, Tick fallback_bb, Tick fallback_ba, std::int8_t reprice_ticks = 0) {
         const FlatLadderBook& book = pipeline_.replay().book();
         Tick bb = 0, ba = 0;
         Qty bv = 0, av = 0;
         if (!book.best_bid(bb, bv) || bv == 0) {
-            const Tick replenish_bb = std::clamp<Tick>(fallback_bb, cfg_.min_tick + 1, cfg_.max_tick - 2);
-            submit_background_limit(Side::Buy, replenish_bb, cfg_.initial_depth_per_level, now_ns);
+            const Tick replenish_bb = std::clamp<Tick>(
+                fallback_bb + static_cast<Tick>(reprice_ticks), cfg_.min_tick + 1, cfg_.max_tick - 2);
+            const Qty depth = (cfg_.qr_params.theta_reinit > 0.0)
+                ? qrp_.sample_stationary_queue_depth(0)
+                : cfg_.initial_depth_per_level;
+            submit_background_limit(Side::Buy, replenish_bb, std::max<Qty>(1, depth), now_ns);
         }
         if (!book.best_ask(ba, av) || av == 0) {
             const Tick replenish_ba = std::clamp<Tick>(
-                std::max<Tick>(fallback_ba, fallback_bb + 2), cfg_.min_tick + 2, cfg_.max_tick - 1);
-            submit_background_limit(Side::Sell, replenish_ba, cfg_.initial_depth_per_level, now_ns);
+                std::max<Tick>(fallback_ba + static_cast<Tick>(reprice_ticks), fallback_bb + 2),
+                cfg_.min_tick + 2, cfg_.max_tick - 1);
+            const Qty depth = (cfg_.qr_params.theta_reinit > 0.0)
+                ? qrp_.sample_stationary_queue_depth(0)
+                : cfg_.initial_depth_per_level;
+            submit_background_limit(Side::Sell, replenish_ba, std::max<Qty>(1, depth), now_ns);
         }
     }
 
@@ -878,7 +913,7 @@ private:
         res.invariants_ok = pipeline_.replay().book().check_invariants_report().ok;
         res.export_parity_ok = export_sink_.accepted_frames() == 0 ||
             (export_sink_.seq_monotone() &&
-             export_sink_.last_hash() <= res.final_replay_hash);
+             export_sink_.verify_final_parity(res.final_replay_hash));
         res.join_manifest_clean = !join_hook_.any_leak();
         res.join_summary = join_hook_.summary();
         res.impact_score = impact_score_;

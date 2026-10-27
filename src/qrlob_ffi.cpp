@@ -196,13 +196,16 @@ int qrlob_ffi_simulate_qr_trajectory(
     qrp_cfg.num_levels = 5;
     qrp_cfg.theta_ergodic = theta_ergodic;
     qrp_cfg.theta_reprice = theta_reprice;
+    qrp_cfg.enable_inside_spread_orders = true;
+    qrp_cfg.opposite_queue_beta = 0.20;
+    qrp_cfg.imbalance_sensitivity = 0.30;
     qrp_cfg.size_model = sim::OrderSizeModel::LogBinnedEmpirical;
 
     sim::QueueReactiveProcess qrp(qrp_cfg, sim::HawkesMatrix::default_microstructure(), seed);
     if (use_3d_table) {
         sim::Empirical3DIntensityTable table = sim::Empirical3DIntensityTable::default_calibrated();
         if (table_csv_path && table_csv_path[0] != '\0') {
-            table.load_csv(std::string(table_csv_path));
+            if (!table.load_csv(std::string(table_csv_path))) return -2;
         }
         qrp.set_empirical_3d_table(table);
     }
@@ -222,14 +225,16 @@ int qrlob_ffi_simulate_qr_trajectory(
         sim::Qty bv = 0, av = 0;
         if (!book.best_bid(bb, bv) || bv == 0) {
             bb = 99;
-            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = bb,
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = bb,
                                      .side = sim::Side::Buy, .type = sim::OrderType::Limit},
                           qrp.current_time(), tbuf, 32);
             book.best_bid(bb, bv);
         }
         if (!book.best_ask(ba, av) || av == 0) {
             ba = std::max<sim::Tick>(bb + 2, 101);
-            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = ba,
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = ba,
                                      .side = sim::Side::Sell, .type = sim::OrderType::Limit},
                           qrp.current_time(), tbuf, 32);
             book.best_ask(ba, av);
@@ -429,6 +434,64 @@ int qrlob_ffi_run_mm_tournament(
     if (out_impact_rmse) {
         *out_impact_rmse = res.impact_score.rmse();
     }
+    return 0;
+}
+
+
+int qrlob_ffi_calibrate_lobster_csv(
+    const char* csv_path,
+    double* out_empirical_rate_hz,
+    double* out_branching_ratio,
+    double* out_baseline_mu_hz,
+    double* out_vpin) {
+    if (!csv_path || csv_path[0] == 0) return -1;
+    std::ifstream ifs(csv_path);
+    if (!ifs.is_open()) return -2;
+
+    std::vector<sim::experimental::ArrivalEvent> arrivals;
+    std::vector<sim::experimental::SignedTrade> trades;
+    std::string line;
+    std::uint64_t seq = 0;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string tok;
+        std::vector<std::string> cols;
+        while (std::getline(ss, tok, ',')) cols.push_back(tok);
+        if (cols.size() < 6) continue;
+        const double t_sec = std::strtod(cols[0].c_str(), nullptr);
+        const int ev_type = std::atoi(cols[1].c_str());
+        const std::int64_t size = std::strtoll(cols[3].c_str(), nullptr, 10);
+        const std::int64_t price = std::strtoll(cols[4].c_str(), nullptr, 10);
+        const int dir = std::atoi(cols[5].c_str());
+        if (size <= 0 || price <= 0) continue;
+
+        const std::int64_t t_us = static_cast<std::int64_t>(t_sec * 1e6);
+        ++seq;
+        arrivals.push_back(sim::experimental::ArrivalEvent{
+            .seq = seq,
+            .time = t_us,
+            .mark = ev_type,
+            .queue_depth = size
+        });
+        if (ev_type == 4 || ev_type == 5) {
+            trades.push_back(sim::experimental::SignedTrade{
+                .seq = seq,
+                .ts_ns = static_cast<std::uint64_t>(t_us) * 1000ULL,
+                .price = price,
+                .volume = size,
+                .side = static_cast<std::int8_t>(dir >= 0 ? 1 : -1)
+            });
+        }
+    }
+    if (arrivals.size() < 2) return -3;
+
+    const auto hawkes_cal = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
+    const auto vpin_res = sim::experimental::evaluate_vpin(trades, 1000);
+    if (out_empirical_rate_hz) *out_empirical_rate_hz = hawkes_cal.empirical_rate * 1e6;
+    if (out_branching_ratio) *out_branching_ratio = hawkes_cal.branching_ratio;
+    if (out_baseline_mu_hz) *out_baseline_mu_hz = hawkes_cal.baseline_mu * 1e6;
+    if (out_vpin) *out_vpin = static_cast<double>(vpin_res.vpin_scaled) / 1e6;
     return 0;
 }
 
