@@ -532,11 +532,6 @@ public:
             const std::int64_t da = snap.best_ask_qty - prev_ask_qty_;
             ofi_delta = db - da;
         }
-        prev_bid_qty_ = snap.best_bid_qty;
-        prev_ask_qty_ = snap.best_ask_qty;
-        have_last_ = true;
-        last_seq_ = frame.seq;
-        last_hash_ = frame.replay_hash;
 
         QrlobShmMicrostructureExt ext{};
         const std::int64_t clamped_ofi = std::clamp<std::int64_t>(ofi_delta, -32767, 32767);
@@ -563,6 +558,11 @@ public:
         pack_microstructure_ext(ev, ext);
 
         if (producer_.try_enqueue(ev)) {
+            prev_bid_qty_ = snap.best_bid_qty;
+            prev_ask_qty_ = snap.best_ask_qty;
+            have_last_ = true;
+            last_seq_ = frame.seq;
+            last_hash_ = frame.replay_hash;
             ++enqueued_frames_;
         } else {
             ++dropped_frames_;

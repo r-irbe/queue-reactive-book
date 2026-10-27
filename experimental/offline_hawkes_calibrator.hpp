@@ -745,7 +745,7 @@ inline bool load_lobster_paired_csv(
     }
     std::ifstream ob_ifs;
     bool has_ob = false;
-    if (ob_path != message_csv_path) {
+    if (ob_path != resolved_msg_path) {
         ob_ifs.open(ob_path);
         has_ob = ob_ifs.is_open();
     }

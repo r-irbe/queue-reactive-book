@@ -287,6 +287,28 @@ TEST_CASE("experimental Ozaki + Queue-Reactive Hawkes MLE: analytical score vs F
     REQUIRE(ffi_rep.n_total == 2000);
     REQUIRE(ffi_rep.oos_llr_per_event == Catch::Approx(mle.oos_llr_per_event));
     REQUIRE(out_n_res == 600);
+
+    // 4. Verify calibrate_mle numerical stability on pathological zero-dt + extreme queue-depth stream
+    std::vector<ArrivalEvent> patho;
+    patho.reserve(120);
+    for (std::uint64_t i = 0; i < 120; ++i) {
+        patho.push_back(ArrivalEvent{
+            .seq = i + 1,
+            .time = 5000000,
+            .mark = 1,
+            .queue_depth = (i % 2 == 0) ? 0 : 1000000000LL,
+            .opp_queue_depth = 100,
+            .spread_ticks = 1
+        });
+    }
+    const auto patho_mle = StateDependentHawkesCalibrator::calibrate_mle(patho, 0.70);
+    REQUIRE(std::isfinite(patho_mle.mu_hz));
+    REQUIRE(std::isfinite(patho_mle.alpha_hz));
+    REQUIRE(std::isfinite(patho_mle.beta_hz));
+    REQUIRE(std::isfinite(patho_mle.gamma_qr));
+    REQUIRE(std::isfinite(patho_mle.log_likelihood_train));
+    REQUIRE(std::isfinite(patho_mle.oos_llr_per_event));
+    REQUIRE(patho_mle.branching_ratio <= 0.98);
 }
 
 TEST_CASE("experimental SPSC unified leangrph ABI (0x434E49524E41454C) and 16B QrlobShmMicrostructureExt",
@@ -352,6 +374,54 @@ TEST_CASE("experimental SPSC unified leangrph ABI (0x434E49524E41454C) and 16B Q
         REQUIRE(read_ext.spread_ticks >= 1U);
     }
     REQUIRE(count == 256);
+
+    // 3. Verify ShmSpscFeatureExportSink drop recovery & OFI state preservation on full 1024-slot ring
+    LeangrphShmRingChannel local_ch{};
+    ShmSpscFeatureExportSink sink(reinterpret_cast<ShmRingChannel*>(&local_ch), kLeangrphRingCapacity);
+    ShmSpscConsumer local_cons(reinterpret_cast<ShmRingChannel*>(&local_ch), kLeangrphRingCapacity);
+
+    for (std::size_t s = 1; s <= kLeangrphRingCapacity; ++s) {
+        ExportFrame f{};
+        f.seq = s;
+        f.replay_hash = s * 100ULL;
+        f.snapshot.best_bid_qty = 100;
+        f.snapshot.best_ask_qty = 100;
+        f.snapshot.spread = 1;
+        sink.on_frame(f);
+    }
+    REQUIRE(sink.enqueued_frames() == kLeangrphRingCapacity);
+    REQUIRE(sink.dropped_frames() == 0);
+    REQUIRE(sink.last_hash() == kLeangrphRingCapacity * 100ULL);
+
+    // Ring is full: frame 1025 must be dropped without advancing last_seq_ or prev_bid_qty_
+    ExportFrame f_drop{};
+    f_drop.seq = kLeangrphRingCapacity + 1;
+    f_drop.replay_hash = 999999ULL;
+    f_drop.snapshot.best_bid_qty = 150;
+    f_drop.snapshot.best_ask_qty = 90;
+    f_drop.snapshot.spread = 2;
+    sink.on_frame(f_drop);
+    REQUIRE(sink.dropped_frames() == 1);
+    REQUIRE(sink.seq_violations() == 0);
+    REQUIRE(sink.last_hash() == kLeangrphRingCapacity * 100ULL);
+
+    // Drain 1 slot and retry frame 1025: must succeed with zero seq_violations and exact OFI delta (+50 - (-10) = +60)
+    ShmIpcEvent drained{};
+    REQUIRE(local_cons.try_dequeue(drained));
+    sink.on_frame(f_drop);
+    REQUIRE(sink.enqueued_frames() == kLeangrphRingCapacity + 1);
+    REQUIRE(sink.seq_violations() == 0);
+    REQUIRE(sink.last_hash() == 999999ULL);
+
+    for (std::size_t s = 2; s <= kLeangrphRingCapacity; ++s) {
+        REQUIRE(local_cons.try_dequeue(drained));
+    }
+    REQUIRE(local_cons.try_dequeue(drained));
+    REQUIRE(drained.seq == kLeangrphRingCapacity + 1);
+    QrlobShmMicrostructureExt retry_ext{};
+    REQUIRE(unpack_microstructure_ext(drained, retry_ext));
+    REQUIRE(retry_ext.ofi_q16 == 60 * 65536);
+
     reader_ep.close();
     ::unlink(shm_path);
 }
