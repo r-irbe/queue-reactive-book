@@ -493,65 +493,177 @@ int run_parity_mode(int sim_events, std::uint64_t seed) {
     return rep.parity_ok ? 0 : 1;
 }
 
+struct TickerCalibrationEntry {
+    std::string ticker;
+    std::string message_path;
+    std::string orderbook_path;
+    std::size_t n_events = 0;
+    std::size_t n_trades = 0;
+    sim::experimental::CalibratedHawkesSummary moment{};
+    sim::experimental::HawkesMleResult mle{};
+    sim::experimental::VpinResult vpin{};
+};
+
+void write_calibration_json(const std::string& json_path,
+                            const std::vector<TickerCalibrationEntry>& entries) {
+    std::ofstream ofs(json_path);
+    if (!ofs.is_open()) return;
+    ofs << std::fixed << std::setprecision(6);
+    ofs << "{\n";
+    ofs << "  \"schema_version\": \"2.0\",\n";
+    ofs << "  \"model\": \"Ozaki_Exact_O_N_Queue_Reactive_Hawkes_MLE\",\n";
+    ofs << "  \"solver\": \"Hybrid_EM_Projected_Damped_Newton_Armijo\",\n";
+    ofs << "  \"train_fraction\": 0.70,\n";
+    ofs << "  \"tickers\": {\n";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        const double vpin_val = static_cast<double>(e.vpin.vpin_scaled) / 1e6;
+        ofs << "    \"" << e.ticker << "\": {\n";
+        ofs << "      \"message_file\": \"" << e.message_path << "\",\n";
+        ofs << "      \"orderbook_file\": \"" << e.orderbook_path << "\",\n";
+        ofs << "      \"n_events\": " << e.n_events << ",\n";
+        ofs << "      \"n_train\": " << e.mle.n_train << ",\n";
+        ofs << "      \"n_oos\": " << e.mle.n_oos << ",\n";
+        ofs << "      \"n_trades\": " << e.n_trades << ",\n";
+        ofs << "      \"mean_resting_l1_depth\": " << e.mle.mean_queue_depth << ",\n";
+        ofs << "      \"mean_spread_ticks\": " << e.mle.mean_spread_ticks << ",\n";
+        ofs << "      \"empirical_rate_hz\": " << (e.moment.empirical_rate * 1e6) << ",\n";
+        ofs << "      \"moment_branching_ratio\": " << e.moment.branching_ratio << ",\n";
+        ofs << "      \"mle_mu_hz\": " << e.mle.mu_hz << ",\n";
+        ofs << "      \"mle_alpha_hz\": " << e.mle.alpha_hz << ",\n";
+        ofs << "      \"mle_beta_hz\": " << e.mle.beta_hz << ",\n";
+        ofs << "      \"mle_branching_ratio\": " << e.mle.branching_ratio << ",\n";
+        ofs << "      \"mle_gamma_qr\": " << e.mle.gamma_qr << ",\n";
+        ofs << "      \"se_mu\": " << e.mle.se_mu << ",\n";
+        ofs << "      \"se_alpha\": " << e.mle.se_alpha << ",\n";
+        ofs << "      \"se_beta\": " << e.mle.se_beta << ",\n";
+        ofs << "      \"se_gamma\": " << e.mle.se_gamma << ",\n";
+        ofs << "      \"log_likelihood_init\": " << e.mle.log_likelihood_init << ",\n";
+        ofs << "      \"log_likelihood_train\": " << e.mle.log_likelihood_train << ",\n";
+        ofs << "      \"log_likelihood_poisson_train\": " << e.mle.log_likelihood_poisson_train << ",\n";
+        ofs << "      \"aic_hawkes\": " << e.mle.aic_hawkes << ",\n";
+        ofs << "      \"bic_hawkes\": " << e.mle.bic_hawkes << ",\n";
+        ofs << "      \"aic_poisson\": " << e.mle.aic_poisson << ",\n";
+        ofs << "      \"log_likelihood_oos\": " << e.mle.log_likelihood_oos << ",\n";
+        ofs << "      \"log_likelihood_poisson_oos\": " << e.mle.log_likelihood_poisson_oos << ",\n";
+        ofs << "      \"oos_llr_per_event\": " << e.mle.oos_llr_per_event << ",\n";
+        ofs << "      \"ogata_residual_mean\": " << e.mle.ogata_residual_mean << ",\n";
+        ofs << "      \"ogata_residual_std\": " << e.mle.ogata_residual_std << ",\n";
+        ofs << "      \"ks_statistic\": " << e.mle.ks_statistic << ",\n";
+        ofs << "      \"ks_pvalue\": " << e.mle.ks_pvalue << ",\n";
+        ofs << "      \"vpin\": " << vpin_val << ",\n";
+        ofs << "      \"vpin_buckets\": " << e.vpin.n_buckets << "\n";
+        ofs << "    }" << (i + 1 < entries.size() ? "," : "") << "\n";
+    }
+    ofs << "  }\n";
+    ofs << "}\n";
+}
+
 int run_calibrate_mode(const std::string& dataset_path) {
-    const std::string path = dataset_path.empty()
-        ? "data/lobster_AAPL_2012-06-21_message_5.csv"
-        : dataset_path;
-    std::ifstream ifs(path);
-    if (!ifs.is_open()) {
-        std::cerr << "Error: cannot open dataset '" << path << "'\n";
-        return 1;
-    }
+    struct TickerSpec {
+        const char* ticker;
+        const char* msg_path;
+        const char* ob_path;
+    };
+    const TickerSpec default_specs[] = {
+        {"AAPL", "data/lobster_AAPL_2012-06-21_message_5.csv", "data/lobster_AAPL_2012-06-21_orderbook_5.csv"},
+        {"AMZN", "data/lobster_AMZN_2012-06-21_message_5.csv", "data/lobster_AMZN_2012-06-21_orderbook_5.csv"},
+        {"GOOG", "data/lobster_GOOG_2012-06-21_message_5.csv", "data/lobster_GOOG_2012-06-21_orderbook_5.csv"},
+        {"INTC", "data/lobster_INTC_2012-06-21_message_5.csv", "data/lobster_INTC_2012-06-21_orderbook_5.csv"},
+        {"MSFT", "data/lobster_MSFT_2012-06-21_message_5.csv", "data/lobster_MSFT_2012-06-21_orderbook_5.csv"},
+    };
 
-    std::vector<sim::experimental::ArrivalEvent> arrivals;
-    std::vector<sim::experimental::SignedTrade> trades;
-    std::string line;
-    std::uint64_t seq = 0;
-    while (std::getline(ifs, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string tok;
-        std::vector<std::string> cols;
-        while (std::getline(ss, tok, ',')) cols.push_back(tok);
-        if (cols.size() < 6) continue;
-        const double t_sec = std::strtod(cols[0].c_str(), nullptr);
-        const int ev_type = std::atoi(cols[1].c_str());
-        const std::int64_t size = std::strtoll(cols[3].c_str(), nullptr, 10);
-        const std::int64_t price = std::strtoll(cols[4].c_str(), nullptr, 10);
-        const int dir = std::atoi(cols[5].c_str());
-
-        const std::int64_t t_us = static_cast<std::int64_t>(t_sec * 1e6);
-        ++seq;
-        arrivals.push_back(sim::experimental::ArrivalEvent{
-            .seq = seq,
-            .time = t_us,
-            .mark = ev_type,
-            .queue_depth = size
-        });
-        if (ev_type == 4 || ev_type == 5) {
-            trades.push_back(sim::experimental::SignedTrade{
-                .seq = seq,
-                .ts_ns = static_cast<std::uint64_t>(t_us) * 1000ULL,
-                .price = price,
-                .volume = size,
-                .side = static_cast<std::int8_t>(dir >= 0 ? 1 : -1)
-            });
+    std::vector<TickerCalibrationEntry> entries;
+    if (!dataset_path.empty()) {
+        std::vector<sim::experimental::ArrivalEvent> arrivals;
+        std::vector<sim::experimental::SignedTrade> trades;
+        if (!sim::experimental::load_lobster_paired_csv(dataset_path, arrivals, trades)) {
+            std::cerr << "Error: cannot open dataset '" << dataset_path << "'\n";
+            return 1;
         }
+        TickerCalibrationEntry e{};
+        e.ticker = "CUSTOM";
+        e.message_path = dataset_path;
+        e.orderbook_path = dataset_path;
+        const std::size_t pos = e.orderbook_path.find("_message_5.csv");
+        if (pos != std::string::npos) {
+            e.orderbook_path.replace(pos, 14, "_orderbook_5.csv");
+        }
+        e.n_events = arrivals.size();
+        e.n_trades = trades.size();
+        e.moment = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
+        e.mle = sim::experimental::StateDependentHawkesCalibrator::calibrate_mle(
+            std::span<const sim::experimental::ArrivalEvent>(arrivals.data(), arrivals.size()), 0.70);
+        e.vpin = sim::experimental::evaluate_vpin(trades, 1000);
+        entries.push_back(e);
+    } else {
+        for (const auto& sp : default_specs) {
+            std::vector<sim::experimental::ArrivalEvent> arrivals;
+            std::vector<sim::experimental::SignedTrade> trades;
+            if (!sim::experimental::load_lobster_paired_csv(sp.msg_path, arrivals, trades)) {
+                std::cerr << "Error: cannot open dataset '" << sp.msg_path << "'\n";
+                return 1;
+            }
+            TickerCalibrationEntry e{};
+            e.ticker = sp.ticker;
+            e.message_path = sp.msg_path;
+            e.orderbook_path = sp.ob_path;
+            e.n_events = arrivals.size();
+            e.n_trades = trades.size();
+            e.moment = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
+            e.mle = sim::experimental::StateDependentHawkesCalibrator::calibrate_mle(
+                std::span<const sim::experimental::ArrivalEvent>(arrivals.data(), arrivals.size()), 0.70);
+            e.vpin = sim::experimental::evaluate_vpin(trades, 1000);
+            entries.push_back(e);
+        }
+        write_calibration_json("data/lobster_calibration_summary.json", entries);
     }
 
-    const auto hawkes_cal = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
-    const auto vpin_res = sim::experimental::evaluate_vpin(trades, 1000);
-    std::cout << "[calibrate] dataset=" << path
-              << " events=" << arrivals.size()
-              << " trades=" << trades.size()
-              << " empirical_rate_hz=" << std::fixed << std::setprecision(2) << (hawkes_cal.empirical_rate * 1e6)
-              << " empirical_rate_per_us=" << std::scientific << std::setprecision(4) << hawkes_cal.empirical_rate
+    std::cout << "==========================================================================================================\n"
+              << "  LOBSTER 5-Level Paired Co-Read & Exact O(N) Ozaki + Queue-Reactive Hawkes MLE Summary (70/30 OOS Split)\n"
+              << "==========================================================================================================\n"
+              << std::left << std::setw(8) << "Ticker"
+              << std::right << std::setw(8) << "Events"
+              << std::setw(10) << "MeanQ1"
+              << std::setw(10) << "mu(Hz)"
+              << std::setw(11) << "alpha(Hz)"
+              << std::setw(11) << "beta(Hz)"
+              << std::setw(9) << "n_hat"
+              << std::setw(9) << "gamma_qr"
+              << std::setw(11) << "OOS_LLR"
+              << std::setw(9) << "KS_D"
+              << std::setw(9) << "VPIN" << "\n"
+              << "----------------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& e : entries) {
+        const double vpin_val = static_cast<double>(e.vpin.vpin_scaled) / 1e6;
+        std::cout << std::left << std::setw(8) << e.ticker
+                  << std::right << std::setw(8) << e.n_events
+                  << std::fixed << std::setprecision(1) << std::setw(10) << e.mle.mean_queue_depth
+                  << std::setprecision(2) << std::setw(10) << e.mle.mu_hz
+                  << std::setw(11) << e.mle.alpha_hz
+                  << std::setw(11) << e.mle.beta_hz
+                  << std::setprecision(4) << std::setw(9) << e.mle.branching_ratio
+                  << std::setw(9) << e.mle.gamma_qr
+                  << std::setw(11) << e.mle.oos_llr_per_event
+                  << std::setw(9) << e.mle.ks_statistic
+                  << std::setw(9) << vpin_val << "\n";
+    }
+    std::cout << "==========================================================================================================\n";
+
+    const auto& first = entries.front();
+    std::cout << "[calibrate] dataset=" << first.message_path
+              << " events=" << first.n_events
+              << " trades=" << first.n_trades
+              << " empirical_rate_hz=" << std::fixed << std::setprecision(2) << (first.moment.empirical_rate * 1e6)
+              << " empirical_rate_per_us=" << std::scientific << std::setprecision(4) << first.moment.empirical_rate
               << std::fixed << std::setprecision(4)
-              << " branching_ratio=" << hawkes_cal.branching_ratio
-              << " baseline_mu_hz=" << std::setprecision(2) << (hawkes_cal.baseline_mu * 1e6)
+              << " branching_ratio=" << first.mle.branching_ratio
+              << " baseline_mu_hz=" << std::setprecision(2) << first.mle.mu_hz
               << std::setprecision(4)
-              << " vpin_buckets=" << vpin_res.n_buckets
-              << " vpin=" << (static_cast<double>(vpin_res.vpin_scaled) / 1e6) << "\n";
+              << " oos_llr_per_event=" << first.mle.oos_llr_per_event
+              << " vpin_buckets=" << first.vpin.n_buckets
+              << " vpin=" << (static_cast<double>(first.vpin.vpin_scaled) / 1e6) << "\n";
     return 0;
 }
 

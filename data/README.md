@@ -76,7 +76,7 @@ Headerless 20-column CSV aligned row-for-row with the message file (`4 * K` colu
 | `lobster_INTC_2012-06-21_orderbook_5.csv` | 227541 | 2000 | `86987d071c8834fec9c87f0cb0b914bee9bbfa97e3234a79e55e8bd7a5aa385e` |
 | `lobster_MSFT_2012-06-21_message_5.csv` | 80569 | 2000 | `aa87c7723f0df0cea832e9e04a0921731d76726e11e970dedccd9532cb0d5aa1` |
 | `lobster_MSFT_2012-06-21_orderbook_5.csv` | 233373 | 2000 | `645fb40170ae480fb51ea570ba63b01bee251f6e0df30ea58f7f49fe0fe2584e` |
-| `lobster_calibration_summary.json` | 2792 | 135 | `13bf8345d8f5f551e26b442f503e0a0c3c81c9425980de75de9a4d2d31cc62d7` |
+| `lobster_calibration_summary.json` | 6418 | 188 | `710a9d00fe9fdd7dd4f38f2598a0df6ecee4b555ca744af7fcdc5f1ad224d8b2` |
 | `qr_simulator_intensities.json` | 38780 | 1514 | `4f1b305ac9ca457d4405f8a36f6f5b7be7ad8bb424829ab7684e5bcc39e066ca` |
 
 ### Extended Raw Archive (`/home/radu/code/tacit-mui/docs/investigation-garden/inbox/queue_reactive_literature/datasets/`)

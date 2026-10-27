@@ -75,7 +75,7 @@ target_include_directories(sim_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/test_shim
 )
 target_compile_options(sim_test PRIVATE ${QRLOB_ARCH_FLAGS})
-target_link_libraries(sim_test PRIVATE qrlob_core)
+target_link_libraries(sim_test PRIVATE qrlob_core qrlob_ffi)
 add_test(NAME sim_test COMMAND sim_test)
 
 add_custom_target(qrlob_tests DEPENDS sim_test)

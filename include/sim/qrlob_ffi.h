@@ -13,7 +13,8 @@
 //   - QueueReactiveProcess (HLR Models I/IIb/III, Hawkes, 3D Noble-Rosenbaum,
 //     Ogata exact thinning residuals)
 //   - SimulationSession multi-agent market-making & execution tournament
-//   - OfflineHawkesCalibrator & VpinToxicityReplay
+//   - OfflineHawkesCalibrator (moment & exact Ozaki + Queue-Reactive MLE) & VpinToxicityReplay
+//   - Unified SPSC Shared Memory Ring ABI (0x434E49524E41454C) + 16B QrlobShmMicrostructureExt
 // ============================================================================
 
 #include <stddef.h>
@@ -76,6 +77,41 @@ typedef struct QrlobAgentSummary {
     int64_t queue_risk_x2;
 } QrlobAgentSummary;
 
+typedef struct QrlobMleCalibrationReport {
+    uint64_t n_total;
+    uint64_t n_train;
+    uint64_t n_oos;
+    uint64_t n_trades;
+    double mean_queue_depth;
+    double mean_spread_ticks;
+    double empirical_rate_hz;
+    double mu_hz;
+    double alpha_hz;
+    double beta_hz;
+    double branching_ratio;
+    double gamma_qr;
+    double se_mu;
+    double se_alpha;
+    double se_beta;
+    double se_gamma;
+    double log_likelihood_init;
+    double log_likelihood_train;
+    double log_likelihood_poisson_train;
+    double aic_hawkes;
+    double bic_hawkes;
+    double aic_poisson;
+    double log_likelihood_oos;
+    double log_likelihood_poisson_oos;
+    double oos_llr_per_event;
+    double ogata_residual_mean;
+    double ogata_residual_std;
+    double ks_statistic;
+    double ks_pvalue;
+    double vpin;
+    uint64_t vpin_buckets;
+    uint64_t calibration_hash;
+} QrlobMleCalibrationReport;
+
 // Run C++ microbenchmarks + FlatLadderParityHarness in-process and populate summary
 int qrlob_ffi_run_microbenchmarks(
     uint64_t num_ops,
@@ -120,8 +156,8 @@ int qrlob_ffi_run_mm_tournament(
     double* out_exploitability_gain_lb,
     double* out_impact_rmse);
 
-
-// Calibrate StateDependentHawkesCalibrator & VPIN on a LOBSTER message CSV file.
+// Calibrate StateDependentHawkesCalibrator & VPIN on a LOBSTER message CSV file
+// (co-reading companion _orderbook_5.csv when present).
 // Returns 0 on success, negative on error (e.g. non-existent or empty CSV).
 int qrlob_ffi_calibrate_lobster_csv(
     const char* csv_path,
@@ -129,6 +165,27 @@ int qrlob_ffi_calibrate_lobster_csv(
     double* out_branching_ratio,
     double* out_baseline_mu_hz,
     double* out_vpin);
+
+// Calibrate exact O(N) Ozaki + Queue-Reactive MLE on a LOBSTER paired CSV file.
+// Optionally writes up to `max_residuals` out-of-sample Ogata time-rescaled residuals.
+int qrlob_ffi_calibrate_lobster_mle(
+    const char* csv_path,
+    double train_fraction,
+    QrlobMleCalibrationReport* out_report,
+    double* out_oos_residuals,
+    size_t max_residuals,
+    size_t* out_num_residuals);
+
+// Generate a synthetic Queue-Reactive + Hawkes L3 microstructure stream directly into
+// a POSIX shared-memory SPSC ring buffer using the unified 0x434E49524E41454C ABI
+// and 16-byte QrlobShmMicrostructureExt telemetry payload.
+int qrlob_ffi_generate_shm_microstructure_stream(
+    const char* shm_path,
+    uint64_t num_events,
+    uint64_t seed,
+    int use_leangrph_abi,
+    uint64_t* out_events_published,
+    uint64_t* out_final_hash);
 
 #ifdef __cplusplus
 }

@@ -116,6 +116,42 @@ class QrlobAgentSummary(ctypes.Structure):
         ("queue_risk_x2", ctypes.c_int64),
     ]
 
+class QrlobMleCalibrationReport(ctypes.Structure):
+    _fields_ = [
+        ("n_total", ctypes.c_uint64),
+        ("n_train", ctypes.c_uint64),
+        ("n_oos", ctypes.c_uint64),
+        ("n_trades", ctypes.c_uint64),
+        ("mean_queue_depth", ctypes.c_double),
+        ("mean_spread_ticks", ctypes.c_double),
+        ("empirical_rate_hz", ctypes.c_double),
+        ("mu_hz", ctypes.c_double),
+        ("alpha_hz", ctypes.c_double),
+        ("beta_hz", ctypes.c_double),
+        ("branching_ratio", ctypes.c_double),
+        ("gamma_qr", ctypes.c_double),
+        ("se_mu", ctypes.c_double),
+        ("se_alpha", ctypes.c_double),
+        ("se_beta", ctypes.c_double),
+        ("se_gamma", ctypes.c_double),
+        ("log_likelihood_init", ctypes.c_double),
+        ("log_likelihood_train", ctypes.c_double),
+        ("log_likelihood_poisson_train", ctypes.c_double),
+        ("aic_hawkes", ctypes.c_double),
+        ("bic_hawkes", ctypes.c_double),
+        ("aic_poisson", ctypes.c_double),
+        ("log_likelihood_oos", ctypes.c_double),
+        ("log_likelihood_poisson_oos", ctypes.c_double),
+        ("oos_llr_per_event", ctypes.c_double),
+        ("ogata_residual_mean", ctypes.c_double),
+        ("ogata_residual_std", ctypes.c_double),
+        ("ks_statistic", ctypes.c_double),
+        ("ks_pvalue", ctypes.c_double),
+        ("vpin", ctypes.c_double),
+        ("vpin_buckets", ctypes.c_uint64),
+        ("calibration_hash", ctypes.c_uint64),
+    ]
+
 def load_ffi_library() -> ctypes.CDLL:
     so_path = BUILD_DIR / "libqrlob_ffi.so"
     if not so_path.exists():
@@ -160,6 +196,13 @@ def load_ffi_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_double),
     ]
     lib.qrlob_ffi_calibrate_lobster_csv.restype = ctypes.c_int
+
+    lib.qrlob_ffi_calibrate_lobster_mle.argtypes = [
+        ctypes.c_char_p, ctypes.c_double, ctypes.POINTER(QrlobMleCalibrationReport),
+        ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)
+    ]
+    lib.qrlob_ffi_calibrate_lobster_mle.restype = ctypes.c_int
+
     return lib
 
 def run_ffi_microbenchmarks(num_ops: int = 100000, seed: int = 42) -> Dict[str, object]:
@@ -371,3 +414,54 @@ def calibrate_lobster_csv_ffi(csv_path: str) -> Dict[str, float]:
         "baseline_mu_hz": float(mu_hz.value),
         "vpin": float(vpin.value),
     }
+
+
+def calibrate_lobster_mle_ffi(csv_path: str, train_fraction: float = 0.70):
+    lib = load_ffi_library()
+    rep = QrlobMleCalibrationReport()
+    max_res = 4096
+    res_buf = (ctypes.c_double * max_res)()
+    out_n = ctypes.c_size_t(0)
+    b_path = csv_path.encode("ascii") if csv_path else None
+    rc = lib.qrlob_ffi_calibrate_lobster_mle(
+        b_path, train_fraction, ctypes.byref(rep), res_buf, max_res, ctypes.byref(out_n)
+    )
+    if rc != 0:
+        raise RuntimeError(f"qrlob_ffi_calibrate_lobster_mle failed with rc={rc}")
+    n_r = out_n.value
+    residuals = np.array([res_buf[i] for i in range(n_r)], dtype=np.float64)
+    summary = {
+        "n_total": int(rep.n_total),
+        "n_train": int(rep.n_train),
+        "n_oos": int(rep.n_oos),
+        "n_trades": int(rep.n_trades),
+        "mean_queue_depth": float(rep.mean_queue_depth),
+        "mean_spread_ticks": float(rep.mean_spread_ticks),
+        "empirical_rate_hz": float(rep.empirical_rate_hz),
+        "mu_hz": float(rep.mu_hz),
+        "alpha_hz": float(rep.alpha_hz),
+        "beta_hz": float(rep.beta_hz),
+        "branching_ratio": float(rep.branching_ratio),
+        "gamma_qr": float(rep.gamma_qr),
+        "se_mu": float(rep.se_mu),
+        "se_alpha": float(rep.se_alpha),
+        "se_beta": float(rep.se_beta),
+        "se_gamma": float(rep.se_gamma),
+        "log_likelihood_init": float(rep.log_likelihood_init),
+        "log_likelihood_train": float(rep.log_likelihood_train),
+        "log_likelihood_poisson_train": float(rep.log_likelihood_poisson_train),
+        "aic_hawkes": float(rep.aic_hawkes),
+        "bic_hawkes": float(rep.bic_hawkes),
+        "aic_poisson": float(rep.aic_poisson),
+        "log_likelihood_oos": float(rep.log_likelihood_oos),
+        "log_likelihood_poisson_oos": float(rep.log_likelihood_poisson_oos),
+        "oos_llr_per_event": float(rep.oos_llr_per_event),
+        "ogata_residual_mean": float(rep.ogata_residual_mean),
+        "ogata_residual_std": float(rep.ogata_residual_std),
+        "ks_statistic": float(rep.ks_statistic),
+        "ks_pvalue": float(rep.ks_pvalue),
+        "vpin": float(rep.vpin),
+        "vpin_buckets": int(rep.vpin_buckets),
+        "calibration_hash": f"0x{rep.calibration_hash:016x}",
+    }
+    return summary, residuals

@@ -445,44 +445,11 @@ int qrlob_ffi_calibrate_lobster_csv(
     double* out_baseline_mu_hz,
     double* out_vpin) {
     if (!csv_path || csv_path[0] == 0) return -1;
-    std::ifstream ifs(csv_path);
-    if (!ifs.is_open()) return -2;
 
     std::vector<sim::experimental::ArrivalEvent> arrivals;
     std::vector<sim::experimental::SignedTrade> trades;
-    std::string line;
-    std::uint64_t seq = 0;
-    while (std::getline(ifs, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string tok;
-        std::vector<std::string> cols;
-        while (std::getline(ss, tok, ',')) cols.push_back(tok);
-        if (cols.size() < 6) continue;
-        const double t_sec = std::strtod(cols[0].c_str(), nullptr);
-        const int ev_type = std::atoi(cols[1].c_str());
-        const std::int64_t size = std::strtoll(cols[3].c_str(), nullptr, 10);
-        const std::int64_t price = std::strtoll(cols[4].c_str(), nullptr, 10);
-        const int dir = std::atoi(cols[5].c_str());
-        if (size <= 0 || price <= 0) continue;
-
-        const std::int64_t t_us = static_cast<std::int64_t>(t_sec * 1e6);
-        ++seq;
-        arrivals.push_back(sim::experimental::ArrivalEvent{
-            .seq = seq,
-            .time = t_us,
-            .mark = ev_type,
-            .queue_depth = size
-        });
-        if (ev_type == 4 || ev_type == 5) {
-            trades.push_back(sim::experimental::SignedTrade{
-                .seq = seq,
-                .ts_ns = static_cast<std::uint64_t>(t_us) * 1000ULL,
-                .price = price,
-                .volume = size,
-                .side = static_cast<std::int8_t>(dir >= 0 ? 1 : -1)
-            });
-        }
+    if (!sim::experimental::load_lobster_paired_csv(std::string(csv_path), arrivals, trades)) {
+        return -2;
     }
     if (arrivals.size() < 2) return -3;
 
@@ -492,6 +459,199 @@ int qrlob_ffi_calibrate_lobster_csv(
     if (out_branching_ratio) *out_branching_ratio = hawkes_cal.branching_ratio;
     if (out_baseline_mu_hz) *out_baseline_mu_hz = hawkes_cal.baseline_mu * 1e6;
     if (out_vpin) *out_vpin = static_cast<double>(vpin_res.vpin_scaled) / 1e6;
+    return 0;
+}
+
+int qrlob_ffi_calibrate_lobster_mle(
+    const char* csv_path,
+    double train_fraction,
+    QrlobMleCalibrationReport* out_report,
+    double* out_oos_residuals,
+    size_t max_residuals,
+    size_t* out_num_residuals) {
+    if (!csv_path || csv_path[0] == 0 || !out_report) return -1;
+    std::memset(out_report, 0, sizeof(QrlobMleCalibrationReport));
+    if (out_num_residuals) *out_num_residuals = 0;
+
+    std::vector<sim::experimental::ArrivalEvent> arrivals;
+    std::vector<sim::experimental::SignedTrade> trades;
+    if (!sim::experimental::load_lobster_paired_csv(std::string(csv_path), arrivals, trades)) {
+        return -2;
+    }
+    if (arrivals.size() < 4) return -3;
+
+    const auto mom = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
+    const auto mle = sim::experimental::StateDependentHawkesCalibrator::calibrate_mle(
+        std::span<const sim::experimental::ArrivalEvent>(arrivals.data(), arrivals.size()),
+        train_fraction);
+    const auto vpin_res = sim::experimental::evaluate_vpin(trades, 1000);
+
+    out_report->n_total = mle.n_total;
+    out_report->n_train = mle.n_train;
+    out_report->n_oos = mle.n_oos;
+    out_report->n_trades = trades.size();
+    out_report->mean_queue_depth = mle.mean_queue_depth;
+    out_report->mean_spread_ticks = mle.mean_spread_ticks;
+    out_report->empirical_rate_hz = mom.empirical_rate * 1e6;
+    out_report->mu_hz = mle.mu_hz;
+    out_report->alpha_hz = mle.alpha_hz;
+    out_report->beta_hz = mle.beta_hz;
+    out_report->branching_ratio = mle.branching_ratio;
+    out_report->gamma_qr = mle.gamma_qr;
+    out_report->se_mu = mle.se_mu;
+    out_report->se_alpha = mle.se_alpha;
+    out_report->se_beta = mle.se_beta;
+    out_report->se_gamma = mle.se_gamma;
+    out_report->log_likelihood_init = mle.log_likelihood_init;
+    out_report->log_likelihood_train = mle.log_likelihood_train;
+    out_report->log_likelihood_poisson_train = mle.log_likelihood_poisson_train;
+    out_report->aic_hawkes = mle.aic_hawkes;
+    out_report->bic_hawkes = mle.bic_hawkes;
+    out_report->aic_poisson = mle.aic_poisson;
+    out_report->log_likelihood_oos = mle.log_likelihood_oos;
+    out_report->log_likelihood_poisson_oos = mle.log_likelihood_poisson_oos;
+    out_report->oos_llr_per_event = mle.oos_llr_per_event;
+    out_report->ogata_residual_mean = mle.ogata_residual_mean;
+    out_report->ogata_residual_std = mle.ogata_residual_std;
+    out_report->ks_statistic = mle.ks_statistic;
+    out_report->ks_pvalue = mle.ks_pvalue;
+    out_report->vpin = static_cast<double>(vpin_res.vpin_scaled) / 1e6;
+    out_report->vpin_buckets = vpin_res.n_buckets;
+    out_report->calibration_hash = mle.calibration_hash;
+
+    if (out_oos_residuals && max_residuals > 0) {
+        const std::size_t n_copy = std::min<std::size_t>(
+            max_residuals, mle.oos_ogata_residuals.size());
+        for (std::size_t i = 0; i < n_copy; ++i) {
+            out_oos_residuals[i] = mle.oos_ogata_residuals[i];
+        }
+        if (out_num_residuals) *out_num_residuals = n_copy;
+    } else if (out_num_residuals) {
+        *out_num_residuals = mle.oos_ogata_residuals.size();
+    }
+    return 0;
+}
+
+int qrlob_ffi_generate_shm_microstructure_stream(
+    const char* shm_path,
+    uint64_t num_events,
+    uint64_t seed,
+    int use_leangrph_abi,
+    uint64_t* out_events_published,
+    uint64_t* out_final_hash) {
+    const char* path = (shm_path && shm_path[0] != '\0')
+        ? shm_path
+        : sim::experimental::kDefaultShmPath;
+
+    sim::experimental::ShmSpscEndpoint ep;
+    if (!ep.open(path, true, use_leangrph_abi != 0)) {
+        return -1;
+    }
+
+    const std::size_t cap = ep.ring_capacity();
+    sim::experimental::ShmSpscFeatureExportSink sink(ep.request_channel(), cap);
+
+    sim::QRParams qrp_cfg{};
+    qrp_cfg.num_levels = 5;
+    qrp_cfg.theta_ergodic = 0.03;
+    qrp_cfg.theta_reprice = 0.65;
+    qrp_cfg.enable_inside_spread_orders = true;
+    qrp_cfg.opposite_queue_beta = 0.20;
+    qrp_cfg.imbalance_sensitivity = 0.30;
+    qrp_cfg.size_model = sim::OrderSizeModel::LogBinnedEmpirical;
+
+    sim::QueueReactiveProcess qrp(qrp_cfg, sim::HawkesMatrix::default_microstructure(), seed);
+    sim::FlatLadderBook book(50, 150, static_cast<std::size_t>(num_events * 2 + 512));
+    for (int lvl = 0; lvl < 5; ++lvl) {
+        book.add(sim::Order{.qty = 100, .orig_qty = 100, .price = 99 - lvl,
+                            .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 10 + lvl);
+        book.add(sim::Order{.qty = 100, .orig_qty = 100, .price = 101 + lvl,
+                            .side = sim::Side::Sell, .type = sim::OrderType::Limit}, 20 + lvl);
+    }
+
+    sim::Trade tbuf[32]{};
+    const std::size_t max_steps = std::min<std::size_t>(
+        static_cast<std::size_t>(num_events), cap);
+    std::uint64_t running_hash = sim::experimental::detail::kFnvOffsetBasis;
+
+    for (std::size_t i = 0; i < max_steps; ++i) {
+        sim::Tick bb = 99, ba = 101;
+        sim::Qty bv = 0, av = 0;
+        if (!book.best_bid(bb, bv) || bv == 0) {
+            bb = 99;
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = bb,
+                                     .side = sim::Side::Buy, .type = sim::OrderType::Limit},
+                          qrp.current_time(), tbuf, 32);
+            book.best_bid(bb, bv);
+        }
+        if (!book.best_ask(ba, av) || av == 0) {
+            ba = std::max<sim::Tick>(bb + 2, 101);
+            const sim::Qty q_init = qrp.sample_stationary_queue_depth(0);
+            book.add_into(sim::Order{.qty = q_init, .orig_qty = q_init, .price = ba,
+                                     .side = sim::Side::Sell, .type = sim::OrderType::Limit},
+                          qrp.current_time(), tbuf, 32);
+            book.best_ask(ba, av);
+        }
+
+        std::array<sim::Qty, sim::kMaxQRLevels> bid_q{};
+        std::array<sim::Qty, sim::kMaxQRLevels> ask_q{};
+        for (std::size_t l = 0; l < sim::kMaxQRLevels; ++l) {
+            const sim::Tick bp = bb - static_cast<sim::Tick>(l);
+            const sim::Tick ap = ba + static_cast<sim::Tick>(l);
+            bid_q[l] = (bp >= 50) ? book.volume_at(sim::Side::Buy, bp) : 0;
+            ask_q[l] = (ap <= 150) ? book.volume_at(sim::Side::Sell, ap) : 0;
+        }
+
+        const sim::QREvent ev = qrp.next_event_ogata_thinning(bb, bid_q, ba, ask_q);
+        if (ev.order_type == sim::OrderType::Limit) {
+            const sim::Tick px = std::clamp<sim::Tick>(ev.price, 50, 150);
+            book.add_into(sim::Order{.qty = ev.qty, .orig_qty = ev.qty, .price = px,
+                                     .side = ev.side, .type = sim::OrderType::Limit},
+                          qrp.current_time(), tbuf, 32);
+        } else if (ev.order_type == sim::OrderType::Market) {
+            book.add_into(sim::Order{.qty = ev.qty, .orig_qty = ev.qty, .price = 0,
+                                     .side = ev.side, .type = sim::OrderType::Market},
+                          qrp.current_time(), tbuf, 32);
+        } else if (ev.order_type == sim::OrderType::Cancel) {
+            const sim::Tick px = std::clamp<sim::Tick>(ev.price, 50, 150);
+            const sim::OrderId tid = book.peek_tail_order_id(ev.side, px);
+            if (tid != 0) {
+                book.cancel(tid, qrp.current_time());
+            }
+        }
+
+        const sim::EventSeq seq = static_cast<sim::EventSeq>(i + 1);
+        running_hash = sim::experimental::detail::fnv1a_u64(running_hash, seq);
+        running_hash = sim::experimental::detail::fnv1a_i64(running_hash, qrp.current_time());
+        running_hash = sim::experimental::detail::fnv1a_i64(running_hash, ev.price);
+        running_hash = sim::experimental::detail::fnv1a_i64(running_hash, ev.qty);
+
+        const auto hawkes_q16 = static_cast<std::uint32_t>(
+            std::clamp<double>(qrp.last_total_intensity() * 65536.0, 1.0, 4294967295.0));
+        const auto nr3d_vol_q8 = static_cast<std::uint16_t>(
+            std::clamp<std::int64_t>((bv + av) * 2, 1, 65535));
+        const std::uint8_t lvl_reg = static_cast<std::uint8_t>(
+            ((static_cast<unsigned>(ev.level) & 0x0FU) << 4U) |
+            (static_cast<unsigned>(ev.type) & 0x0FU));
+        const auto rep_shift = static_cast<std::int8_t>(
+            std::clamp<std::int64_t>(ev.reprice_ticks, -127, 127));
+
+        sink.set_telemetry_hints(hawkes_q16, nr3d_vol_q8, 2450U, lvl_reg, rep_shift);
+
+        sim::ExportFrame frame{};
+        frame.seq = seq;
+        frame.replay_hash = running_hash;
+        frame.snapshot = sim::make_book_observables(book, seq);
+        sink.on_frame(frame);
+    }
+
+    if (out_events_published) {
+        *out_events_published = static_cast<uint64_t>(sink.enqueued_frames());
+    }
+    if (out_final_hash) {
+        *out_final_hash = sink.last_hash();
+    }
     return 0;
 }
 
