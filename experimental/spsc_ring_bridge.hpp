@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 // Lock-free POSIX shared-memory SPSC ring buffer (`ShmIpcEvent`, `ShmIpcHeader`,
 // `ShmRingChannel`, `ShmSpscProducer`, `ShmSpscConsumer`, `ShmSpscEndpoint`)
 // with 64-byte cache-aligned binary event frames.

@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 // Fixed-width bitwise van Emde Boas (vEB) bitsets (128/256/512-bit), MSB-first
 // bitboard, offset-binary tick codec, Gray-code subset evaluator, and Elias-Fano

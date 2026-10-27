@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 // Agent reward ledger keyed by `(parent_id, agent, scenario_id)`.

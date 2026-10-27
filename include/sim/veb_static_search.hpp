@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 // Khuong & Morin (2017) Branchless 1-Based Eytzinger Lookup with _mm_prefetch
 // (`EytzingerTickGrid`) and Cache-Oblivious van Emde Boas Static Search

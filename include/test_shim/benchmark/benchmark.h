@@ -1,9 +1,13 @@
 #pragma once
 
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -144,12 +148,24 @@ inline BenchmarkTarget* RegisterBenchmark(const char* name, BenchmarkFn fn) {
     return ptr;
 }
 
+struct BenchmarkRunRecord {
+    std::string name;
+    int64_t iterations = 0;
+    double real_time_ns = 0.0;
+    double cpu_time_ns = 0.0;
+    double items_per_second = 0.0;
+    std::map<std::string, double> counters;
+};
+
 inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
     std::string filter;
+    std::string out_path;
     for (int i = 1; i < argc && argv != nullptr; ++i) {
         const char* arg = argv[i];
         if (std::strncmp(arg, "--benchmark_filter=", 19) == 0) {
             filter = arg + 19;
+        } else if (std::strncmp(arg, "--benchmark_out=", 16) == 0) {
+            out_path = arg + 16;
         }
     }
 
@@ -159,6 +175,8 @@ inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
               << std::setw(12) << "Iterations"
               << std::setw(16) << "Throughput" << "\n";
     std::cout << "--------------------------------------------------------------------------------\n";
+
+    std::vector<BenchmarkRunRecord> records;
 
     for (const auto& target : get_bench_registry()) {
         std::vector<std::vector<int64_t>> runs = target->arg_lists;
@@ -189,25 +207,65 @@ inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
                       << std::right << std::setw(14) << std::fixed << std::setprecision(1) << per_iter_ns
                       << std::setw(12) << iters;
 
+            double items_per_sec = 0.0;
             if (state.items_processed() > 0 && ns > 0) {
-                const double items_per_sec = (static_cast<double>(state.items_processed()) / static_cast<double>(ns)) * 1e9;
+                items_per_sec = (static_cast<double>(state.items_processed()) / static_cast<double>(ns)) * 1e9;
                 std::cout << std::setw(13) << std::fixed << std::setprecision(2)
                           << (items_per_sec / 1e6) << "M/s";
             } else {
                 std::cout << std::setw(16) << "-";
             }
 
+            BenchmarkRunRecord rec{};
+            rec.name = label;
+            rec.iterations = iters;
+            rec.real_time_ns = per_iter_ns;
+            rec.cpu_time_ns = per_iter_ns;
+            rec.items_per_second = items_per_sec;
+
             for (const auto& [k, c] : state.counters) {
                 double val = c.value;
                 if ((c.flags & Counter::kAvgIterations) != 0) {
                     val /= static_cast<double>(iters);
                 }
+                rec.counters[k] = val;
                 std::cout << "  " << k << "=" << std::fixed << std::setprecision(1) << val;
             }
             std::cout << "\n";
+            records.push_back(std::move(rec));
         }
     }
     std::cout << "--------------------------------------------------------------------------------\n";
+
+    if (!out_path.empty()) {
+        std::ofstream ofs(out_path);
+        if (ofs.is_open()) {
+            ofs << "{\n"
+                << "  \"context\": {\n"
+                << "    \"executable\": \"sim_bench\",\n"
+                << "    \"num_benchmarks\": " << records.size() << "\n"
+                << "  },\n"
+                << "  \"benchmarks\": [\n";
+            for (std::size_t i = 0; i < records.size(); ++i) {
+                const auto& r = records[i];
+                ofs << "    {\n"
+                    << "      \"name\": \"" << r.name << "\",\n"
+                    << "      \"run_name\": \"" << r.name << "\",\n"
+                    << "      \"run_type\": \"iteration\",\n"
+                    << "      \"iterations\": " << r.iterations << ",\n"
+                    << "      \"real_time\": " << std::fixed << std::setprecision(4) << r.real_time_ns << ",\n"
+                    << "      \"cpu_time\": " << std::fixed << std::setprecision(4) << r.cpu_time_ns << ",\n"
+                    << "      \"time_unit\": \"ns\",\n"
+                    << "      \"items_per_second\": " << std::fixed << std::setprecision(2) << r.items_per_second;
+                for (const auto& [ck, cv] : r.counters) {
+                    ofs << ",\n      \"" << ck << "\": " << std::fixed << std::setprecision(4) << cv;
+                }
+                ofs << "\n    }" << (i + 1 < records.size() ? "," : "") << "\n";
+            }
+            ofs << "  ]\n}\n";
+        }
+    }
+
     return 0;
 }
 

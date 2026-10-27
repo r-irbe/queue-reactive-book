@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 // Thread-local heap allocation counter and budget gate for scoped regions.

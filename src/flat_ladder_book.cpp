@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include "sim/flat_ladder_book.hpp"
 #include <algorithm>
 #include <bit>
@@ -949,6 +952,38 @@ std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
     ahead += node_pool_[curr].qty;
   }
   return ahead;
+}
+
+OrderId FlatLadderBook::peek_head_order_id(Side side, Tick price) const noexcept {
+  if (!is_valid_ || !in_range(price)) return 0ULL;
+  const std::size_t idx = index_of(price);
+  if (level_side_[idx] != side_tag(side)) return 0ULL;
+  const std::uint32_t slot = levels_[idx].head_slot;
+  if (slot == kNullSlot || slot >= node_pool_.size()) return 0ULL;
+  return node_pool_[slot].id;
+}
+
+OrderId FlatLadderBook::peek_tail_order_id(Side side, Tick price) const noexcept {
+  if (!is_valid_ || !in_range(price)) return 0ULL;
+  const std::size_t idx = index_of(price);
+  if (level_side_[idx] != side_tag(side)) return 0ULL;
+  const std::uint32_t slot = levels_[idx].tail_slot;
+  if (slot == kNullSlot || slot >= node_pool_.size()) return 0ULL;
+  return node_pool_[slot].id;
+}
+
+OrderId FlatLadderBook::peek_nth_order_id(Side side, Tick price, std::size_t n) const noexcept {
+  if (!is_valid_ || !in_range(price)) return 0ULL;
+  const std::size_t idx = index_of(price);
+  if (level_side_[idx] != side_tag(side)) return 0ULL;
+  std::uint32_t curr = levels_[idx].head_slot;
+  std::size_t step = 0;
+  while (curr != kNullSlot && curr < node_pool_.size()) {
+    if (step == n) return node_pool_[curr].id;
+    curr = node_pool_[curr].next_slot;
+    ++step;
+  }
+  return 0ULL;
 }
 
 bool FlatLadderBook::best_bid(Tick &price, Qty &volume) const noexcept {

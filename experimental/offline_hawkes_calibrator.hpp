@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 // Offline dyadic Hawkes point-process intensity replay, moment-based
 // branching-ratio calibrator, and equal-volume VPIN flow-toxicity evaluator.
 

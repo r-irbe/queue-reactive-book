@@ -1,11 +1,17 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include "qr/alloc_guard.hpp"
 #include "sim/sim.hpp"
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -14,48 +20,36 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [OPTIONS] [STEPS]\n"
               << "\n"
               << "Options:\n"
-              << "  -h, --help        Show this help message and exit\n"
-              << "  --steps <N>       Number of simulation events to run (default: 10000, min: 100)\n"
-              << "  --seed <S>        PRNG seed for QueueReactiveProcess (default: 0x9E3779B97F4A7C15)\n";
+              << "  -h, --help                Show this help message and exit\n"
+              << "  --mode <MODE>             Execution mode:\n"
+              << "                              demo          (default interactive walkthrough)\n"
+              << "                              qr-stylized   (5-level HLR IIb/III + Hawkes + Ogata trajectory)\n"
+              << "                              latency-sweep (3-stage latency adverse selection sweep)\n"
+              << "                              mm-tournament (AS vs GLFT vs CJP vs Passive vs Sniper)\n"
+              << "                              exec-impact   (TWAP vs VWAP vs POV execution & sqrt impact)\n"
+              << "                              parity        (FlatLadderBook vs LimitOrderBook FNV-1a parity)\n"
+              << "                              calibrate     (Offline Hawkes & VPIN calibration on LOBSTER CSV)\n"
+              << "  --steps <N>, --events <N> Number of simulation events to run (default: 10000, min: 100)\n"
+              << "  --seed <S>                PRNG seed for QueueReactiveProcess (default: 0x9E3779B97F4A7C15)\n"
+              << "  --dataset <PATH>          Input CSV dataset path for calibrate/qr-stylized modes\n"
+              << "  --export-dir <DIR>        Optional directory to export CSV/JSON experiment artifacts\n";
 }
 
-} // namespace
-
-int main(int argc, char* argv[]) {
-    int sim_events = 10000;
-    std::uint64_t seed = sim::rng_constants::kDefaultSeed;
-
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        } else if (std::strcmp(argv[i], "--steps") == 0) {
-            if (i + 1 >= argc) {
-                std::cerr << "Error: --steps requires a numeric argument\n";
-                print_usage(argv[0]);
-                return 1;
-            }
-            sim_events = std::max(100, std::atoi(argv[++i]));
-        } else if (std::strncmp(argv[i], "--steps=", 8) == 0) {
-            sim_events = std::max(100, std::atoi(argv[i] + 8));
-        } else if (std::strcmp(argv[i], "--seed") == 0) {
-            if (i + 1 >= argc) {
-                std::cerr << "Error: --seed requires a numeric argument\n";
-                print_usage(argv[0]);
-                return 1;
-            }
-            seed = std::strtoull(argv[++i], nullptr, 0);
-        } else if (std::strncmp(argv[i], "--seed=", 7) == 0) {
-            seed = std::strtoull(argv[i] + 7, nullptr, 0);
-        } else if (argv[i][0] != '-') {
-            sim_events = std::max(100, std::atoi(argv[i]));
-        } else {
-            std::cerr << "Error: unknown option '" << argv[i] << "'\n";
-            print_usage(argv[0]);
-            return 1;
-        }
+const char* agent_kind_name(sim::StrategicAgentKind k) noexcept {
+    switch (k) {
+        case sim::StrategicAgentKind::AvellanedaStoikov: return "AvellanedaStoikov";
+        case sim::StrategicAgentKind::GlftHeuristic:     return "GLFT_2013";
+        case sim::StrategicAgentKind::CjpHeuristic:      return "CJP_2015_OFI";
+        case sim::StrategicAgentKind::PassiveMaker:      return "PassiveMaker";
+        case sim::StrategicAgentKind::LatencyTaker:      return "LatencyTaker";
+        case sim::StrategicAgentKind::TwapExecution:     return "TWAP";
+        case sim::StrategicAgentKind::VwapExecution:     return "VWAP";
+        case sim::StrategicAgentKind::PovExecution:      return "POV";
     }
+    return "Unknown";
+}
 
+int run_demo_mode(int sim_events, std::uint64_t seed) {
     std::cout << "Queue-Reactive Limit Order Book Simulator (C++20)\n";
     std::cout << "--------------------------------------------------------------------\n\n";
 
@@ -91,7 +85,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  Bid vol @100: " << ladder.volume_at(sim::Side::Buy, 100) << "\n\n";
     }
 
-    std::cout << "[2] L3 FIFO Queue Priority (queue_ahead):\n";
+    std::cout << "[2] L3 FIFO Queue Priority (queue_ahead & peek_head/tail):\n";
     {
         sim::FlatLadderBook book(90, 110);
         for (int i = 1; i <= 4; ++i) {
@@ -105,7 +99,9 @@ int main(int argc, char* argv[]) {
             book.add(o, 1000 * i);
         }
 
-        std::cout << "  4 buy orders of 20 lots queued at tick 100:\n";
+        std::cout << "  4 buy orders of 20 lots queued at tick 100 (head="
+                  << book.peek_head_order_id(sim::Side::Buy, 100)
+                  << ", tail=" << book.peek_tail_order_id(sim::Side::Buy, 100) << "):\n";
         for (sim::OrderId id = 1; id <= 4; ++id) {
             auto ahead = book.queue_ahead(id);
             std::cout << "    order " << id << ": "
@@ -136,6 +132,7 @@ int main(int argc, char* argv[]) {
         sim::Trade trade_buf[32]{};
         std::uint64_t total_trades = 0;
         std::uint64_t total_volume = 0;
+        std::uint64_t total_cancels = 0;
 
         const auto t0 = std::chrono::high_resolution_clock::now();
         sim::diag::AllocStats alloc_delta{};
@@ -143,9 +140,15 @@ int main(int argc, char* argv[]) {
             sim::diag::ScopedAllocCounter alloc_counter;
             for (int i = 0; i < sim_events; ++i) {
                 sim::Tick bb = 99, ba = 101;
-                sim::Qty bv = 100, av = 100;
-                sim_book.best_bid(bb, bv);
-                sim_book.best_ask(ba, av);
+                sim::Qty bv = 0, av = 0;
+                if (!sim_book.best_bid(bb, bv)) {
+                    bb = 99;
+                    bv = 0;
+                }
+                if (!sim_book.best_ask(ba, av)) {
+                    ba = 101;
+                    av = 0;
+                }
 
                 auto ev = qrp.next_event(bb, bv, ba, av);
 
@@ -153,7 +156,7 @@ int main(int argc, char* argv[]) {
                     sim::Order o{};
                     o.agent = 100;
                     o.side = ev.side;
-                    o.price = ev.price;
+                    o.price = std::clamp<sim::Tick>(ev.price, 80, 120);
                     o.qty = ev.qty;
                     o.orig_qty = ev.qty;
                     o.type = sim::OrderType::Limit;
@@ -170,6 +173,14 @@ int main(int argc, char* argv[]) {
                     const auto summary = sim_book.add_into(o, qrp.current_time(), trade_buf, 32);
                     total_trades += summary.trade_count;
                     total_volume += static_cast<std::uint64_t>(summary.filled);
+                } else if (ev.order_type == sim::OrderType::Cancel) {
+                    const sim::Tick px = std::clamp<sim::Tick>(ev.price, 80, 120);
+                    const sim::OrderId target_id = (i & 1)
+                        ? sim_book.peek_tail_order_id(ev.side, px)
+                        : sim_book.peek_head_order_id(ev.side, px);
+                    if (target_id != 0 && sim_book.cancel(target_id, qrp.current_time())) {
+                        ++total_cancels;
+                    }
                 }
             }
             alloc_delta = alloc_counter.delta();
@@ -181,6 +192,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "  Events processed:   " << sim_events << "\n";
         std::cout << "  Trades executed:    " << total_trades << "\n";
+        std::cout << "  Cancels executed:   " << total_cancels << "\n";
         std::cout << "  Volume matched:     " << total_volume << " lots\n";
         std::cout << "  Heap allocations:   " << alloc_delta.allocations
                   << " (" << alloc_delta.bytes << " bytes)\n";
@@ -191,6 +203,427 @@ int main(int argc, char* argv[]) {
                   << std::fixed << std::setprecision(1)
                   << (static_cast<double>(elapsed_us * 1000) / sim_events) << " ns/event)\n";
     }
-
     return 0;
+}
+
+int run_qr_stylized_mode(int sim_events, std::uint64_t seed,
+                         const std::string& dataset_path,
+                         const std::string& export_dir) {
+    sim::QRParams qrp_cfg{};
+    qrp_cfg.num_levels = 5;
+    qrp_cfg.theta_ergodic = 0.35;
+    qrp_cfg.theta_reprice = 0.65;
+    qrp_cfg.size_model = sim::OrderSizeModel::LogBinnedEmpirical;
+
+    sim::QueueReactiveProcess qrp(qrp_cfg, sim::HawkesMatrix::default_microstructure(), seed);
+    sim::Empirical3DIntensityTable table = sim::Empirical3DIntensityTable::default_calibrated();
+    if (!dataset_path.empty()) {
+        table.load_csv(dataset_path);
+    }
+    qrp.set_empirical_3d_table(table);
+
+    sim::FlatLadderBook book(50, 150, static_cast<std::size_t>(sim_events * 2 + 512));
+    for (int lvl = 0; lvl < 5; ++lvl) {
+        book.add(sim::Order{.qty = 100, .orig_qty = 100, .price = 99 - lvl,
+                            .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 10 + lvl);
+        book.add(sim::Order{.qty = 100, .orig_qty = 100, .price = 101 + lvl,
+                            .side = sim::Side::Sell, .type = sim::OrderType::Limit}, 20 + lvl);
+    }
+
+    std::ofstream csv;
+    if (!export_dir.empty()) {
+        csv.open(export_dir + "/qr_stylized_trajectory.csv");
+        if (csv.is_open()) {
+            csv << "step,time_us,best_bid,best_ask,bid_vol_l1,ask_vol_l1,kind,level,side,qty,price_shift,intensity,ogata_residual\n";
+        }
+    }
+
+    sim::Trade tbuf[32]{};
+    std::uint64_t trades = 0, cancels = 0, shifts = 0;
+    for (int i = 0; i < sim_events; ++i) {
+        sim::Tick bb = 99, ba = 101;
+        sim::Qty bv = 0, av = 0;
+        if (!book.best_bid(bb, bv) || bv == 0) {
+            bb = 99;
+            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = bb,
+                                     .side = sim::Side::Buy, .type = sim::OrderType::Limit},
+                          qrp.current_time(), tbuf, 32);
+            book.best_bid(bb, bv);
+        }
+        if (!book.best_ask(ba, av) || av == 0) {
+            ba = std::max<sim::Tick>(bb + 2, 101);
+            book.add_into(sim::Order{.qty = 100, .orig_qty = 100, .price = ba,
+                                     .side = sim::Side::Sell, .type = sim::OrderType::Limit},
+                          qrp.current_time(), tbuf, 32);
+            book.best_ask(ba, av);
+        }
+
+        std::array<sim::Qty, sim::kMaxQRLevels> bid_q{};
+        std::array<sim::Qty, sim::kMaxQRLevels> ask_q{};
+        for (std::size_t l = 0; l < sim::kMaxQRLevels; ++l) {
+            const sim::Tick bp = bb - static_cast<sim::Tick>(l);
+            const sim::Tick ap = ba + static_cast<sim::Tick>(l);
+            bid_q[l] = (bp >= 50) ? book.volume_at(sim::Side::Buy, bp) : 0;
+            ask_q[l] = (ap <= 150) ? book.volume_at(sim::Side::Sell, ap) : 0;
+        }
+
+        const auto ev = qrp.next_event_ogata_thinning(bb, bid_q, ba, ask_q);
+        if (ev.reprice_ticks != 0) ++shifts;
+        if (ev.order_type == sim::OrderType::Limit) {
+            const sim::Tick px = std::clamp<sim::Tick>(ev.price, 50, 150);
+            const auto res = book.add_into(
+                sim::Order{.qty = ev.qty, .orig_qty = ev.qty, .price = px,
+                           .side = ev.side, .type = sim::OrderType::Limit},
+                qrp.current_time(), tbuf, 32);
+            trades += res.trade_count;
+        } else if (ev.order_type == sim::OrderType::Market) {
+            const auto res = book.add_into(
+                sim::Order{.qty = ev.qty, .orig_qty = ev.qty, .price = 0,
+                           .side = ev.side, .type = sim::OrderType::Market},
+                qrp.current_time(), tbuf, 32);
+            trades += res.trade_count;
+        } else if (ev.order_type == sim::OrderType::Cancel) {
+            const sim::Tick px = std::clamp<sim::Tick>(ev.price, 50, 150);
+            const sim::OrderId tid = (i & 1)
+                ? book.peek_tail_order_id(ev.side, px)
+                : book.peek_head_order_id(ev.side, px);
+            if (tid != 0 && book.cancel(tid, qrp.current_time())) {
+                ++cancels;
+            }
+        }
+
+        if (csv.is_open()) {
+            const double og_res = qrp.ogata_residuals().empty() ? 0.0 : qrp.ogata_residuals().back();
+            csv << i << "," << qrp.current_time() << "," << bb << "," << ba << ","
+                << bv << "," << av << "," << static_cast<int>(ev.type) << ","
+                << static_cast<int>(ev.level) << ","
+                << (ev.side == sim::Side::Buy ? 1 : -1) << "," << ev.qty << ","
+                << static_cast<int>(ev.reprice_ticks) << "," << qrp.last_total_intensity() << ","
+                << og_res << "\n";
+        }
+    }
+
+    double mean_res = 0.0;
+    for (double r : qrp.ogata_residuals()) mean_res += r;
+    if (!qrp.ogata_residuals().empty()) {
+        mean_res /= static_cast<double>(qrp.ogata_residuals().size());
+    }
+
+    std::cout << "[qr-stylized] events=" << sim_events
+              << " trades=" << trades
+              << " cancels=" << cancels
+              << " reprice_shifts=" << shifts
+              << " ogata_mean_residual=" << std::fixed << std::setprecision(4) << mean_res << "\n";
+    return 0;
+}
+
+int run_latency_sweep_mode(int sim_events, std::uint64_t seed, const std::string& export_dir) {
+    const std::int64_t latencies_ns[] = {0, 500, 2000, 10000, 50000, 250000, 1000000};
+    std::ofstream csv;
+    if (!export_dir.empty()) {
+        csv.open(export_dir + "/latency_sweep.csv");
+        if (csv.is_open()) {
+            csv << "latency_ns,quotes,passive_fills,final_inv,mtm_pnl,sharpe_proxy,maker_markout,maker_adv_x2,queue_risk_x2\n";
+        }
+    }
+    std::cout << "[latency-sweep] Avellaneda-Stoikov across 7 latency tiers (events=" << sim_events << "):\n";
+    for (std::int64_t lat : latencies_ns) {
+        sim::SimulationSessionConfig scfg{};
+        scfg.num_events = static_cast<std::size_t>(sim_events);
+        scfg.seed = seed;
+
+        sim::StrategicAgentConfig acfg{};
+        acfg.agent_id = 10;
+        acfg.kind = sim::StrategicAgentKind::AvellanedaStoikov;
+        acfg.latency = sim::LatencyConfig{lat * 4 / 10, lat * 2 / 10, lat * 4 / 10};
+
+        sim::SimulationSession session(scfg, {acfg});
+        const auto res = session.run();
+        const auto& m = res.agent_metrics.front();
+        std::cout << "  latency=" << std::setw(8) << lat << " ns"
+                  << " | fills=" << std::setw(4) << m.passive_fills
+                  << " | PnL=" << std::setw(9) << std::fixed << std::setprecision(1) << m.mark_to_mid_pnl
+                  << " | maker_adv_x2=" << std::setw(6) << m.risk_triplet.maker_adversity_x2
+                  << " | queue_risk_x2=" << std::setw(6) << m.risk_triplet.queue_risk_x2 << "\n";
+        if (csv.is_open()) {
+            csv << lat << "," << m.quotes_emitted << "," << m.passive_fills << ","
+                << m.final_inventory << "," << m.mark_to_mid_pnl << ","
+                << m.sharpe_proxy << "," << m.mean_maker_markout_ticks << ","
+                << m.risk_triplet.maker_adversity_x2 << ","
+                << m.risk_triplet.queue_risk_x2 << "\n";
+        }
+    }
+    return 0;
+}
+
+int run_mm_tournament_mode(int sim_events, std::uint64_t seed, const std::string& export_dir) {
+    sim::SimulationSessionConfig scfg{};
+    scfg.num_events = static_cast<std::size_t>(sim_events);
+    scfg.seed = seed;
+
+    std::vector<sim::StrategicAgentConfig> agents;
+    const sim::StrategicAgentKind kinds[] = {
+        sim::StrategicAgentKind::AvellanedaStoikov,
+        sim::StrategicAgentKind::GlftHeuristic,
+        sim::StrategicAgentKind::CjpHeuristic,
+        sim::StrategicAgentKind::PassiveMaker,
+        sim::StrategicAgentKind::LatencyTaker
+    };
+    for (std::size_t k = 0; k < 5; ++k) {
+        sim::StrategicAgentConfig acfg{};
+        acfg.agent_id = static_cast<sim::AgentId>(10 + k);
+        acfg.kind = kinds[k];
+        acfg.latency = (kinds[k] == sim::StrategicAgentKind::LatencyTaker)
+            ? sim::LatencyConfig{200, 100, 200}
+            : sim::LatencyConfig{1500, 500, 1500};
+        agents.push_back(acfg);
+    }
+
+    sim::SimulationSession session(scfg, agents);
+    const auto res = session.run();
+
+    std::ofstream csv;
+    if (!export_dir.empty()) {
+        csv.open(export_dir + "/mm_tournament.csv");
+        if (csv.is_open()) {
+            csv << "agent_id,strategy,quotes,passive_fills,aggressive_fills,final_inv,mtm_pnl,sharpe,max_dd,maker_adv_x2,taker_adv_x2,queue_risk_x2\n";
+        }
+    }
+
+    std::cout << "[mm-tournament] Multi-Agent Market-Making Tournament (events=" << sim_events << "):\n";
+    for (const auto& m : res.agent_metrics) {
+        std::cout << "  " << std::left << std::setw(18) << agent_kind_name(m.kind)
+                  << " | passive=" << std::right << std::setw(4) << m.passive_fills
+                  << " | aggr=" << std::setw(4) << m.aggressive_fills
+                  << " | inv=" << std::setw(5) << m.final_inventory
+                  << " | PnL=" << std::setw(9) << std::fixed << std::setprecision(1) << m.mark_to_mid_pnl
+                  << " | Sharpe=" << std::setw(6) << std::setprecision(2) << m.sharpe_proxy << "\n";
+        if (csv.is_open()) {
+            csv << m.agent_id << "," << agent_kind_name(m.kind) << ","
+                << m.quotes_emitted << "," << m.passive_fills << ","
+                << m.aggressive_fills << "," << m.final_inventory << ","
+                << m.mark_to_mid_pnl << "," << m.sharpe_proxy << ","
+                << m.max_drawdown_ticks << ","
+                << m.risk_triplet.maker_adversity_x2 << ","
+                << m.risk_triplet.taker_adversity_x2 << ","
+                << m.risk_triplet.queue_risk_x2 << "\n";
+        }
+    }
+    std::cout << "  Exploitability gain_lower_bound=" << res.exploitability.gain_lower_bound
+              << " (is_equilibrium_certificate=" << (res.exploitability.is_equilibrium_certificate ? "true" : "false")
+              << ") | Impact RMSE=" << res.impact_score.rmse() << "\n";
+    return 0;
+}
+
+int run_exec_impact_mode(int sim_events, std::uint64_t seed, const std::string& export_dir) {
+    const sim::StrategicAgentKind schedules[] = {
+        sim::StrategicAgentKind::TwapExecution,
+        sim::StrategicAgentKind::VwapExecution,
+        sim::StrategicAgentKind::PovExecution
+    };
+    std::ofstream csv;
+    if (!export_dir.empty()) {
+        csv.open(export_dir + "/exec_impact.csv");
+        if (csv.is_open()) {
+            csv << "schedule,slices_sent,filled_qty,cash_spent,taker_adv_x2,impact_rmse,impact_bias\n";
+        }
+    }
+    std::cout << "[exec-impact] Execution Schedule Comparison (TWAP vs VWAP vs POV):\n";
+    for (auto sched : schedules) {
+        sim::SimulationSessionConfig scfg{};
+        scfg.num_events = static_cast<std::size_t>(sim_events);
+        scfg.seed = seed;
+
+        sim::StrategicAgentConfig acfg{};
+        acfg.agent_id = 50;
+        acfg.kind = sched;
+        acfg.execution_target_qty = 120;
+        acfg.execution_slices = 12;
+        acfg.pov_participation = 0.12;
+
+        sim::SimulationSession session(scfg, {acfg});
+        const auto res = session.run();
+        const auto& m = res.agent_metrics.front();
+        std::cout << "  " << std::left << std::setw(8) << agent_kind_name(sched)
+                  << " | slices=" << std::right << std::setw(3) << m.exec_slices_sent
+                  << " | filled=" << std::setw(5) << m.total_filled_qty
+                  << " | taker_adv_x2=" << std::setw(6) << m.risk_triplet.taker_adversity_x2
+                  << " | impact_rmse=" << std::fixed << std::setprecision(4) << res.impact_score.rmse() << "\n";
+        if (csv.is_open()) {
+            csv << agent_kind_name(sched) << "," << m.exec_slices_sent << ","
+                << m.total_filled_qty << "," << (-m.final_cash) << ","
+                << m.risk_triplet.taker_adversity_x2 << ","
+                << res.impact_score.rmse() << "," << res.impact_score.bias() << "\n";
+        }
+    }
+    return 0;
+}
+
+int run_parity_mode(int sim_events, std::uint64_t seed) {
+    std::vector<sim::TraceEvent> trace;
+    trace.reserve(static_cast<std::size_t>(sim_events));
+    sim::Rng rng(seed);
+    for (int i = 0; i < sim_events; ++i) {
+        sim::TraceEvent ev{};
+        ev.seq = static_cast<sim::EventSeq>(i + 1);
+        ev.ts = static_cast<sim::TimeNs>((i + 1) * 100);
+        ev.agent = static_cast<sim::AgentId>((i % 8) + 1);
+        ev.side = (rng.next_u64() & 1ULL) ? sim::Side::Buy : sim::Side::Sell;
+        ev.qty = static_cast<sim::Qty>(10 + (rng.next_u64() % 40));
+        if ((rng.next_u64() % 100) < 70) {
+            ev.kind = sim::TraceEventKind::SubmitLimit;
+            ev.price = (ev.side == sim::Side::Buy)
+                ? static_cast<sim::Tick>(95 + (rng.next_u64() % 6))
+                : static_cast<sim::Tick>(100 + (rng.next_u64() % 6));
+        } else {
+            ev.kind = sim::TraceEventKind::SubmitMarket;
+            ev.price = 0;
+        }
+        trace.push_back(ev);
+    }
+    const auto rep = sim::experimental::FlatLadderParityHarness::verify_trace(80, 120, trace);
+    std::cout << "[parity] events=" << rep.events_replayed
+              << " trades=" << rep.trades_matched
+              << " mismatches=" << rep.mismatches
+              << " flat_digest=0x" << std::hex << rep.flat_digest
+              << " ref_digest=0x" << rep.ref_digest << std::dec
+              << " parity_ok=" << (rep.parity_ok ? "true" : "false") << "\n";
+    return rep.parity_ok ? 0 : 1;
+}
+
+int run_calibrate_mode(const std::string& dataset_path) {
+    const std::string path = dataset_path.empty()
+        ? "data/lobster_AAPL_2012-06-21_message_5.csv"
+        : dataset_path;
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        std::cerr << "Error: cannot open dataset '" << path << "'\n";
+        return 1;
+    }
+
+    std::vector<sim::experimental::ArrivalEvent> arrivals;
+    std::vector<sim::experimental::SignedTrade> trades;
+    std::string line;
+    std::uint64_t seq = 0;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string tok;
+        std::vector<std::string> cols;
+        while (std::getline(ss, tok, ',')) cols.push_back(tok);
+        if (cols.size() < 6) continue;
+        const double t_sec = std::strtod(cols[0].c_str(), nullptr);
+        const int ev_type = std::atoi(cols[1].c_str());
+        const std::int64_t size = std::strtoll(cols[3].c_str(), nullptr, 10);
+        const std::int64_t price = std::strtoll(cols[4].c_str(), nullptr, 10);
+        const int dir = std::atoi(cols[5].c_str());
+
+        const std::int64_t t_us = static_cast<std::int64_t>(t_sec * 1e6);
+        ++seq;
+        arrivals.push_back(sim::experimental::ArrivalEvent{
+            .seq = seq,
+            .time = t_us,
+            .mark = ev_type,
+            .queue_depth = size
+        });
+        if (ev_type == 4 || ev_type == 5) {
+            trades.push_back(sim::experimental::SignedTrade{
+                .seq = seq,
+                .ts_ns = static_cast<std::uint64_t>(t_us) * 1000ULL,
+                .price = price,
+                .volume = size,
+                .side = static_cast<std::int8_t>(dir >= 0 ? 1 : -1)
+            });
+        }
+    }
+
+    const auto hawkes_cal = sim::experimental::StateDependentHawkesCalibrator::calibrate(arrivals, 1);
+    const auto vpin_res = sim::experimental::evaluate_vpin(trades, 1000);
+    std::cout << "[calibrate] dataset=" << path
+              << " events=" << arrivals.size()
+              << " trades=" << trades.size()
+              << " empirical_rate=" << std::fixed << std::setprecision(4) << hawkes_cal.empirical_rate
+              << " branching_ratio=" << hawkes_cal.branching_ratio
+              << " baseline_mu=" << hawkes_cal.baseline_mu
+              << " vpin_buckets=" << vpin_res.n_buckets
+              << " vpin=" << (static_cast<double>(vpin_res.vpin_scaled) / 1e6) << "\n";
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    int sim_events = 10000;
+    std::uint64_t seed = sim::rng_constants::kDefaultSeed;
+    std::string mode = "demo";
+    std::string dataset_path;
+    std::string export_dir;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (std::strcmp(argv[i], "--steps") == 0 || std::strcmp(argv[i], "--events") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << argv[i] << " requires a numeric argument\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+            sim_events = std::max(100, std::atoi(argv[++i]));
+        } else if (std::strncmp(argv[i], "--steps=", 8) == 0) {
+            sim_events = std::max(100, std::atoi(argv[i] + 8));
+        } else if (std::strncmp(argv[i], "--events=", 9) == 0) {
+            sim_events = std::max(100, std::atoi(argv[i] + 9));
+        } else if (std::strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --seed requires a numeric argument\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+            seed = std::strtoull(argv[++i], nullptr, 0);
+        } else if (std::strncmp(argv[i], "--seed=", 7) == 0) {
+            seed = std::strtoull(argv[i] + 7, nullptr, 0);
+        } else if (std::strcmp(argv[i], "--mode") == 0) {
+            if (i + 1 >= argc) return 1;
+            mode = argv[++i];
+        } else if (std::strncmp(argv[i], "--mode=", 7) == 0) {
+            mode = argv[i] + 7;
+        } else if (std::strcmp(argv[i], "--dataset") == 0) {
+            if (i + 1 >= argc) return 1;
+            dataset_path = argv[++i];
+        } else if (std::strncmp(argv[i], "--dataset=", 10) == 0) {
+            dataset_path = argv[i] + 10;
+        } else if (std::strcmp(argv[i], "--export-dir") == 0) {
+            if (i + 1 >= argc) return 1;
+            export_dir = argv[++i];
+        } else if (std::strncmp(argv[i], "--export-dir=", 13) == 0) {
+            export_dir = argv[i] + 13;
+        } else if (argv[i][0] != '-') {
+            sim_events = std::max(100, std::atoi(argv[i]));
+        } else {
+            std::cerr << "Error: unknown option '" << argv[i] << "'\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (mode == "demo") {
+        return run_demo_mode(sim_events, seed);
+    } else if (mode == "qr-stylized") {
+        return run_qr_stylized_mode(sim_events, seed, dataset_path, export_dir);
+    } else if (mode == "latency-sweep") {
+        return run_latency_sweep_mode(sim_events, seed, export_dir);
+    } else if (mode == "mm-tournament") {
+        return run_mm_tournament_mode(sim_events, seed, export_dir);
+    } else if (mode == "exec-impact") {
+        return run_exec_impact_mode(sim_events, seed, export_dir);
+    } else if (mode == "parity") {
+        return run_parity_mode(sim_events, seed);
+    } else if (mode == "calibrate") {
+        return run_calibrate_mode(dataset_path);
+    } else {
+        std::cerr << "Error: unknown mode '" << mode << "'\n";
+        print_usage(argv[0]);
+        return 1;
+    }
 }

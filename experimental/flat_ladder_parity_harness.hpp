@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 // Deterministic replay parity harness comparing `FlatLadderBook`,
 // `LimitOrderBook`, and a tombstone-vector reference ladder, plus a
 // cache-oblivious van Emde Boas static search layout (`VebStaticSearch`).

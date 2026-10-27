@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include "catch2/catch_test_macros.hpp"
 #define QRLOB_NO_GLOBAL_NEW_OVERRIDE 1
 #include "qr/alloc_guard.hpp"

@@ -1,7 +1,11 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 #include "fill_attribution.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <unordered_map>
 #include <vector>
@@ -86,14 +90,22 @@ private:
         order.side = event.side;
         order.type = type;
 
-        const OrderId assigned_internal_id = next_internal_order_id_++;
-        if (event.order_id != 0) {
-            external_to_internal_[event.order_id] = assigned_internal_id;
-        }
-        internal_to_parent_[assigned_internal_id] = event.parent_id;
-
         step.execution = book_.add(order, event.ts);
-        step.accepted = true;
+        if (step.execution.id != 0) {
+            const OrderId internal_id = step.execution.id;
+            next_internal_order_id_ = std::max<OrderId>(next_internal_order_id_, internal_id + 1);
+            if (event.order_id != 0) {
+                external_to_internal_[event.order_id] = internal_id;
+            }
+            internal_to_parent_[internal_id] = event.parent_id;
+            step.accepted = (step.execution.status != OrderStatus::RejectedInvalid &&
+                             step.execution.status != OrderStatus::RejectedOutOfRange &&
+                             step.execution.status != OrderStatus::RejectedPostOnly &&
+                             step.execution.status != OrderStatus::RejectedFok);
+        } else {
+            step.accepted = false;
+        }
+
         step.fills.reserve(step.execution.trades.size());
         step.trade_events.reserve(step.execution.trades.size());
         for (const Trade& trade : step.execution.trades) {

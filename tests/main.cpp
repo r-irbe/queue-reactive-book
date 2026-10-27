@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include "sim/bitwise_veb_codings.hpp"
 #include <catch2/catch_test_macros.hpp>
 
@@ -3940,14 +3943,31 @@ TEST_CASE("quote adapters never produce phantom fills, only SubmitLimit intents"
     REQUIRE(intents[1].side == sim::Side::Sell);
     REQUIRE(intents[1].price == 107);
 
-    // GLFT/CJP placeholders are deferred: they fabricate neither a quote nor a fill.
-    const auto glft = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
-                                              as_inputs(200, 0));
-    REQUIRE_FALSE(glft.model_supported);
-    REQUIRE(sim::to_quote_intents(glft, 42).empty());
-    const auto cjp = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p,
-                                             as_inputs(200, 0));
-    REQUIRE(sim::to_quote_intents(cjp, 42).empty());
+    // GLFT (2013) and CJP (2015) closed-form models emit valid SubmitLimit intents
+    // with inventory monotonicity and OFI skew directionality.
+    const auto glft_flat = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
+                                                   as_inputs(200, 0));
+    REQUIRE(glft_flat.model_supported);
+    REQUIRE(glft_flat.has_bid);
+    REQUIRE(glft_flat.has_ask);
+    REQUIRE(glft_flat.bid_px < glft_flat.ask_px);
+    REQUIRE(sim::to_quote_intents(glft_flat, 42).size() == 2);
+
+    const auto glft_long = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
+                                                   as_inputs(200, 15));
+    REQUIRE(glft_long.bid_px <= glft_flat.bid_px);
+    REQUIRE(glft_long.ask_px <= glft_flat.ask_px);
+
+    auto cjp_in_pos = as_inputs(200, 0);
+    cjp_in_pos.alpha_ofi = 6.0;
+    auto cjp_in_neg = as_inputs(200, 0);
+    cjp_in_neg.alpha_ofi = -6.0;
+    const auto cjp_pos = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p, cjp_in_pos);
+    const auto cjp_neg = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p, cjp_in_neg);
+    REQUIRE(cjp_pos.model_supported);
+    REQUIRE(cjp_pos.bid_px < cjp_pos.ask_px);
+    REQUIRE(cjp_pos.bid_px >= cjp_neg.bid_px);
+    REQUIRE(cjp_pos.ask_px >= cjp_neg.ask_px);
 }
 
 
@@ -5215,4 +5235,156 @@ TEST_CASE("FOK + Self-Trade Prevention exact pre-flight parity in FlatLadderBook
             REQUIRE(flat.volume_at(sim::Side::Sell, 101) == 0);
         });
     }
+}
+
+
+#include "sim/sim.hpp"
+
+TEST_CASE("Bug 1 fix: eval_neg_ln_u_q16_from_raw never underflows on 0xFFFF mask",
+          "[qr][bug1][clz]") {
+    const std::uint64_t val_max = sim::QueueReactiveProcess::eval_neg_ln_u_q16_from_raw(0xFFFFFFFFFFFFFFFFULL);
+    const std::uint64_t val_zero = sim::QueueReactiveProcess::eval_neg_ln_u_q16_from_raw(0ULL);
+    REQUIRE(val_max <= 65536ULL);
+    REQUIRE(val_zero > val_max);
+
+    sim::QueueReactiveProcess qrp({}, sim::HawkesMatrix::default_microstructure(), 12345ULL);
+    std::array<sim::Qty, sim::kMaxQRLevels> bq{100, 80, 60, 40, 20};
+    std::array<sim::Qty, sim::kMaxQRLevels> aq{100, 80, 60, 40, 20};
+    for (int i = 0; i < 200; ++i) {
+        const auto ev = qrp.next_event_ogata_thinning(99, bq, 101, aq);
+        REQUIRE(ev.qty > 0);
+        REQUIRE(qrp.current_time() > 0);
+    }
+    REQUIRE(qrp.ogata_residuals().size() == 200);
+
+    const auto pmf = qrp.stationary_queue_pmf(0);
+    REQUIRE(pmf.size() == 64);
+    double sum_p = 0.0;
+    for (double p : pmf) sum_p += p;
+    REQUIRE(std::fabs(sum_p - 1.0) < 1e-6);
+}
+
+TEST_CASE("Bug 2 & 3 fix: ReplayDriver rejected order ID guard and FlatLadderBook peek order IDs",
+          "[replay][flat_ladder][bug2][bug3]") {
+    sim::FlatLadderBook book(90, 110, 128);
+    REQUIRE(book.peek_head_order_id(sim::Side::Buy, 100) == 0);
+    REQUIRE(book.peek_tail_order_id(sim::Side::Buy, 100) == 0);
+
+    const auto r1 = book.add(sim::Order{.qty = 10, .agent = 1, .orig_qty = 10, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 10);
+    const auto r2 = book.add(sim::Order{.qty = 20, .agent = 2, .orig_qty = 20, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 20);
+    const auto r3 = book.add(sim::Order{.qty = 30, .agent = 3, .orig_qty = 30, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 30);
+    REQUIRE(book.peek_head_order_id(sim::Side::Buy, 100) == r1.id);
+    REQUIRE(book.peek_tail_order_id(sim::Side::Buy, 100) == r3.id);
+    REQUIRE(book.peek_nth_order_id(sim::Side::Buy, 100, 1) == r2.id);
+
+    // ReplayDriver rejected invalid order (qty=0 -> id=0) should not advance next_internal_order_id_
+    sim::ReplayDriver driver(90, 110, 128);
+    sim::TraceEvent bad_ev{};
+    bad_ev.seq = 1;
+    bad_ev.ts = 100;
+    bad_ev.kind = sim::TraceEventKind::SubmitLimit;
+    bad_ev.order_id = 500;
+    bad_ev.agent = 1;
+    bad_ev.side = sim::Side::Buy;
+    bad_ev.price = 100;
+    bad_ev.qty = 0; // RejectedInvalid -> execution.id == 0!
+    const auto step_bad = driver.apply(bad_ev);
+    REQUIRE(step_bad.execution.id == 0);
+    REQUIRE_FALSE(step_bad.accepted);
+
+    sim::TraceEvent good_ev{};
+    good_ev.seq = 2;
+    good_ev.ts = 200;
+    good_ev.kind = sim::TraceEventKind::SubmitLimit;
+    good_ev.order_id = 501;
+    good_ev.agent = 1;
+    good_ev.side = sim::Side::Buy;
+    good_ev.price = 100;
+    good_ev.qty = 15;
+    const auto step_good = driver.apply(good_ev);
+    REQUIRE(step_good.execution.id == 1);
+
+    // Cancelling external order 501 must cancel internal order 1
+    sim::TraceEvent cancel_ev{};
+    cancel_ev.seq = 3;
+    cancel_ev.ts = 300;
+    cancel_ev.kind = sim::TraceEventKind::Cancel;
+    cancel_ev.order_id = 501;
+    const auto step_cancel = driver.apply(cancel_ev);
+    REQUIRE(step_cancel.cancel_accepted);
+    REQUIRE(driver.book().volume_at(sim::Side::Buy, 100) == 0);
+}
+
+TEST_CASE("SimulationSession coordinates multi-agent latency pipeline and TCA",
+          "[simulation][coordinator]") {
+    sim::SimulationSessionConfig scfg{};
+    scfg.num_events = 300;
+    scfg.seed = 42ULL;
+
+    sim::StrategicAgentConfig as_agent{};
+    as_agent.agent_id = 10;
+    as_agent.kind = sim::StrategicAgentKind::AvellanedaStoikov;
+    as_agent.latency = sim::LatencyConfig{500, 200, 500};
+
+    sim::StrategicAgentConfig glft_agent{};
+    glft_agent.agent_id = 11;
+    glft_agent.kind = sim::StrategicAgentKind::GlftHeuristic;
+    glft_agent.latency = sim::LatencyConfig{1000, 300, 1000};
+
+    sim::SimulationSession session(scfg, {as_agent, glft_agent});
+    const auto res = session.run();
+    REQUIRE(res.events_processed == 300);
+    REQUIRE(res.invariants_ok);
+    REQUIRE(res.export_parity_ok);
+    REQUIRE(res.join_manifest_clean);
+    REQUIRE(res.agent_metrics.size() == 2);
+    REQUIRE(res.agent_metrics[0].quotes_emitted > 0);
+    REQUIRE(res.agent_metrics[1].quotes_emitted > 0);
+    REQUIRE_FALSE(res.exploitability.is_equilibrium_certificate);
+}
+
+
+TEST_CASE("Zero steady-state heap allocations in QueueReactiveProcess + FlatLadderBook loop",
+          "[qr][alloc_guard][zero_alloc]") {
+    sim::FlatLadderBook book(80, 120, 4096);
+    book.add_into(
+        sim::Order{.qty = 100, .orig_qty = 100, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::Limit},
+        100, nullptr, 0);
+    book.add_into(
+        sim::Order{.qty = 100, .orig_qty = 100, .price = 101, .side = sim::Side::Sell, .type = sim::OrderType::Limit},
+        100, nullptr, 0);
+
+    sim::QueueReactiveProcess qrp({}, sim::HawkesMatrix::default_microstructure(), 42ULL);
+    sim::Trade trades[16]{};
+
+    sim::diag::AllocStats allocs{};
+    {
+        sim::diag::ScopedAllocCounter guard;
+        for (int i = 0; i < 1000; ++i) {
+            sim::Tick bb = 99, ba = 101;
+            sim::Qty bv = 0, av = 0;
+            if (!book.best_bid(bb, bv)) { bb = 99; bv = 0; }
+            if (!book.best_ask(ba, av)) { ba = 101; av = 0; }
+            const auto ev = qrp.next_event(bb, bv, ba, av);
+            if (ev.order_type == sim::OrderType::Limit || ev.order_type == sim::OrderType::Market) {
+                sim::Order o{};
+                o.agent = (ev.order_type == sim::OrderType::Limit) ? 10 : 20;
+                o.side = ev.side;
+                o.price = std::clamp<sim::Tick>(ev.price, 80, 120);
+                o.qty = ev.qty;
+                o.orig_qty = ev.qty;
+                o.type = ev.order_type;
+                book.add_into(o, qrp.current_time(), trades, 16);
+            } else if (ev.order_type == sim::OrderType::Cancel) {
+                const sim::Tick px = std::clamp<sim::Tick>(ev.price, 80, 120);
+                const sim::OrderId tid = book.peek_tail_order_id(ev.side, px);
+                if (tid != 0) book.cancel(tid, qrp.current_time());
+            }
+        }
+        allocs = guard.delta();
+    }
+    REQUIRE(allocs.allocations == 0);
 }

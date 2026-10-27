@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 #include "lob.hpp"
@@ -351,6 +354,11 @@ public:
     StpMode default_stp_mode() const noexcept { return default_stp_mode_; }
 
     std::optional<Qty> queue_ahead(OrderId id) const noexcept;
+
+    // O(1) head / tail / nth resting order ID lookup at a tick level (returns 0 if empty)
+    OrderId peek_head_order_id(Side side, Tick price) const noexcept;
+    OrderId peek_tail_order_id(Side side, Tick price) const noexcept;
+    OrderId peek_nth_order_id(Side side, Tick price, std::size_t n) const noexcept;
 
     void   set_time(TimeNs t) noexcept { book_time_ = t; }
     TimeNs time()             const noexcept { return book_time_; }

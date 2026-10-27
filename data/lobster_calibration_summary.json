@@ -1,0 +1,135 @@
+{
+  "n_events": 12,
+  "event_type_counts": {
+    "submission": 8,
+    "execution_visible": 1,
+    "delete": 2,
+    "cancel_partial": 1
+  },
+  "direction_counts": {
+    "-1": 7,
+    "1": 5
+  },
+  "proportions": {
+    "submission": 0.6666666666666666,
+    "cancel_partial": 0.08333333333333333,
+    "delete": 0.16666666666666666,
+    "execution_visible": 0.08333333333333333,
+    "execution_hidden": 0.0
+  },
+  "time_span_s": 0.010999999998603016,
+  "mean_inter_arrival_s": 0.0009999999998730016,
+  "median_inter_arrival_s": 0.000999999996565748,
+  "spread": {
+    "n": 9,
+    "mean": 1000.0,
+    "std": 0.0,
+    "min": 1000.0,
+    "max": 1000.0
+  },
+  "top_depth": {
+    "n": 9,
+    "mean": 228.88888888888889,
+    "std": 33.48115371848748,
+    "min": 180.0,
+    "max": 270.0
+  },
+  "imbalance": {
+    "n": 9,
+    "mean": 0.22031913336261164,
+    "std": 0.22152775464913238,
+    "min": -0.1111111111111111,
+    "max": 0.5555555555555556
+  },
+  "per_row": [
+    {
+      "row": 0,
+      "time_s": 34200.0,
+      "spread": NaN,
+      "top_depth": NaN,
+      "imbalance": NaN
+    },
+    {
+      "row": 1,
+      "time_s": 34200.001,
+      "spread": NaN,
+      "top_depth": NaN,
+      "imbalance": NaN
+    },
+    {
+      "row": 2,
+      "time_s": 34200.002,
+      "spread": NaN,
+      "top_depth": NaN,
+      "imbalance": NaN
+    },
+    {
+      "row": 3,
+      "time_s": 34200.003,
+      "spread": 1000.0,
+      "top_depth": 220.0,
+      "imbalance": 0.09090909090909091
+    },
+    {
+      "row": 4,
+      "time_s": 34200.004,
+      "spread": 1000.0,
+      "top_depth": 220.0,
+      "imbalance": 0.09090909090909091
+    },
+    {
+      "row": 5,
+      "time_s": 34200.005,
+      "spread": 1000.0,
+      "top_depth": 220.0,
+      "imbalance": 0.09090909090909091
+    },
+    {
+      "row": 6,
+      "time_s": 34200.006,
+      "spread": 1000.0,
+      "top_depth": 270.0,
+      "imbalance": -0.1111111111111111
+    },
+    {
+      "row": 7,
+      "time_s": 34200.007,
+      "spread": 1000.0,
+      "top_depth": 230.0,
+      "imbalance": 0.043478260869565216
+    },
+    {
+      "row": 8,
+      "time_s": 34200.008,
+      "spread": 1000.0,
+      "top_depth": 180.0,
+      "imbalance": 0.3333333333333333
+    },
+    {
+      "row": 9,
+      "time_s": 34200.009,
+      "spread": 1000.0,
+      "top_depth": 180.0,
+      "imbalance": 0.3333333333333333
+    },
+    {
+      "row": 10,
+      "time_s": 34200.01,
+      "spread": 1000.0,
+      "top_depth": 270.0,
+      "imbalance": 0.5555555555555556
+    },
+    {
+      "row": 11,
+      "time_s": 34200.011,
+      "spread": 1000.0,
+      "top_depth": 270.0,
+      "imbalance": 0.5555555555555556
+    }
+  ],
+  "source": {
+    "message_file": "fixtures/lobster/SYNTH_message_3.csv",
+    "orderbook_file": "fixtures/lobster/SYNTH_orderbook_3.csv",
+    "levels": 3
+  }
+}
