@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include "rng.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <array>
@@ -229,6 +230,192 @@ private:
     TimeNs current_time_ns_ = 0;
     // state_[i][j] = current excitation on event i due to past events of type j
     std::array<std::array<double, kEventTypes>, kEventTypes> state_{};
+};
+
+// ----------------------------------------------------------------------------
+// Lean-Verified SWAR 4-Bit Nibble LUTs & Branchless Primitives
+// (`generated_verified_kernels.rs`, `Rules.MarketSubgameGpu`, `Common.BitwiseSWAR`)
+// ----------------------------------------------------------------------------
+
+inline constexpr std::uint32_t kSwarAddLut    = 0x55865432U;
+inline constexpr std::uint32_t kSwarCancelLut = 0x40432210U;
+inline constexpr std::uint32_t kSwarExecLut   = 0xFF9F4F00U;
+
+// Branchless bit-multiplexer (`chANF` from `/home/radu/code/sair/kernel/common/BitwiseSWAR.lean`):
+// selects bits from `t` where `mask` is 1, and from `f` where `mask` is 0, with zero NOT gates.
+constexpr std::uint64_t bit_mux(std::uint64_t mask, std::uint64_t t, std::uint64_t f) noexcept {
+    return f ^ (mask & (t ^ f));
+}
+
+// Branchless all-ones mask (0xFFFFFFFFFFFFFFFFULL) if x == 0, else 0ULL.
+constexpr std::uint64_t is_zero_mask(std::uint64_t x) noexcept {
+    return (((x | (0ULL - x)) >> 63ULL) - 1ULL);
+}
+
+// Branchless sign-mask ReLU (`family4_cfr_branchless_relu64_exact`).
+constexpr std::uint64_t verified_cfr_branchless_relu64(std::uint64_t w) noexcept {
+    const auto sign_mask = static_cast<std::uint64_t>(static_cast<std::int64_t>(w) >> 63);
+    return w & (sign_mask ^ 0xFFFFFFFFFFFFFFFFULL);
+}
+
+struct SwarQueueReactiveRegimeLut {
+    static constexpr std::uint32_t kAddLut    = kSwarAddLut;
+    static constexpr std::uint32_t kCancelLut = kSwarCancelLut;
+    static constexpr std::uint32_t kExecLut   = kSwarExecLut;
+
+    static constexpr std::uint32_t extract_nibble(std::uint32_t lut, std::uint32_t regime) noexcept {
+        return (lut >> ((regime & 7U) << 2U)) & 0xFU;
+    }
+
+    static constexpr std::uint32_t add_nibble(std::uint32_t regime) noexcept {
+        return extract_nibble(kSwarAddLut, regime);
+    }
+
+    static constexpr std::uint32_t cancel_nibble(std::uint32_t regime) noexcept {
+        return extract_nibble(kSwarCancelLut, regime);
+    }
+
+    static constexpr std::uint32_t exec_nibble(std::uint32_t regime) noexcept {
+        return extract_nibble(kSwarExecLut, regime);
+    }
+    static constexpr std::uint8_t decode_add(std::uint32_t regime) noexcept {
+        return static_cast<std::uint8_t>(add_nibble(regime));
+    }
+    static constexpr std::uint8_t decode_cancel(std::uint32_t regime) noexcept {
+        return static_cast<std::uint8_t>(cancel_nibble(regime));
+    }
+    static constexpr std::uint8_t decode_exec(std::uint32_t regime) noexcept {
+        return static_cast<std::uint8_t>(exec_nibble(regime));
+    }
+
+    static constexpr std::uint32_t exec_toxicity_bit(std::uint32_t adv_mode, std::uint32_t regime) noexcept {
+        return (kSwarExecLut >> (((adv_mode & 3U) << 3U) | (regime & 7U))) & 1U;
+    }
+
+    // Classify queue depth into 3-bit regime in [0, 7] via leading-zero log2 bucket.
+    static constexpr std::uint32_t classify_regime(Qty bid_vol, Qty ask_vol) noexcept {
+        const auto total = static_cast<std::uint64_t>(
+            (bid_vol > 0 ? bid_vol : 0) + (ask_vol > 0 ? ask_vol : 0));
+        if (total == 0ULL) return 0U;
+        const auto lg = static_cast<std::uint32_t>(63 - std::countl_zero(total));
+        return lg > 7U ? 7U : lg;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Deterministic Zero-libm Fixed-Point Q48.16 Horner Exponential Decay &
+// Online Hawkes / Queue-Reactive Intensity Evaluator (`OnlineHawkesQ16`)
+// (`family3_hawkes_q16_decay_bounded`)
+// ----------------------------------------------------------------------------
+
+inline constexpr std::uint64_t kQ16One  = 65536ULL;
+inline constexpr std::uint64_t kLn2Q16  = 45426ULL; // round(ln(2) * 65536)
+
+// Raw Lean-verified Family 3 kernel (`verified_hawkes_q16_horner_decay`):
+// evaluates 2nd-order Horner polynomial `65536 - r + ((r * r) >> 17)` for r in [0, 65535].
+constexpr std::uint64_t verified_hawkes_q16_horner_step(std::uint64_t w) noexcept {
+    const std::uint64_t r = w & 65535ULL;
+    return (65536ULL - r) + ((r * r) >> 17ULL);
+}
+
+// Evaluates exp(-dt_scaled_q16 / 65536.0) in Q48.16 fixed-point [0, 65536]
+// using integer dyadic range reduction `dt_scaled = k * ln2_q16 + r`,
+// 8x sub-step Horner evaluation `65536 - r_sub + ((r_sub * r_sub) >> 17)` with
+// 3 fixed-point squarings, and final dyadic shift `>> k`.
+// Achieves < 0.10% max relative error vs std::exp across [0, 4 * ln(2)] with
+// zero transcendental libm calls and zero floating-point non-associativity.
+constexpr std::uint64_t eval_hawkes_q16_horner_decay(std::uint64_t dt_scaled_q16) noexcept {
+    if (dt_scaled_q16 == 0ULL) return kQ16One;
+    const std::uint64_t k = dt_scaled_q16 / kLn2Q16;
+    if (k >= 32ULL) return 0ULL;
+    const std::uint64_t r = dt_scaled_q16 - (k * kLn2Q16);
+    const std::uint64_t r_sub = (r + 4ULL) >> 3ULL;
+    const std::uint64_t h1 = verified_hawkes_q16_horner_step(r_sub);
+    const std::uint64_t h2 = (h1 * h1 + 32768ULL) >> 16ULL;
+    const std::uint64_t h4 = (h2 * h2 + 32768ULL) >> 16ULL;
+    const std::uint64_t h8 = (h4 * h4 + 32768ULL) >> 16ULL;
+    return h8 >> k;
+}
+
+class OnlineHawkesQ16 {
+public:
+    static constexpr std::uint64_t kScaleQ16 = kQ16One;
+
+    constexpr explicit OnlineHawkesQ16(std::uint64_t mu_q16 = 10ULL * kQ16One,
+                                       std::uint64_t alpha_q16 = 5ULL * kQ16One,
+                                       std::uint64_t beta_per_us_q16 = kQ16One) noexcept
+        : mu_q16_(mu_q16),
+          alpha_q16_(alpha_q16),
+          beta_per_us_q16_(beta_per_us_q16),
+          excitation_q16_(0ULL),
+          last_ts_ns_(0),
+          event_count_(0ULL) {}
+
+    constexpr void reset() noexcept {
+        excitation_q16_ = 0ULL;
+        last_ts_ns_ = 0;
+        event_count_ = 0ULL;
+    }
+
+    // Decay excitation state to timestamp `ts_ns` without adding a jump.
+    constexpr std::uint64_t decay_to(TimeNs ts_ns) noexcept {
+        if (event_count_ > 0ULL && ts_ns > last_ts_ns_) {
+            const auto dt_ns = static_cast<std::uint64_t>(ts_ns - last_ts_ns_);
+            const std::uint64_t dt_scaled_q16 = (dt_ns * beta_per_us_q16_) / 1000ULL;
+            const std::uint64_t decay_q16 = eval_hawkes_q16_horner_decay(dt_scaled_q16);
+            excitation_q16_ = (excitation_q16_ * decay_q16 + 32768ULL) >> 16ULL;
+        }
+        if (ts_ns > last_ts_ns_ || event_count_ == 0ULL) {
+            last_ts_ns_ = ts_ns;
+        }
+        return mu_q16_ + excitation_q16_;
+    }
+
+    // Process an event arrival at `ts_ns`: decays state, records pre-jump intensity,
+    // and adds self-excitation jump `alpha_q16_`. Returns post-jump intensity in Q48.16.
+    constexpr std::uint64_t record_event(TimeNs ts_ns, std::uint32_t regime = 0U) noexcept {
+        (void)decay_to(ts_ns);
+        const std::uint32_t add_mult = SwarQueueReactiveRegimeLut::add_nibble(regime);
+        const std::uint64_t scaled_jump = (alpha_q16_ * (4ULL + add_mult)) >> 3ULL;
+        excitation_q16_ += (regime == 0U) ? alpha_q16_ : scaled_jump;
+        ++event_count_;
+        return mu_q16_ + excitation_q16_;
+    }
+
+    // Evaluate queue-reactive intensity in Q48.16 combining SWAR regime LUT multipliers
+    // with current fixed-point Hawkes excitation.
+    constexpr std::uint64_t evaluate_queue_reactive_intensity_q16(
+        Qty bid_vol, Qty ask_vol) const noexcept {
+        const std::uint32_t regime = SwarQueueReactiveRegimeLut::classify_regime(bid_vol, ask_vol);
+        const std::uint32_t add_w = SwarQueueReactiveRegimeLut::add_nibble(regime);
+        const std::uint32_t can_w = SwarQueueReactiveRegimeLut::cancel_nibble(regime);
+        const std::uint64_t base_mod = (mu_q16_ * (8ULL + add_w + can_w)) >> 4ULL;
+        return base_mod + excitation_q16_;
+    }
+
+    constexpr std::uint64_t decay_dt(std::uint64_t dt_scaled_q16) noexcept {
+        const std::uint64_t decay_q16 = eval_hawkes_q16_horner_decay(dt_scaled_q16);
+        excitation_q16_ = (excitation_q16_ * decay_q16 + 32768ULL) >> 16ULL;
+        return mu_q16_ + excitation_q16_; 
+    }
+    static constexpr double q16_to_double(std::uint64_t v_q16) noexcept {
+        return static_cast<double>(v_q16) / static_cast<double>(kQ16One);
+    }
+    constexpr std::uint64_t intensity_q16() const noexcept { return mu_q16_ + excitation_q16_; }
+    constexpr double intensity_double() const noexcept {
+        return static_cast<double>(intensity_q16()) / static_cast<double>(kQ16One);
+    }
+    constexpr std::uint64_t excitation_q16() const noexcept { return excitation_q16_; }
+    constexpr std::uint64_t event_count() const noexcept { return event_count_; }
+    constexpr TimeNs last_time_ns() const noexcept { return last_ts_ns_; }
+
+private:
+    std::uint64_t mu_q16_;
+    std::uint64_t alpha_q16_;
+    std::uint64_t beta_per_us_q16_;
+    std::uint64_t excitation_q16_;
+    TimeNs last_ts_ns_;
+    std::uint64_t event_count_;
 };
 
 } // namespace sim

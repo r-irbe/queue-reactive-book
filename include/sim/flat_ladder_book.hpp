@@ -2,6 +2,7 @@
 
 #include "lob.hpp"
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -32,6 +33,93 @@ struct IntrusiveLevel {
     Qty           volume      = 0;
 
     bool empty() const noexcept { return volume == 0; }
+};
+
+class LadderUndoLog;
+class ReversibleSubgameScope;
+
+enum class LadderDeltaKind : std::uint8_t {
+    InsertRest  = 0,
+    UnlinkNode  = 1,
+    PartialFill = 2
+};
+
+// Self-inverse F_2 XOR / compact delta record for O(1) zero-allocation
+// counterfactual rollout rollback (`old ^ delta ^ delta == old`).
+struct LadderDeltaEntry {
+    LadderDeltaKind kind         = LadderDeltaKind::InsertRest;
+    std::uint8_t    side_xor     = 0;
+    std::uint8_t    id_live_xor  = 0;
+    Side            order_side   = Side::Buy;
+    std::uint32_t   level_idx    = 0;
+    std::uint32_t   slot         = kNullSlot;
+    std::uint32_t   head_xor     = 0;
+    std::uint32_t   tail_xor     = 0;
+    std::uint32_t   live_xor     = 0;
+    std::uint32_t   vol_xor      = 0;
+    std::uint32_t   tot_vol_xor  = 0;
+    std::uint32_t   free_head_xor = 0;
+    std::uint32_t   prev_next_xor = 0;
+    std::uint32_t   next_prev_xor = 0;
+    std::uint64_t   l_bitmap_xor = 0ULL;
+    std::uint64_t   s_bitmap_xor = 0ULL;
+    OrderId         order_id     = 0;
+    OrderRef        saved_ref{};
+    IntrusiveOrderNode saved_node{};
+};
+
+// Fixed-capacity stack/arena-backed undo log for zero-allocation game-tree rollouts.
+class LadderUndoLog {
+public:
+    static constexpr std::size_t kDefaultCapacity = 4096U;
+
+    LadderUndoLog() noexcept = default;
+
+    void bind_external_buffer(LadderDeltaEntry* buf, std::size_t cap) noexcept {
+        ext_buf_ = buf;
+        ext_cap_ = cap;
+        count_ = 0U;
+        overflow_ = false;
+    }
+
+    void reset() noexcept {
+        count_ = 0U;
+        overflow_ = false;
+    }
+
+    bool push(const LadderDeltaEntry& entry) noexcept {
+        LadderDeltaEntry* storage = ext_buf_ ? ext_buf_ : inline_entries_.data();
+        const std::size_t cap = ext_buf_ ? ext_cap_ : kDefaultCapacity;
+        if (count_ >= cap) [[unlikely]] {
+            overflow_ = true;
+            return false;
+        }
+        storage[count_++] = entry;
+        return true;
+    }
+
+    const LadderDeltaEntry& pop() noexcept {
+        const LadderDeltaEntry* storage = ext_buf_ ? ext_buf_ : inline_entries_.data();
+        return storage[--count_];
+    }
+
+    std::size_t size() const noexcept { return count_; }
+    bool empty() const noexcept { return count_ == 0U; }
+    bool overflowed() const noexcept { return overflow_; }
+
+    std::size_t saved_best_bid_idx = std::numeric_limits<std::size_t>::max();
+    std::size_t saved_best_ask_idx = std::numeric_limits<std::size_t>::max();
+    std::size_t saved_live_order_count = 0;
+    std::uint64_t saved_event_count = 0;
+    OrderId saved_next_id = 1;
+    TimeNs saved_book_time = 0;
+
+private:
+    std::array<LadderDeltaEntry, kDefaultCapacity> inline_entries_{};
+    LadderDeltaEntry* ext_buf_ = nullptr;
+    std::size_t ext_cap_ = 0U;
+    std::size_t count_ = 0U;
+    bool overflow_ = false;
 };
 
 // Bounded tick-ladder order book backed by a pre-allocated PMR arena, a
@@ -103,7 +191,17 @@ public:
     InvariantReport check_invariants_report() const noexcept;
     void check_invariants() const noexcept;
 
+    // Zero-allocation counterfactual undo log attachment & exact state digest
+    void attach_undo_log(LadderUndoLog* log) noexcept;
+    void detach_undo_log() noexcept { active_undo_log_ = nullptr; }
+    LadderUndoLog* active_undo_log() const noexcept { return active_undo_log_; }
+    void rollback_undo_log(LadderUndoLog& log) noexcept;
+    std::uint64_t state_digest() const noexcept;
+    bool state_equals(const FlatLadderBook& other) const noexcept;
+
 private:
+    friend class ReversibleSubgameScope;
+
     std::pmr::monotonic_buffer_resource arena_;
     std::pmr::unsynchronized_pool_resource pool_;
 
@@ -128,6 +226,8 @@ private:
     OrderId next_id_ = 1;
     TimeNs book_time_ = 0;
     bool is_valid_ = true;
+
+    LadderUndoLog* active_undo_log_ = nullptr;
 
     std::pmr::memory_resource* resource() noexcept { return &pool_; }
     const std::pmr::memory_resource* resource() const noexcept { return &pool_; }
@@ -155,6 +255,7 @@ private:
     void free_slot(std::uint32_t slot) noexcept;
 
     void rest(Order& order);
+    void unlink_maker_node(std::size_t idx, std::uint32_t slot, Side maker_side) noexcept;
 
     bool can_fill_fok(Side side, Tick price, Qty qty, bool is_market,
                       AgentId taker_agent = 0,
@@ -170,6 +271,99 @@ private:
     void refresh_best_ask_from(std::size_t start) noexcept;
 
     StpMode default_stp_mode_ = StpMode::None;
+};
+
+// RAII reversible scope for zero-allocation counterfactual subgame rollouts
+// (`CFR+`, subgame resolving, best-response lookahead).
+class ReversibleSubgameScope {
+public:
+    explicit ReversibleSubgameScope(FlatLadderBook& book) noexcept
+        : book_(book), prev_log_(book.active_undo_log()) {
+        book_.attach_undo_log(&local_log_);
+    }
+
+    ReversibleSubgameScope(FlatLadderBook& book, LadderUndoLog& external_log) noexcept
+        : book_(book), ext_log_(&external_log), prev_log_(book.active_undo_log()) {
+        book_.attach_undo_log(ext_log_);
+    }
+
+    ~ReversibleSubgameScope() noexcept {
+        if (!committed_) {
+            rollback();
+        } else {
+            book_.active_undo_log_ = prev_log_;
+        }
+    }
+
+    ReversibleSubgameScope(const ReversibleSubgameScope&) = delete;
+    ReversibleSubgameScope& operator=(const ReversibleSubgameScope&) = delete;
+
+    MatchSummary add(Order order, TimeNs ts,
+                     Trade* trade_buf = nullptr,
+                     std::size_t trade_cap = 0,
+                     StpMode stp = StpMode::None) noexcept {
+        return book_.add_into(order, ts, trade_buf, trade_cap, stp);
+    }
+
+    bool cancel(OrderId id, TimeNs ts) noexcept {
+        return book_.cancel(id, ts);
+    }
+
+    MatchSummary execute(Side taker_side, Qty qty, TimeNs ts,
+                         AgentId agent = 0,
+                         Trade* trade_buf = nullptr,
+                         std::size_t trade_cap = 0,
+                         StpMode stp = StpMode::None) noexcept {
+        Order mkt{};
+        mkt.qty = qty;
+        mkt.orig_qty = qty;
+        mkt.agent = agent;
+        mkt.side = taker_side;
+        mkt.type = OrderType::Market;
+        mkt.stp = stp;
+        return book_.add_into(mkt, ts, trade_buf, trade_cap, stp);
+    }
+
+    void rollback() noexcept {
+        if (rolled_back_) return;
+        LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
+        book_.rollback_undo_log(*log);
+        book_.active_undo_log_ = prev_log_;
+        rolled_back_ = true;
+    }
+
+    // Re-arm the scope after a rollback so multiple branches can reuse the same scope.
+    void reset() noexcept {
+        if (!rolled_back_ && !committed_) {
+            rollback();
+        }
+        LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
+        book_.attach_undo_log(log);
+        rolled_back_ = false;
+        committed_ = false;
+    }
+
+    void commit() noexcept {
+        committed_ = true;
+    }
+
+    std::size_t delta_count() const noexcept {
+        const LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
+        return log->size();
+    }
+
+    bool overflowed() const noexcept {
+        const LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
+        return log->overflowed();
+    }
+
+private:
+    FlatLadderBook& book_;
+    LadderUndoLog local_log_{};
+    LadderUndoLog* ext_log_ = nullptr;
+    LadderUndoLog* prev_log_ = nullptr;
+    bool rolled_back_ = false;
+    bool committed_ = false;
 };
 
 } // namespace sim

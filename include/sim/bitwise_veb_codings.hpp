@@ -7,6 +7,8 @@
 #include <bit>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
+#include <new>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -241,6 +243,362 @@ private:
     std::uint64_t low_mask_ = 0;
     std::vector<std::uint64_t> lower_words_;
     std::vector<std::uint64_t> upper_words_;
+};
+
+inline constexpr std::uint32_t kVebNullTick = 0xFFFFFFFFU;
+
+// Verified 3-level radix-64 (or 6+6 bit) coordinate encode/decode helpers
+// ported from generated_verified_kernels.rs and Rules.BitwiseVebWarpCodec.
+constexpr std::uint32_t verified_veb3_4096_encode(std::uint32_t c1, std::uint32_t b0) noexcept {
+    return ((c1 & 63U) << 6U) | (b0 & 63U);
+}
+
+constexpr void verified_veb3_4096_decode(std::uint32_t tick, std::uint32_t& out_c1, std::uint32_t& out_b0) noexcept {
+    out_c1 = (tick >> 6U) & 63U;
+    out_b0 = tick & 63U;
+}
+
+constexpr std::uint32_t verified_veb4_16m_encode(std::uint32_t c3, std::uint32_t c2, std::uint32_t c1, std::uint32_t b0) noexcept {
+    return ((c3 & 63U) << 18U) | ((c2 & 63U) << 12U) | ((c1 & 63U) << 6U) | (b0 & 63U);
+}
+
+// 8. Bijective 16-Byte Reversible vEB Delta Token (F_2 XOR Rollback)
+struct ReversibleVebDelta {
+    std::uint8_t cluster_idx = 0;
+    std::uint64_t summary_xor_mask = 0ULL;
+    std::uint64_t cluster_xor_mask = 0ULL;
+};
+
+// 9. L1D-Resident 3-Level / 4,096-Tick Bitwise van Emde Boas Tree (584 Payload Bytes, alignas(64))
+struct alignas(64) BitwiseVeb4096 {
+    static constexpr std::uint32_t kUniverse = 4096U;
+    static constexpr std::uint32_t kNullTick = kVebNullTick;
+    static constexpr std::size_t kPayloadBytes = 584U;
+
+    union {
+        std::uint64_t root = 0ULL;
+        std::uint64_t summary;
+    };
+    union {
+        std::uint64_t l2[64] = {0ULL};
+        std::uint64_t l1[64];
+        std::uint64_t clusters[64];
+    };
+    std::uint64_t summary_writes = 0ULL;
+    std::uint64_t elided_summary_writes = 0ULL;
+    std::uint64_t l1_group_summary[5] = {0ULL, 0ULL, 0ULL, 0ULL, 0ULL};
+
+    constexpr BitwiseVeb4096() noexcept : root(0ULL), l2{0ULL} {}
+
+    constexpr void clear() noexcept {
+        root = 0ULL;
+        for (std::size_t i = 0; i < 64; ++i) l2[i] = 0ULL;
+        summary_writes = 0ULL;
+        elided_summary_writes = 0ULL;
+        for (std::size_t i = 0; i < 5; ++i) l1_group_summary[i] = 0ULL;
+    }
+
+    constexpr bool empty() const noexcept { return root == 0ULL; }
+
+    constexpr void insert(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return;
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        const std::uint64_t old_w = l2[c];
+        l2[c] = old_w | (1ULL << b);
+        if (old_w == 0ULL) {
+            root |= (1ULL << c);
+            ++summary_writes;
+        } else {
+            ++elided_summary_writes;
+        }
+    }
+
+    constexpr void remove(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return;
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        const std::uint64_t next_w = l2[c] & ~(1ULL << b);
+        l2[c] = next_w;
+        if (next_w == 0ULL) {
+            root &= ~(1ULL << c);
+            ++summary_writes;
+        } else {
+            ++elided_summary_writes;
+        }
+    }
+
+    constexpr bool contains(std::uint32_t tick) const noexcept {
+        if (tick >= kUniverse) return false;
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        return (l2[c] & (1ULL << b)) != 0ULL;
+    }
+
+    constexpr std::uint32_t min_tick() const noexcept {
+        if (root == 0ULL) return kNullTick;
+        const auto c = static_cast<std::uint32_t>(std::countr_zero(root));
+        const auto b = static_cast<std::uint32_t>(std::countr_zero(l2[c]));
+        return verified_veb3_4096_encode(c, b);
+    }
+
+    constexpr std::uint32_t max_tick() const noexcept {
+        if (root == 0ULL) return kNullTick;
+        const auto c = static_cast<std::uint32_t>(63 - std::countl_zero(root));
+        const auto b = static_cast<std::uint32_t>(63 - std::countl_zero(l2[c]));
+        return verified_veb3_4096_encode(c, b);
+    }
+
+    constexpr int find_min() const noexcept {
+        const std::uint32_t m = min_tick();
+        return (m == kNullTick) ? -1 : static_cast<int>(m);
+    }
+
+    constexpr int find_max() const noexcept {
+        const std::uint32_t m = max_tick();
+        return (m == kNullTick) ? -1 : static_cast<int>(m);
+    }
+
+    constexpr std::uint32_t next_higher(std::uint32_t tick) const noexcept {
+        if (tick >= kUniverse - 1U) return kNullTick;
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        if (b < 63U) {
+            const std::uint64_t local_rem = l2[c] & (~0ULL << (b + 1U));
+            if (local_rem != 0ULL) {
+                return verified_veb3_4096_encode(c, static_cast<std::uint32_t>(std::countr_zero(local_rem)));
+            }
+        }
+        if (c >= 63U) return kNullTick;
+        const std::uint64_t rem_summary = root & (~0ULL << (c + 1U));
+        if (rem_summary == 0ULL) return kNullTick;
+        const auto next_c = static_cast<std::uint32_t>(std::countr_zero(rem_summary));
+        const auto next_b = static_cast<std::uint32_t>(std::countr_zero(l2[next_c]));
+        return verified_veb3_4096_encode(next_c, next_b);
+    }
+
+    constexpr std::uint32_t prev_lower(std::uint32_t tick) const noexcept {
+        if (tick == 0U) return kNullTick;
+        if (tick >= kUniverse) return max_tick();
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        if (b > 0U) {
+            const std::uint64_t local_rem = l2[c] & (~0ULL >> (64U - b));
+            if (local_rem != 0ULL) {
+                return verified_veb3_4096_encode(c, static_cast<std::uint32_t>(63 - std::countl_zero(local_rem)));
+            }
+        }
+        if (c == 0U) return kNullTick;
+        const std::uint64_t rem_summary = root & (~0ULL >> (64U - c));
+        if (rem_summary == 0ULL) return kNullTick;
+        const auto prev_c = static_cast<std::uint32_t>(63 - std::countl_zero(rem_summary));
+        const auto prev_b = static_cast<std::uint32_t>(63 - std::countl_zero(l2[prev_c]));
+        return verified_veb3_4096_encode(prev_c, prev_b);
+    }
+
+    constexpr int find_next(std::uint32_t tick) const noexcept {
+        const std::uint32_t n = next_higher(tick);
+        return (n == kNullTick) ? -1 : static_cast<int>(n);
+    }
+
+    constexpr int find_prev(std::uint32_t tick) const noexcept {
+        const std::uint32_t p = prev_lower(tick);
+        return (p == kNullTick) ? -1 : static_cast<int>(p);
+    }
+
+    constexpr ReversibleVebDelta insert_reversible(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return {};
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        const std::uint64_t old_cluster = l2[c];
+        const std::uint64_t new_cluster = old_cluster | (1ULL << b);
+        l2[c] = new_cluster;
+        const std::uint64_t cluster_xor_mask = old_cluster ^ new_cluster;
+        std::uint64_t summary_xor_mask = 0ULL;
+        if (old_cluster == 0ULL && new_cluster != 0ULL) {
+            summary_xor_mask = (1ULL << c);
+            root ^= summary_xor_mask;
+        }
+        return ReversibleVebDelta{static_cast<std::uint8_t>(c), summary_xor_mask, cluster_xor_mask};
+    }
+
+    constexpr ReversibleVebDelta remove_reversible(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return {};
+        std::uint32_t c = 0U, b = 0U;
+        verified_veb3_4096_decode(tick, c, b);
+        const std::uint64_t old_cluster = l2[c];
+        const std::uint64_t new_cluster = old_cluster & ~(1ULL << b);
+        l2[c] = new_cluster;
+        const std::uint64_t cluster_xor_mask = old_cluster ^ new_cluster;
+        std::uint64_t summary_xor_mask = 0ULL;
+        if (old_cluster != 0ULL && new_cluster == 0ULL) {
+            summary_xor_mask = (1ULL << c);
+            root ^= summary_xor_mask;
+        }
+        return ReversibleVebDelta{static_cast<std::uint8_t>(c), summary_xor_mask, cluster_xor_mask};
+    }
+
+    constexpr void rollback_delta(const ReversibleVebDelta& delta) noexcept {
+        l2[delta.cluster_idx & 63U] ^= delta.cluster_xor_mask;
+        root ^= delta.summary_xor_mask;
+    }
+
+    constexpr std::uint32_t intersect_and_count(const BitwiseVeb4096& other, BitwiseVeb4096& out) const noexcept {
+        out.clear();
+        std::uint64_t cand = root & other.root;
+        std::uint64_t act = 0ULL;
+        std::uint32_t count = 0U;
+        while (cand != 0ULL) {
+            const auto c = static_cast<std::uint32_t>(std::countr_zero(cand));
+            const std::uint64_t w = l2[c] & other.l2[c];
+            if (w != 0ULL) {
+                out.l2[c] = w;
+                act |= (1ULL << c);
+                count += static_cast<std::uint32_t>(std::popcount(w));
+            }
+            cand &= (cand - 1ULL);
+        }
+        out.root = act;
+        return count;
+    }
+};
+
+static_assert(alignof(BitwiseVeb4096) == 64, "BitwiseVeb4096 must be 64-byte cache-line aligned");
+static_assert(sizeof(BitwiseVeb4096) == 576, "BitwiseVeb4096 must be 576 bytes (9 cache lines)");
+
+// 10. 4-Level Hybrid Sparse Bitwise van Emde Boas Tree (U = 64^4 = 16,777,216)
+class SparseBitwiseVeb16M {
+public:
+    static constexpr std::uint32_t kUniverse = 16777216U;
+    static constexpr std::uint32_t kNullTick = kVebNullTick;
+
+    SparseBitwiseVeb16M() noexcept = default;
+
+    std::size_t allocated_pages() const noexcept { return allocated_pages_; }
+
+    std::size_t active_footprint_bytes() const noexcept {
+        return sizeof(BitwiseVeb4096) * (1U + allocated_pages_);
+    }
+
+    bool empty() const noexcept { return top_.empty(); }
+
+    void clear() noexcept {
+        top_.clear();
+        for (auto& page : pages_) page.reset();
+        allocated_pages_ = 0U;
+    }
+
+    void insert(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return;
+        const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
+        const std::uint32_t low12 = tick & 0xFFFU;
+        if (!pages_[page_idx]) {
+            pages_[page_idx].reset(new (std::nothrow) BitwiseVeb4096());
+            if (!pages_[page_idx]) return;
+            ++allocated_pages_;
+        }
+        const bool was_empty = pages_[page_idx]->empty();
+        pages_[page_idx]->insert(low12);
+        if (was_empty) top_.insert(page_idx);
+    }
+
+    void remove(std::uint32_t tick) noexcept {
+        if (tick >= kUniverse) return;
+        const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
+        const std::uint32_t low12 = tick & 0xFFFU;
+        auto* page = pages_[page_idx].get();
+        if (!page) return;
+        page->remove(low12);
+        if (page->empty()) top_.remove(page_idx);
+    }
+
+    bool contains(std::uint32_t tick) const noexcept {
+        if (tick >= kUniverse) return false;
+        const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
+        const std::uint32_t low12 = tick & 0xFFFU;
+        const auto* page = pages_[page_idx].get();
+        return page != nullptr && page->contains(low12);
+    }
+
+    std::uint32_t min_tick() const noexcept {
+        const std::uint32_t min_page = top_.min_tick();
+        if (min_page == kNullTick) return kNullTick;
+        const auto* page = pages_[min_page].get();
+        if (!page) return kNullTick;
+        const std::uint32_t min_low = page->min_tick();
+        if (min_low == kNullTick) return kNullTick;
+        return (min_page << 12U) | min_low;
+    }
+
+    std::uint32_t max_tick() const noexcept {
+        const std::uint32_t max_page = top_.max_tick();
+        if (max_page == kNullTick) return kNullTick;
+        const auto* page = pages_[max_page].get();
+        if (!page) return kNullTick;
+        const std::uint32_t max_low = page->max_tick();
+        if (max_low == kNullTick) return kNullTick;
+        return (max_page << 12U) | max_low;
+    }
+
+    int find_min() const noexcept {
+        const std::uint32_t m = min_tick();
+        return (m == kNullTick) ? -1 : static_cast<int>(m);
+    }
+
+    int find_max() const noexcept {
+        const std::uint32_t m = max_tick();
+        return (m == kNullTick) ? -1 : static_cast<int>(m);
+    }
+
+    std::uint32_t next_higher(std::uint32_t tick) const noexcept {
+        if (tick >= kUniverse - 1U) return kNullTick;
+        const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
+        const std::uint32_t low12 = tick & 0xFFFU;
+        if (const auto* page = pages_[page_idx].get()) {
+            const std::uint32_t b = page->next_higher(low12);
+            if (b != kNullTick) return (page_idx << 12U) | b;
+        }
+        const std::uint32_t next_page = top_.next_higher(page_idx);
+        if (next_page == kNullTick) return kNullTick;
+        const auto* np = pages_[next_page].get();
+        if (!np) return kNullTick;
+        const std::uint32_t next_low = np->min_tick();
+        if (next_low == kNullTick) return kNullTick;
+        return (next_page << 12U) | next_low;
+    }
+
+    std::uint32_t prev_lower(std::uint32_t tick) const noexcept {
+        if (tick == 0U) return kNullTick;
+        if (tick >= kUniverse) return max_tick();
+        const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
+        const std::uint32_t low12 = tick & 0xFFFU;
+        if (const auto* page = pages_[page_idx].get()) {
+            const std::uint32_t b = page->prev_lower(low12);
+            if (b != kNullTick) return (page_idx << 12U) | b;
+        }
+        const std::uint32_t prev_page = top_.prev_lower(page_idx);
+        if (prev_page == kNullTick) return kNullTick;
+        const auto* pp = pages_[prev_page].get();
+        if (!pp) return kNullTick;
+        const std::uint32_t prev_low = pp->max_tick();
+        if (prev_low == kNullTick) return kNullTick;
+        return (prev_page << 12U) | prev_low;
+    }
+
+    int find_next(std::uint32_t tick) const noexcept {
+        const std::uint32_t n = next_higher(tick);
+        return (n == kNullTick) ? -1 : static_cast<int>(n);
+    }
+
+    int find_prev(std::uint32_t tick) const noexcept {
+        const std::uint32_t p = prev_lower(tick);
+        return (p == kNullTick) ? -1 : static_cast<int>(p);
+    }
+
+private:
+    BitwiseVeb4096 top_{};
+    std::array<std::unique_ptr<BitwiseVeb4096>, 4096> pages_{};
+    std::size_t allocated_pages_ = 0U;
 };
 
 } // namespace sim

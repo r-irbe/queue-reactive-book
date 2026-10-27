@@ -1,5 +1,6 @@
 #include "sim/flat_ladder_book.hpp"
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 
@@ -14,6 +15,12 @@ constexpr std::size_t compute_tick_span(Tick min_tick, Tick max_tick) noexcept {
   return static_cast<std::size_t>(static_cast<std::int64_t>(max_tick) -
                                   static_cast<std::int64_t>(min_tick) + 1);
 }
+
+inline std::uint64_t fnv1a_mix64(std::uint64_t h, std::uint64_t v) noexcept {
+  h ^= v;
+  h *= 0x100000001B3ULL;
+  return h;
+}
 } // namespace
 
 FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
@@ -23,7 +30,8 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
                                std::size_t arena_bytes) noexcept
     : arena_(arena_bytes == 0
                  ? suggest_arena_bytes(expected_orders +
-                                       compute_tick_span(min_tick, max_tick))
+                                       compute_tick_span(min_tick, max_tick) +
+                                       16384)
                  : arena_bytes,
              std::pmr::new_delete_resource()),
       pool_(&arena_), levels_(resource()), node_pool_(resource()),
@@ -41,9 +49,10 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
   level_bitmap_.assign(num_level_words, 0);
   summary_bitmap_.assign((num_level_words + 63) / 64, 0);
 
-  node_pool_.reserve(expected_orders);
-  id_refs_.resize(expected_orders + 1);
-  id_live_.assign(expected_orders + 1, 0);
+  const std::size_t prealloc_orders = std::max<std::size_t>(expected_orders + 4096, 8192);
+  node_pool_.reserve(prealloc_orders);
+  id_refs_.resize(prealloc_orders + 1);
+  id_live_.assign(prealloc_orders + 1, 0);
 }
 
 std::unique_ptr<FlatLadderBook> FlatLadderBook::create(Tick min_tick,
@@ -174,7 +183,7 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty,
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
       if (w != 0) {
-        found = (word << 6) + static_cast<std::size_t>(__builtin_ctzll(w));
+        found = (word << 6) + static_cast<std::size_t>(std::countr_zero(w));
         if (found >= tick_count_) found = kNpos;
       } else {
         const std::size_t nw = word + 1;
@@ -187,10 +196,10 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty,
             if (s == sw) s_val &= s_mask;
             if (s_val != 0) {
               const std::size_t tw =
-                  (s << 6) + static_cast<std::size_t>(__builtin_ctzll(s_val));
+                  (s << 6) + static_cast<std::size_t>(std::countr_zero(s_val));
               if (tw < level_bitmap_.size()) {
                 found = (tw << 6) +
-                        static_cast<std::size_t>(__builtin_ctzll(level_bitmap_[tw]));
+                        static_cast<std::size_t>(std::countr_zero(level_bitmap_[tw]));
                 if (found >= tick_count_) found = kNpos;
                 break;
               }
@@ -215,7 +224,7 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty,
       std::uint64_t w = level_bitmap_[word] & mask;
       std::size_t found = kNpos;
       if (w != 0) {
-        found = (word << 6) + static_cast<std::size_t>(63 - __builtin_clzll(w));
+        found = (word << 6) + static_cast<std::size_t>(63 - std::countl_zero(w));
       } else if (word > 0) {
         const std::size_t pw_idx = word - 1;
         const std::size_t sw = pw_idx >> 6;
@@ -227,10 +236,10 @@ bool FlatLadderBook::can_fill_fok(Side side, Tick price, Qty qty,
           if (s_val != 0) {
             const std::size_t tw =
                 (static_cast<std::size_t>(s) << 6) +
-                static_cast<std::size_t>(63 - __builtin_clzll(s_val));
+                static_cast<std::size_t>(63 - std::countl_zero(s_val));
             if (tw < level_bitmap_.size()) {
               found = (tw << 6) +
-                      static_cast<std::size_t>(63 - __builtin_clzll(level_bitmap_[tw]));
+                      static_cast<std::size_t>(63 - std::countl_zero(level_bitmap_[tw]));
               break;
             }
           }
@@ -407,11 +416,89 @@ MatchSummary FlatLadderBook::add_into(Order order, TimeNs ts, Trade *trade_buf,
   return summary;
 }
 
+void FlatLadderBook::unlink_maker_node(std::size_t level_idx, std::uint32_t slot, Side maker_side) noexcept {
+  IntrusiveLevel &level = level_at(level_idx);
+  IntrusiveOrderNode &node = node_pool_[slot];
+  const OrderId id = node.id;
+  const Qty removed_qty = node.qty;
+  const std::size_t side_idx = static_cast<std::size_t>(maker_side) & 1U;
+
+  const std::uint32_t old_head = level.head_slot;
+  const std::uint32_t old_tail = level.tail_slot;
+  const std::uint32_t old_live = level.live_orders;
+  const std::uint32_t old_vol = static_cast<std::uint32_t>(level.volume);
+  const std::uint32_t old_tot = static_cast<std::uint32_t>(total_vol_[side_idx]);
+  const std::uint8_t old_side = level_side_[level_idx];
+  const std::uint32_t old_free = free_head_;
+  const std::uint64_t old_l_bm = level_bitmap_[level_idx >> 6];
+  const std::uint64_t old_s_bm = summary_bitmap_[level_idx >> 12];
+  const std::size_t id_idx = static_cast<std::size_t>(id);
+  const std::uint8_t old_id_live = (id_idx < id_live_.size()) ? id_live_[id_idx] : 0U;
+  const OrderRef old_ref = (id_idx < id_refs_.size()) ? id_refs_[id_idx] : OrderRef{};
+  const IntrusiveOrderNode saved_node = node;
+  const std::uint32_t prev_s = node.prev_slot;
+  const std::uint32_t next_s = node.next_slot;
+  const std::uint32_t old_prev_next = (prev_s != kNullSlot) ? node_pool_[prev_s].next_slot : 0U;
+  const std::uint32_t old_next_prev = (next_s != kNullSlot) ? node_pool_[next_s].prev_slot : 0U;
+
+  clear_order_ref(id);
+  level.volume -= removed_qty;
+  total_vol_[side_idx] -= removed_qty;
+  --level.live_orders;
+
+  if (prev_s != kNullSlot) {
+    node_pool_[prev_s].next_slot = next_s;
+  } else {
+    level.head_slot = next_s;
+  }
+
+  if (next_s != kNullSlot) {
+    node_pool_[next_s].prev_slot = prev_s;
+  } else {
+    level.tail_slot = prev_s;
+  }
+
+  free_slot(slot);
+
+  if (level.volume == 0) {
+    level.head_slot = kNullSlot;
+    level.tail_slot = kNullSlot;
+    level_side_[level_idx] = kNoSide;
+    clear_level_occupied(level_idx);
+  }
+
+  if (active_undo_log_ != nullptr) [[unlikely]] {
+    LadderDeltaEntry d{};
+    d.kind = LadderDeltaKind::UnlinkNode;
+    d.order_side = maker_side;
+    d.level_idx = static_cast<std::uint32_t>(level_idx);
+    d.slot = slot;
+    d.order_id = id;
+    d.saved_ref = old_ref;
+    d.saved_node = saved_node;
+    d.side_xor = static_cast<std::uint8_t>(old_side ^ level_side_[level_idx]);
+    d.id_live_xor = static_cast<std::uint8_t>(old_id_live ^ ((id_idx < id_live_.size()) ? id_live_[id_idx] : 0U));
+    d.head_xor = old_head ^ level.head_slot;
+    d.tail_xor = old_tail ^ level.tail_slot;
+    d.live_xor = old_live ^ level.live_orders;
+    d.vol_xor = old_vol ^ static_cast<std::uint32_t>(level.volume);
+    d.tot_vol_xor = old_tot ^ static_cast<std::uint32_t>(total_vol_[side_idx]);
+    d.free_head_xor = old_free ^ free_head_;
+    d.prev_next_xor = (prev_s != kNullSlot) ? (old_prev_next ^ node_pool_[prev_s].next_slot) : 0U;
+    d.next_prev_xor = (next_s != kNullSlot) ? (old_next_prev ^ node_pool_[next_s].prev_slot) : 0U;
+    d.l_bitmap_xor = old_l_bm ^ level_bitmap_[level_idx >> 6];
+    d.s_bitmap_xor = old_s_bm ^ summary_bitmap_[level_idx >> 12];
+    active_undo_log_->push(d);
+  }
+}
+
 template <Side TakerSide, bool IsLimit, typename TradeSink>
 [[gnu::hot]]
 void FlatLadderBook::match_incoming(Order &incoming, TradeSink &&on_trade,
                                     Tick limit_price, TimeNs ts, StpMode stp) {
   constexpr bool kBuy = (TakerSide == Side::Buy);
+  constexpr Side kMakerSide = kBuy ? Side::Sell : Side::Buy;
+  constexpr std::size_t kOppositeSide = kBuy ? 1U : 0U;
 
   while (incoming.qty > 0) {
     const std::size_t idx = kBuy ? best_ask_idx_ : best_bid_idx_;
@@ -434,43 +521,34 @@ void FlatLadderBook::match_incoming(Order &incoming, TradeSink &&on_trade,
 
       if (incoming.agent == maker.agent && stp != StpMode::None) {
         if (stp == StpMode::CancelPassive) {
-          const Qty c_qty = maker.qty;
-          level.volume -= c_qty;
-          constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
-          total_vol_[kOppositeSide] -= c_qty;
-
-          clear_order_ref(maker.id);
-          --level.live_orders;
-
-          level.head_slot = maker.next_slot;
-          if (level.head_slot != kNullSlot) {
-            node_pool_[level.head_slot].prev_slot = kNullSlot;
-          } else {
-            level.tail_slot = kNullSlot;
-          }
-          free_slot(slot);
+          unlink_maker_node(idx, slot, kMakerSide);
           continue;
         } else if (stp == StpMode::CancelAggressive) {
           incoming.qty = 0;
           break;
         } else if (stp == StpMode::DecrementAndCancel) {
           const Qty dec = std::min(incoming.qty, maker.qty);
-          maker.qty -= dec;
-          level.volume -= dec;
           incoming.qty -= dec;
-          constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
-          total_vol_[kOppositeSide] -= dec;
-
-          if (maker.qty == 0) {
-            clear_order_ref(maker.id);
-            --level.live_orders;
-            level.head_slot = maker.next_slot;
-            if (level.head_slot != kNullSlot) {
-              node_pool_[level.head_slot].prev_slot = kNullSlot;
-            } else {
-              level.tail_slot = kNullSlot;
+          if (dec == maker.qty) {
+            unlink_maker_node(idx, slot, kMakerSide);
+          } else {
+            const std::uint32_t old_vol = static_cast<std::uint32_t>(level.volume);
+            const std::uint32_t old_tot = static_cast<std::uint32_t>(total_vol_[kOppositeSide]);
+            const std::uint32_t old_node_qty = static_cast<std::uint32_t>(maker.qty);
+            maker.qty -= dec;
+            level.volume -= dec;
+            total_vol_[kOppositeSide] -= dec;
+            if (active_undo_log_ != nullptr) [[unlikely]] {
+              LadderDeltaEntry d{};
+              d.kind = LadderDeltaKind::PartialFill;
+              d.order_side = kMakerSide;
+              d.level_idx = static_cast<std::uint32_t>(idx);
+              d.slot = slot;
+              d.vol_xor = old_vol ^ static_cast<std::uint32_t>(level.volume);
+              d.tot_vol_xor = old_tot ^ static_cast<std::uint32_t>(total_vol_[kOppositeSide]);
+              d.live_xor = old_node_qty ^ static_cast<std::uint32_t>(maker.qty);
+              active_undo_log_->push(d);
             }
-            free_slot(slot);
           }
           if (incoming.qty == 0) break;
           continue;
@@ -487,30 +565,31 @@ void FlatLadderBook::match_incoming(Order &incoming, TradeSink &&on_trade,
                      .qty        = fill,
                      .ts         = ts});
 
-      maker.qty -= fill;
-      level.volume -= fill;
       incoming.qty -= fill;
-      constexpr std::uint8_t kOppositeSide = kBuy ? 1 : 0;
-      total_vol_[kOppositeSide] -= fill;
-
-      if (maker.qty == 0) {
-        clear_order_ref(maker.id);
-        --level.live_orders;
-        level.head_slot = maker.next_slot;
-        if (level.head_slot != kNullSlot) {
-          node_pool_[level.head_slot].prev_slot = kNullSlot;
-        } else {
-          level.tail_slot = kNullSlot;
+      if (fill == maker.qty) {
+        unlink_maker_node(idx, slot, kMakerSide);
+      } else {
+        const std::uint32_t old_vol = static_cast<std::uint32_t>(level.volume);
+        const std::uint32_t old_tot = static_cast<std::uint32_t>(total_vol_[kOppositeSide]);
+        const std::uint32_t old_node_qty = static_cast<std::uint32_t>(maker.qty);
+        maker.qty -= fill;
+        level.volume -= fill;
+        total_vol_[kOppositeSide] -= fill;
+        if (active_undo_log_ != nullptr) [[unlikely]] {
+          LadderDeltaEntry d{};
+          d.kind = LadderDeltaKind::PartialFill;
+          d.order_side = kMakerSide;
+          d.level_idx = static_cast<std::uint32_t>(idx);
+          d.slot = slot;
+          d.vol_xor = old_vol ^ static_cast<std::uint32_t>(level.volume);
+          d.tot_vol_xor = old_tot ^ static_cast<std::uint32_t>(total_vol_[kOppositeSide]);
+          d.live_xor = old_node_qty ^ static_cast<std::uint32_t>(maker.qty);
+          active_undo_log_->push(d);
         }
-        free_slot(slot);
       }
     }
 
     if (level.volume == 0) {
-      level.head_slot = kNullSlot;
-      level.tail_slot = kNullSlot;
-      level_side_[idx] = kNoSide;
-      clear_level_occupied(idx);
       if constexpr (kBuy) {
         refresh_best_ask_from(idx + 1);
       } else {
@@ -524,6 +603,22 @@ void FlatLadderBook::rest(Order &order) {
   order.enqueue_ts = book_time_;
   const std::size_t idx = index_of(order.price);
   IntrusiveLevel &level = level_at(idx);
+  const std::size_t side_idx = static_cast<std::size_t>(order.side) & 1U;
+
+  const std::uint32_t old_head = level.head_slot;
+  const std::uint32_t old_tail = level.tail_slot;
+  const std::uint32_t old_live = level.live_orders;
+  const std::uint32_t old_vol = static_cast<std::uint32_t>(level.volume);
+  const std::uint32_t old_tot = static_cast<std::uint32_t>(total_vol_[side_idx]);
+  const std::uint8_t old_side = level_side_[idx];
+  const std::uint64_t old_l_bm = level_bitmap_[idx >> 6];
+  const std::uint64_t old_s_bm = summary_bitmap_[idx >> 12];
+  const std::uint32_t prev_tail = level.tail_slot;
+  const std::uint32_t old_prev_next = (prev_tail != kNullSlot) ? node_pool_[prev_tail].next_slot : 0U;
+
+  const bool reused_from_free = (free_head_ != kNullSlot);
+  const std::uint32_t old_free = free_head_;
+  const IntrusiveOrderNode saved_free_node = reused_from_free ? node_pool_[free_head_] : IntrusiveOrderNode{};
 
   const std::uint32_t slot = alloc_slot();
   IntrusiveOrderNode &node = node_pool_[slot];
@@ -531,11 +626,11 @@ void FlatLadderBook::rest(Order &order) {
   node.enqueue_ts = order.enqueue_ts;
   node.qty = order.qty;
   node.agent = order.agent;
-  node.prev_slot = level.tail_slot;
+  node.prev_slot = prev_tail;
   node.next_slot = kNullSlot;
 
-  if (level.tail_slot != kNullSlot) {
-    node_pool_[level.tail_slot].next_slot = slot;
+  if (prev_tail != kNullSlot) {
+    node_pool_[prev_tail].next_slot = slot;
   } else {
     level.head_slot = slot;
   }
@@ -546,15 +641,44 @@ void FlatLadderBook::rest(Order &order) {
   level_side_[idx] = side_tag(order.side);
   mark_level_occupied(idx);
 
+  const std::size_t id_idx = static_cast<std::size_t>(order.id);
+  const std::uint8_t old_id_live = (id_idx < id_live_.size()) ? id_live_[id_idx] : 0U;
+  const OrderRef old_ref = (id_idx < id_refs_.size()) ? id_refs_[id_idx] : OrderRef{};
+
   set_order_ref(order.id, {order.side, 0, static_cast<std::uint32_t>(idx), slot});
 
-  total_vol_[static_cast<std::uint8_t>(order.side) & 1] += order.qty;
+  total_vol_[side_idx] += order.qty;
   if (is_buy(order.side)) {
     if (best_bid_idx_ == kNpos || idx > best_bid_idx_)
       best_bid_idx_ = idx;
   } else {
     if (best_ask_idx_ == kNpos || idx < best_ask_idx_)
       best_ask_idx_ = idx;
+  }
+
+  if (active_undo_log_ != nullptr) [[unlikely]] {
+    LadderDeltaEntry d{};
+    d.kind = LadderDeltaKind::InsertRest;
+    d.order_side = order.side;
+    d.level_idx = static_cast<std::uint32_t>(idx);
+    d.slot = slot;
+    d.order_id = order.id;
+    d.saved_ref = old_ref;
+    d.saved_node = saved_free_node;
+    d.saved_node.prev_slot = prev_tail;
+    d.saved_node.agent = reused_from_free ? 1U : 0U;
+    d.side_xor = static_cast<std::uint8_t>(old_side ^ level_side_[idx]);
+    d.id_live_xor = static_cast<std::uint8_t>(old_id_live ^ id_live_[id_idx]);
+    d.head_xor = old_head ^ level.head_slot;
+    d.tail_xor = old_tail ^ level.tail_slot;
+    d.live_xor = old_live ^ level.live_orders;
+    d.vol_xor = old_vol ^ static_cast<std::uint32_t>(level.volume);
+    d.tot_vol_xor = old_tot ^ static_cast<std::uint32_t>(total_vol_[side_idx]);
+    d.free_head_xor = old_free ^ free_head_;
+    d.prev_next_xor = (prev_tail != kNullSlot) ? (old_prev_next ^ node_pool_[prev_tail].next_slot) : 0U;
+    d.l_bitmap_xor = old_l_bm ^ level_bitmap_[idx >> 6];
+    d.s_bitmap_xor = old_s_bm ^ summary_bitmap_[idx >> 12];
+    active_undo_log_->push(d);
   }
 }
 
@@ -564,37 +688,12 @@ bool FlatLadderBook::cancel(OrderId id, TimeNs ts) noexcept {
     return false;
 
   const OrderRef ref = get_order_ref(id);
-  clear_order_ref(id);
-
   const std::size_t level_idx = ref.level_idx;
   const std::uint32_t slot = ref.slot;
-  IntrusiveLevel &level = level_at(level_idx);
-  IntrusiveOrderNode &node = node_pool_[slot];
+  unlink_maker_node(level_idx, slot, ref.side);
 
-  const Qty cancelled_qty = node.qty;
-  level.volume -= cancelled_qty;
-  total_vol_[static_cast<std::uint8_t>(ref.side) & 1] -= cancelled_qty;
-  --level.live_orders;
-
-  if (node.prev_slot != kNullSlot) {
-    node_pool_[node.prev_slot].next_slot = node.next_slot;
-  } else {
-    level.head_slot = node.next_slot;
-  }
-
-  if (node.next_slot != kNullSlot) {
-    node_pool_[node.next_slot].prev_slot = node.prev_slot;
-  } else {
-    level.tail_slot = node.prev_slot;
-  }
-
-  free_slot(slot);
-
+  const IntrusiveLevel &level = level_at(level_idx);
   if (level.volume == 0) {
-    level.head_slot = kNullSlot;
-    level.tail_slot = kNullSlot;
-    level_side_[level_idx] = kNoSide;
-    clear_level_occupied(level_idx);
     if (is_buy(ref.side) && best_bid_idx_ == level_idx)
       refresh_best_bid_from(level_idx == 0 ? kNpos : level_idx - 1);
     if (is_sell(ref.side) && best_ask_idx_ == level_idx)
@@ -674,26 +773,100 @@ bool FlatLadderBook::mid_price(double &price) const noexcept {
 
 std::vector<BookLevelView> FlatLadderBook::levels(Side side, std::size_t depth) const {
   std::vector<BookLevelView> out;
+  if (!is_valid_ || tick_count_ == 0) {
+    return out;
+  }
+  if (depth > 0) {
+    out.reserve(std::min<std::size_t>(depth, 64));
+  }
+
   if (side == Side::Buy) {
+    if (best_bid_idx_ == kNpos) return out;
     const std::uint8_t tag = kBuySide;
-    for (std::size_t i = best_bid_idx_; i != kNpos;) {
-      const IntrusiveLevel &level = level_at(i);
-      if (!level.empty() && level_side_[i] == tag)
-        out.push_back({price_of(i), level.volume, level.live_orders});
-      if (depth > 0 && out.size() >= depth)
-        break;
-      if (i == 0)
-        break;
-      --i;
+    const std::size_t clamped = std::min(best_bid_idx_, tick_count_ - 1);
+    std::size_t word = clamped >> 6;
+    const std::size_t bit_in_word = clamped & 63;
+    std::uint64_t w = level_bitmap_[word] & ((~std::uint64_t{0}) >> (63 - bit_in_word));
+
+    while (true) {
+      while (w != 0) {
+        const int hi = 63 - std::countl_zero(w);
+        const std::size_t idx = (word << 6) + static_cast<std::size_t>(hi);
+        w &= ~(std::uint64_t{1} << hi);
+        const IntrusiveLevel &level = level_at(idx);
+        if (!level.empty() && level_side_[idx] == tag) {
+          out.push_back({price_of(idx), level.volume, level.live_orders});
+          if (depth > 0 && out.size() >= depth) {
+            return out;
+          }
+        }
+      }
+      if (word == 0) break;
+      const std::size_t target_word = word - 1;
+      const std::size_t s_word = target_word >> 6;
+      const std::size_t s_bit = target_word & 63;
+      const std::uint64_t s_head_mask = (~std::uint64_t{0}) >> (63 - s_bit);
+      std::size_t next_nonempty_word = kNpos;
+      for (std::int64_t sw = static_cast<std::int64_t>(s_word); sw >= 0; --sw) {
+        std::uint64_t sw_val = summary_bitmap_[static_cast<std::size_t>(sw)];
+        if (static_cast<std::size_t>(sw) == s_word) {
+          sw_val &= s_head_mask;
+        }
+        if (sw_val != 0) {
+          const int hi_w = 63 - std::countl_zero(sw_val);
+          next_nonempty_word = (static_cast<std::size_t>(sw) << 6) + static_cast<std::size_t>(hi_w);
+          break;
+        }
+      }
+      if (next_nonempty_word == kNpos) break;
+      word = next_nonempty_word;
+      w = level_bitmap_[word];
     }
   } else {
+    if (best_ask_idx_ == kNpos || best_ask_idx_ >= tick_count_) return out;
     const std::uint8_t tag = kSellSide;
-    for (std::size_t i = best_ask_idx_; i != kNpos && i < tick_count_; ++i) {
-      const IntrusiveLevel &level = level_at(i);
-      if (!level.empty() && level_side_[i] == tag)
-        out.push_back({price_of(i), level.volume, level.live_orders});
-      if (depth > 0 && out.size() >= depth)
-        break;
+    std::size_t word = best_ask_idx_ >> 6;
+    const std::size_t bit_in_word = best_ask_idx_ & 63;
+    std::uint64_t w = level_bitmap_[word] & ((~std::uint64_t{0}) << bit_in_word);
+    const std::size_t num_s_words = summary_bitmap_.size();
+
+    while (true) {
+      while (w != 0) {
+        const int lo = std::countr_zero(w);
+        const std::size_t idx = (word << 6) + static_cast<std::size_t>(lo);
+        if (idx >= tick_count_) return out;
+        w &= (w - 1ULL);
+        const IntrusiveLevel &level = level_at(idx);
+        if (!level.empty() && level_side_[idx] == tag) {
+          out.push_back({price_of(idx), level.volume, level.live_orders});
+          if (depth > 0 && out.size() >= depth) {
+            return out;
+          }
+        }
+      }
+      const std::size_t next_word = word + 1;
+      if (next_word >= level_bitmap_.size()) break;
+      const std::size_t s_word = next_word >> 6;
+      const std::size_t s_bit = next_word & 63;
+      const std::uint64_t s_tail_mask = (~std::uint64_t{0}) << s_bit;
+      std::size_t next_nonempty_word = kNpos;
+      for (std::size_t sw = s_word; sw < num_s_words; ++sw) {
+        std::uint64_t sw_val = summary_bitmap_[sw];
+        if (sw == s_word) {
+          sw_val &= s_tail_mask;
+        }
+        if (sw_val != 0) {
+          const int lo_w = std::countr_zero(sw_val);
+          const std::size_t candidate = (sw << 6) + static_cast<std::size_t>(lo_w);
+          if (candidate < level_bitmap_.size()) {
+            next_nonempty_word = candidate;
+          }
+          break;
+        }
+      }
+      if (next_nonempty_word == kNpos) break;
+      word = next_nonempty_word;
+      w = level_bitmap_[word];
     }
   }
   return out;
@@ -789,7 +962,7 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
   const std::uint64_t head_mask = (~std::uint64_t{0}) >> (63 - bit_in_word);
   std::uint64_t w = level_bitmap_[word] & head_mask;
   if (w != 0) {
-    const int hi = 63 - __builtin_clzll(w);
+    const int hi = 63 - std::countl_zero(w);
     best_bid_idx_ = (word << 6) + static_cast<std::size_t>(hi);
     return;
   }
@@ -809,10 +982,10 @@ void FlatLadderBook::refresh_best_bid_from(std::size_t start) noexcept {
       sw_val &= s_head_mask;
     }
     if (sw_val != 0) {
-      const int hi_w = 63 - __builtin_clzll(sw_val);
+      const int hi_w = 63 - std::countl_zero(sw_val);
       const std::size_t prev_word = (static_cast<std::size_t>(sw) << 6) + static_cast<std::size_t>(hi_w);
       const std::uint64_t target_w = level_bitmap_[prev_word];
-      const int hi = 63 - __builtin_clzll(target_w);
+      const int hi = 63 - std::countl_zero(target_w);
       best_bid_idx_ = (prev_word << 6) + static_cast<std::size_t>(hi);
       return;
     }
@@ -830,7 +1003,7 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
   const std::uint64_t tail_mask = (~std::uint64_t{0}) << bit_in_word;
   std::uint64_t w = level_bitmap_[word] & tail_mask;
   if (w != 0) {
-    const int lo = __builtin_ctzll(w);
+    const int lo = std::countr_zero(w);
     best_ask_idx_ = (word << 6) + static_cast<std::size_t>(lo);
     if (best_ask_idx_ >= tick_count_) [[unlikely]] {
       best_ask_idx_ = kNpos;
@@ -854,11 +1027,11 @@ void FlatLadderBook::refresh_best_ask_from(std::size_t start) noexcept {
       sw_val &= s_tail_mask;
     }
     if (sw_val != 0) {
-      const int lo_w = __builtin_ctzll(sw_val);
+      const int lo_w = std::countr_zero(sw_val);
       const std::size_t target_w_idx = (sw << 6) + static_cast<std::size_t>(lo_w);
       if (target_w_idx < level_bitmap_.size()) {
         const std::uint64_t target_w = level_bitmap_[target_w_idx];
-        const int lo = __builtin_ctzll(target_w);
+        const int lo = std::countr_zero(target_w);
         best_ask_idx_ = (target_w_idx << 6) + static_cast<std::size_t>(lo);
         if (best_ask_idx_ >= tick_count_) [[unlikely]] {
           best_ask_idx_ = kNpos;
@@ -885,6 +1058,191 @@ void FlatLadderBook::clear_level_occupied(std::size_t idx) noexcept {
   if (level_bitmap_[word] == 0) [[unlikely]] {
     summary_bitmap_[word >> 6] &= ~(std::uint64_t{1} << (word & 63));
   }
+}
+
+void FlatLadderBook::attach_undo_log(LadderUndoLog *log) noexcept {
+  if (log != nullptr) {
+    log->reset();
+    log->saved_best_bid_idx = best_bid_idx_;
+    log->saved_best_ask_idx = best_ask_idx_;
+    log->saved_live_order_count = live_order_count_;
+    log->saved_event_count = event_count_;
+    log->saved_next_id = next_id_;
+    log->saved_book_time = book_time_;
+  }
+  active_undo_log_ = log;
+}
+
+void FlatLadderBook::rollback_undo_log(LadderUndoLog &log) noexcept {
+  while (!log.empty()) {
+    const LadderDeltaEntry &d = log.pop();
+    const std::size_t idx = d.level_idx;
+    IntrusiveLevel &level = level_at(idx);
+    const std::size_t side_idx = static_cast<std::size_t>(d.order_side) & 1U;
+
+    if (d.kind == LadderDeltaKind::PartialFill) {
+      const std::uint32_t cur_vol = static_cast<std::uint32_t>(level.volume);
+      const std::uint32_t cur_tot = static_cast<std::uint32_t>(total_vol_[side_idx]);
+      const std::uint32_t cur_node_qty = static_cast<std::uint32_t>(node_pool_[d.slot].qty);
+      level.volume = static_cast<Qty>(cur_vol ^ d.vol_xor);
+      total_vol_[side_idx] = static_cast<Qty>(cur_tot ^ d.tot_vol_xor);
+      node_pool_[d.slot].qty = static_cast<Qty>(cur_node_qty ^ d.live_xor);
+    } else if (d.kind == LadderDeltaKind::UnlinkNode) {
+      level.head_slot ^= d.head_xor;
+      level.tail_slot ^= d.tail_xor;
+      level.live_orders ^= d.live_xor;
+      level.volume = static_cast<Qty>(static_cast<std::uint32_t>(level.volume) ^ d.vol_xor);
+      total_vol_[side_idx] = static_cast<Qty>(static_cast<std::uint32_t>(total_vol_[side_idx]) ^ d.tot_vol_xor);
+      level_side_[idx] ^= d.side_xor;
+      level_bitmap_[idx >> 6] ^= d.l_bitmap_xor;
+      summary_bitmap_[idx >> 12] ^= d.s_bitmap_xor;
+      free_head_ ^= d.free_head_xor;
+
+      node_pool_[d.slot] = d.saved_node;
+      const std::uint32_t prev_s = d.saved_node.prev_slot;
+      const std::uint32_t next_s = d.saved_node.next_slot;
+      if (prev_s != kNullSlot) {
+        node_pool_[prev_s].next_slot ^= d.prev_next_xor;
+      }
+      if (next_s != kNullSlot) {
+        node_pool_[next_s].prev_slot ^= d.next_prev_xor;
+      }
+
+      const std::size_t id_idx = static_cast<std::size_t>(d.order_id);
+      if (id_idx < id_live_.size()) {
+        id_live_[id_idx] ^= d.id_live_xor;
+        id_refs_[id_idx] = d.saved_ref;
+      }
+    } else if (d.kind == LadderDeltaKind::InsertRest) {
+      level.head_slot ^= d.head_xor;
+      level.tail_slot ^= d.tail_xor;
+      level.live_orders ^= d.live_xor;
+      level.volume = static_cast<Qty>(static_cast<std::uint32_t>(level.volume) ^ d.vol_xor);
+      total_vol_[side_idx] = static_cast<Qty>(static_cast<std::uint32_t>(total_vol_[side_idx]) ^ d.tot_vol_xor);
+      level_side_[idx] ^= d.side_xor;
+      level_bitmap_[idx >> 6] ^= d.l_bitmap_xor;
+      summary_bitmap_[idx >> 12] ^= d.s_bitmap_xor;
+
+      const std::uint32_t prev_tail = d.saved_node.prev_slot;
+      if (prev_tail != kNullSlot) {
+        node_pool_[prev_tail].next_slot ^= d.prev_next_xor;
+      }
+
+      const std::size_t id_idx = static_cast<std::size_t>(d.order_id);
+      if (id_idx < id_live_.size()) {
+        id_live_[id_idx] ^= d.id_live_xor;
+        id_refs_[id_idx] = d.saved_ref;
+      }
+
+      free_head_ ^= d.free_head_xor;
+      if (d.saved_node.agent != 0U) {
+        IntrusiveOrderNode restored = d.saved_node;
+        restored.prev_slot = kNullSlot;
+        restored.agent = 0;
+        node_pool_[d.slot] = restored;
+      } else if (d.slot + 1U == static_cast<std::uint32_t>(node_pool_.size())) {
+        node_pool_.pop_back();
+      } else {
+        node_pool_[d.slot] = IntrusiveOrderNode{};
+      }
+    }
+  }
+
+  best_bid_idx_ = log.saved_best_bid_idx;
+  best_ask_idx_ = log.saved_best_ask_idx;
+  live_order_count_ = log.saved_live_order_count;
+  event_count_ = log.saved_event_count;
+  next_id_ = log.saved_next_id;
+  book_time_ = log.saved_book_time;
+}
+
+std::uint64_t FlatLadderBook::state_digest() const noexcept {
+  std::uint64_t h = 0xCBF29CE484222325ULL;
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(best_bid_idx_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(best_ask_idx_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(live_order_count_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(total_vol_[0]));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(total_vol_[1]));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(event_count_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(next_id_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(book_time_));
+  h = fnv1a_mix64(h, static_cast<std::uint64_t>(free_head_));
+
+  for (std::uint64_t w : summary_bitmap_) {
+    h = fnv1a_mix64(h, w);
+  }
+  for (std::size_t sw = 0; sw < summary_bitmap_.size(); ++sw) {
+    std::uint64_t s_val = summary_bitmap_[sw];
+    while (s_val != 0) {
+      const int lo_w = std::countr_zero(s_val);
+      s_val &= (s_val - 1ULL);
+      const std::size_t lw_idx = (sw << 6) + static_cast<std::size_t>(lo_w);
+      if (lw_idx >= level_bitmap_.size()) continue;
+      std::uint64_t l_val = level_bitmap_[lw_idx];
+      h = fnv1a_mix64(h, lw_idx);
+      h = fnv1a_mix64(h, l_val);
+      while (l_val != 0) {
+        const int lo_b = std::countr_zero(l_val);
+        l_val &= (l_val - 1ULL);
+        const std::size_t idx = (lw_idx << 6) + static_cast<std::size_t>(lo_b);
+        if (idx >= tick_count_) continue;
+        const IntrusiveLevel &lvl = levels_[idx];
+        h = fnv1a_mix64(h, idx);
+        h = fnv1a_mix64(h, level_side_[idx]);
+        h = fnv1a_mix64(h, lvl.head_slot);
+        h = fnv1a_mix64(h, lvl.tail_slot);
+        h = fnv1a_mix64(h, lvl.live_orders);
+        h = fnv1a_mix64(h, static_cast<std::uint64_t>(lvl.volume));
+        for (std::uint32_t curr = lvl.head_slot; curr != kNullSlot; curr = node_pool_[curr].next_slot) {
+          const IntrusiveOrderNode &n = node_pool_[curr];
+          h = fnv1a_mix64(h, curr);
+          h = fnv1a_mix64(h, n.id);
+          h = fnv1a_mix64(h, static_cast<std::uint64_t>(n.enqueue_ts));
+          h = fnv1a_mix64(h, static_cast<std::uint64_t>(n.qty));
+          h = fnv1a_mix64(h, static_cast<std::uint64_t>(n.agent));
+          h = fnv1a_mix64(h, n.prev_slot);
+          h = fnv1a_mix64(h, n.next_slot);
+        }
+      }
+    }
+  }
+  return h;
+}
+
+bool FlatLadderBook::state_equals(const FlatLadderBook &other) const noexcept {
+  if (min_tick_ != other.min_tick_ || max_tick_ != other.max_tick_ ||
+      tick_count_ != other.tick_count_ || best_bid_idx_ != other.best_bid_idx_ ||
+      best_ask_idx_ != other.best_ask_idx_ || live_order_count_ != other.live_order_count_ ||
+      total_vol_[0] != other.total_vol_[0] || total_vol_[1] != other.total_vol_[1] ||
+      event_count_ != other.event_count_ || next_id_ != other.next_id_ ||
+      book_time_ != other.book_time_ || free_head_ != other.free_head_) {
+    return false;
+  }
+  if (level_bitmap_ != other.level_bitmap_ ||
+      summary_bitmap_ != other.summary_bitmap_ ||
+      level_side_ != other.level_side_) {
+    return false;
+  }
+  for (std::size_t i = 0; i < tick_count_; ++i) {
+    const IntrusiveLevel &a = levels_[i];
+    const IntrusiveLevel &b = other.levels_[i];
+    if (a.head_slot != b.head_slot || a.tail_slot != b.tail_slot ||
+        a.live_orders != b.live_orders || a.volume != b.volume) {
+      return false;
+    }
+  }
+  const std::size_t max_id = std::min(id_live_.size(), other.id_live_.size());
+  for (std::size_t id = 0; id < max_id; ++id) {
+    if (id_live_[id] != other.id_live_[id]) return false;
+    if (id_live_[id] != 0) {
+      const OrderRef &ra = id_refs_[id];
+      const OrderRef &rb = other.id_refs_[id];
+      if (ra.side != rb.side || ra.level_idx != rb.level_idx || ra.slot != rb.slot) {
+        return false;
+      }
+    }
+  }
+  return state_digest() == other.state_digest();
 }
 
 } // namespace sim

@@ -5,6 +5,9 @@
 #include "sim/lob.hpp"
 #include "sim/queue_reactive.hpp"
 #include "sim/rng.hpp"
+#include "sim/bitwise_veb_codings.hpp"
+#include "sim/veb_static_search.hpp"
+#include "sim/ofi_sparsity_features.hpp"
 
 #include <cstdlib>
 #include <new>
@@ -807,4 +810,129 @@ BENCHMARK(BM_FlatLadder_STP_CancelPassive)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_FlatLadder_QueueAhead)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_QueueReactive_EventGeneration)->Arg(1024)->Arg(4096);
 
+
+void BM_FlatLadder_SparseLevels(benchmark::State& state) {
+    const int depth = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(100000, 300000, 1024);
+    for (int i = 0; i < 16; ++i) {
+        book.add(make_limit_order(1, sim::Side::Buy, 199000 - i * 4096, 10), i * 2);
+        book.add(make_limit_order(2, sim::Side::Sell, 201000 + i * 4096, 10), i * 2 + 1);
+    }
+    std::size_t sink = 0;
+    for (auto _ : state) {
+        auto bids = book.levels(sim::Side::Buy, static_cast<std::size_t>(depth));
+        auto asks = book.levels(sim::Side::Sell, static_cast<std::size_t>(depth));
+        sink += bids.size() + asks.size();
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * 2);
+}
+
+void BM_BitwiseVeb4096_Ops(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::BitwiseVeb4096 veb{};
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            const auto t = static_cast<std::uint32_t>((i * 73) & 4095);
+            veb.insert(t);
+            sink += veb.min_tick() + veb.next_higher(t >> 1);
+        }
+        for (int i = 0; i < batch; ++i) {
+            const auto t = static_cast<std::uint32_t>((i * 73) & 4095);
+            veb.remove(t);
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch * 2);
+}
+
+void BM_ReversibleSubgame_RolloutRollback(benchmark::State& state) {
+    const int steps = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(9500, 10500, 4096);
+    for (int i = 0; i < 64; ++i) {
+        book.add_into(make_limit_order(1, sim::Side::Buy, 9990 - (i & 15), 10), i, nullptr, 0);
+        book.add_into(make_limit_order(2, sim::Side::Sell, 10010 + (i & 15), 10), 64 + i, nullptr, 0);
+    }
+    sim::LadderUndoLog undo_log;
+    sim::Trade trade_buf[8];
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        sim::ReversibleSubgameScope scope(book, undo_log);
+        for (int s = 0; s < steps; ++s) {
+            const sim::Order o = make_limit_order(3, (s & 1) ? sim::Side::Buy : sim::Side::Sell,
+                                                  (s & 1) ? 9995 : 10005, 5);
+            auto ms = scope.add(o, 1000 + s, trade_buf, 8);
+            sink += static_cast<std::uint64_t>(ms.remaining);
+        }
+        scope.rollback();
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * steps);
+}
+
+void BM_EytzingerTickGrid_LowerBound(benchmark::State& state) {
+    const int n = static_cast<int>(state.range(0));
+    std::vector<std::int64_t> sorted(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) sorted[static_cast<std::size_t>(i)] = 10000 + i * 5;
+    sim::EytzingerTickGrid<std::int64_t> grid(sorted);
+    std::size_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < 256; ++i) {
+            sink += grid.lower_bound_rank(10000 + ((i * 97) % (n * 5)));
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * 256);
+}
+
+void BM_OnlineHawkesQ16_Step(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::OnlineHawkesQ16 hawkes(65536ULL, 16384ULL, 65536ULL);
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            sink += hawkes.record_event(1024ULL);
+            sink += sim::SwarQueueReactiveRegimeLut::decode_add(static_cast<std::uint32_t>(i & 7));
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_MultiLevelOfi_Avx2(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::TopKBookSnapshot<8> prev{};
+    sim::TopKBookSnapshot<8> curr{};
+    for (std::size_t m = 0; m < 8; ++m) {
+        prev.bid_count = 8;
+        prev.ask_count = 8;
+        curr.bid_count = 8;
+        curr.ask_count = 8;
+        prev.bids[m] = {static_cast<sim::Tick>(10000 - m), 50, 2};
+        prev.asks[m] = {static_cast<sim::Tick>(10005 + m), 60, 2};
+        curr.bids[m] = {static_cast<sim::Tick>(10000 - m), 65, 3};
+        curr.asks[m] = {static_cast<sim::Tick>(10005 + m), 45, 2};
+    }
+    const auto weights = sim::default_ofi_decay_weights<8>();
+    double sink = 0.0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            curr.bids[i & 7].qty += 1;
+            const auto out = sim::compute_multilevel_ofi_avx2<8>(prev, curr, weights);
+            sink += out.weighted_ofi;
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+BENCHMARK(BM_FlatLadder_SparseLevels)->Arg(5)->Arg(16);
+BENCHMARK(BM_BitwiseVeb4096_Ops)->Arg(256)->Arg(1024);
+BENCHMARK(BM_ReversibleSubgame_RolloutRollback)->Arg(64)->Arg(256);
+BENCHMARK(BM_EytzingerTickGrid_LowerBound)->Arg(256)->Arg(4096);
+BENCHMARK(BM_OnlineHawkesQ16_Step)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_MultiLevelOfi_Avx2)->Arg(256)->Arg(1024);
+
 BENCHMARK_MAIN();
+
