@@ -713,3 +713,50 @@ TEST_CASE("Pillar 4.8: Zero-Allocation levels_into, make_top_k_snapshot<K>, and 
   REQUIRE(qrp.current_time() > 0);
   REQUIRE(qrp.hawkes_q16().event_count() == 256);
 }
+
+TEST_CASE("Pillar 4.9: Nested ReversibleSubgameScope commit() with external logs does not double-merge on destruction", "[pillar4][undo][commit]") {
+  FlatLadderBook book(1000, 1200, 1024);
+
+  Order seed_bid{}; seed_bid.agent = 1; seed_bid.side = Side::Buy; seed_bid.type = OrderType::Limit; seed_bid.price = 1090; seed_bid.qty = 50;
+  Order seed_ask{}; seed_ask.agent = 2; seed_ask.side = Side::Sell; seed_ask.type = OrderType::Limit; seed_ask.price = 1110; seed_ask.qty = 50;
+  book.add_outcome(seed_bid, 1);
+  book.add_outcome(seed_ask, 2);
+
+  const std::uint64_t root_digest = book.state_digest();
+
+  LadderUndoLog outer_log;
+  LadderUndoLog inner_log;
+
+  {
+    ReversibleSubgameScope outer(book, outer_log);
+    Order b1{}; b1.agent = 3; b1.side = Side::Buy; b1.type = OrderType::Limit; b1.price = 1095; b1.qty = 20;
+    outer.add_outcome(b1, 3);
+    REQUIRE(outer.delta_count() == 1);
+
+    {
+      ReversibleSubgameScope inner(book, inner_log);
+      // Partial fill + rest inside inner scope using distinct external log
+      Order cross_buy{}; cross_buy.agent = 4; cross_buy.side = Side::Buy; cross_buy.type = OrderType::Limit; cross_buy.price = 1110; cross_buy.qty = 30;
+      const auto mo = inner.add_outcome(cross_buy, 4);
+      REQUIRE(mo.status == OrderStatus::FilledComplete);
+      REQUIRE(mo.filled == 30);
+
+      Order rest_ask{}; rest_ask.agent = 5; rest_ask.side = Side::Sell; rest_ask.type = OrderType::Limit; rest_ask.price = 1105; rest_ask.qty = 15;
+      inner.add_outcome(rest_ask, 5);
+      REQUIRE(inner.delta_count() == 2);
+
+      // Explicitly commit inner scope: merges inner_log into outer_log once.
+      inner.commit();
+      REQUIRE(outer.delta_count() == 3);
+    }
+    // After inner scope destructor runs, outer.delta_count() must still be 3 (not 5!).
+    REQUIRE(outer.delta_count() == 3);
+    // Now outer scope rolls back on destruction, restoring exact root state!
+  }
+
+  REQUIRE(book.state_digest() == root_digest);
+  REQUIRE(book.volume_at(Side::Buy, 1090) == 50);
+  REQUIRE(book.volume_at(Side::Sell, 1110) == 50);
+  REQUIRE(book.volume_at(Side::Buy, 1095) == 0);
+  REQUIRE(book.volume_at(Side::Sell, 1105) == 0);
+}

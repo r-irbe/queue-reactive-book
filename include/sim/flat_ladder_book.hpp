@@ -504,10 +504,8 @@ public:
     }
 
     ~ReversibleSubgameScope() noexcept {
-        if (!committed_) {
+        if (!committed_ && !rolled_back_) {
             rollback();
-        } else if (!rolled_back_) {
-            commit_merge();
         }
     }
 
@@ -568,8 +566,6 @@ public:
     void reset() noexcept {
         if (!rolled_back_ && !committed_) {
             rollback();
-        } else if (committed_) {
-            commit_merge();
         }
         arm_scope();
         rolled_back_ = false;
