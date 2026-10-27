@@ -1073,8 +1073,15 @@ void FlatLadderBook::attach_undo_log(LadderUndoLog *log) noexcept {
   active_undo_log_ = log;
 }
 
-void FlatLadderBook::rollback_undo_log(LadderUndoLog &log) noexcept {
-  while (!log.empty()) {
+void FlatLadderBook::rollback_undo_log_to(LadderUndoLog &log,
+                                          std::size_t target_count,
+                                          std::size_t saved_best_bid,
+                                          std::size_t saved_best_ask,
+                                          std::size_t saved_live_orders,
+                                          std::uint64_t saved_events,
+                                          OrderId saved_next,
+                                          TimeNs saved_time) noexcept {
+  while (log.size() > target_count) {
     const LadderDeltaEntry &d = log.pop();
     const std::size_t idx = d.level_idx;
     IntrusiveLevel &level = level_at(idx);
@@ -1138,7 +1145,6 @@ void FlatLadderBook::rollback_undo_log(LadderUndoLog &log) noexcept {
       if (d.saved_node.agent != 0U) {
         IntrusiveOrderNode restored = d.saved_node;
         restored.prev_slot = kNullSlot;
-        restored.agent = 0;
         node_pool_[d.slot] = restored;
       } else if (d.slot + 1U == static_cast<std::uint32_t>(node_pool_.size())) {
         node_pool_.pop_back();
@@ -1148,12 +1154,19 @@ void FlatLadderBook::rollback_undo_log(LadderUndoLog &log) noexcept {
     }
   }
 
-  best_bid_idx_ = log.saved_best_bid_idx;
-  best_ask_idx_ = log.saved_best_ask_idx;
-  live_order_count_ = log.saved_live_order_count;
-  event_count_ = log.saved_event_count;
-  next_id_ = log.saved_next_id;
-  book_time_ = log.saved_book_time;
+  best_bid_idx_ = saved_best_bid;
+  best_ask_idx_ = saved_best_ask;
+  live_order_count_ = saved_live_orders;
+  event_count_ = saved_events;
+  next_id_ = saved_next;
+  book_time_ = saved_time;
+}
+
+void FlatLadderBook::rollback_undo_log(LadderUndoLog &log) noexcept {
+  rollback_undo_log_to(log, 0U,
+                       log.saved_best_bid_idx, log.saved_best_ask_idx,
+                       log.saved_live_order_count, log.saved_event_count,
+                       log.saved_next_id, log.saved_book_time);
 }
 
 std::uint64_t FlatLadderBook::state_digest() const noexcept {
@@ -1230,6 +1243,16 @@ bool FlatLadderBook::state_equals(const FlatLadderBook &other) const noexcept {
         a.live_orders != b.live_orders || a.volume != b.volume) {
       return false;
     }
+  }
+  if (node_pool_.size() != other.node_pool_.size()) return false;
+  std::uint32_t fa = free_head_;
+  std::uint32_t fb = other.free_head_;
+  std::size_t free_steps = 0;
+  while (fa != kNullSlot || fb != kNullSlot) {
+    if (fa != fb || free_steps > node_pool_.size()) return false;
+    fa = node_pool_[fa].next_slot;
+    fb = other.node_pool_[fb].next_slot;
+    ++free_steps;
   }
   const std::size_t max_id = std::min(id_live_.size(), other.id_live_.size());
   for (std::size_t id = 0; id < max_id; ++id) {

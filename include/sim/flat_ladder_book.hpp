@@ -103,6 +103,11 @@ public:
         return storage[--count_];
     }
 
+    const LadderDeltaEntry& entry_at(std::size_t idx) const noexcept {
+        const LadderDeltaEntry* storage = ext_buf_ ? ext_buf_ : inline_entries_.data();
+        return storage[idx];
+    }
+
     std::size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0U; }
     bool overflowed() const noexcept { return overflow_; }
@@ -196,6 +201,14 @@ public:
     void detach_undo_log() noexcept { active_undo_log_ = nullptr; }
     LadderUndoLog* active_undo_log() const noexcept { return active_undo_log_; }
     void rollback_undo_log(LadderUndoLog& log) noexcept;
+    void rollback_undo_log_to(LadderUndoLog& log,
+                              std::size_t target_count,
+                              std::size_t saved_best_bid,
+                              std::size_t saved_best_ask,
+                              std::size_t saved_live_orders,
+                              std::uint64_t saved_events,
+                              OrderId saved_next,
+                              TimeNs saved_time) noexcept;
     std::uint64_t state_digest() const noexcept;
     bool state_equals(const FlatLadderBook& other) const noexcept;
 
@@ -279,19 +292,19 @@ class ReversibleSubgameScope {
 public:
     explicit ReversibleSubgameScope(FlatLadderBook& book) noexcept
         : book_(book), prev_log_(book.active_undo_log()) {
-        book_.attach_undo_log(&local_log_);
+        arm_scope();
     }
 
     ReversibleSubgameScope(FlatLadderBook& book, LadderUndoLog& external_log) noexcept
         : book_(book), ext_log_(&external_log), prev_log_(book.active_undo_log()) {
-        book_.attach_undo_log(ext_log_);
+        arm_scope();
     }
 
     ~ReversibleSubgameScope() noexcept {
         if (!committed_) {
             rollback();
-        } else {
-            book_.active_undo_log_ = prev_log_;
+        } else if (!rolled_back_) {
+            commit_merge();
         }
     }
 
@@ -326,8 +339,10 @@ public:
 
     void rollback() noexcept {
         if (rolled_back_) return;
-        LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
-        book_.rollback_undo_log(*log);
+        book_.rollback_undo_log_to(*active_log_, start_count_,
+                                   saved_best_bid_idx_, saved_best_ask_idx_,
+                                   saved_live_order_count_, saved_event_count_,
+                                   saved_next_id_, saved_book_time_);
         book_.active_undo_log_ = prev_log_;
         rolled_back_ = true;
     }
@@ -336,32 +351,93 @@ public:
     void reset() noexcept {
         if (!rolled_back_ && !committed_) {
             rollback();
+        } else if (committed_) {
+            commit_merge();
         }
-        LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
-        book_.attach_undo_log(log);
+        arm_scope();
         rolled_back_ = false;
         committed_ = false;
     }
 
     void commit() noexcept {
-        committed_ = true;
+        if (!committed_ && !rolled_back_) {
+            commit_merge();
+            committed_ = true;
+        }
     }
 
     std::size_t delta_count() const noexcept {
-        const LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
-        return log->size();
+        return active_log_->size() - start_count_;
     }
 
     bool overflowed() const noexcept {
-        const LadderUndoLog* log = ext_log_ ? ext_log_ : &local_log_;
-        return log->overflowed();
+        return active_log_->overflowed();
     }
 
 private:
+    void arm_scope() noexcept {
+        saved_best_bid_idx_ = book_.best_bid_idx_;
+        saved_best_ask_idx_ = book_.best_ask_idx_;
+        saved_live_order_count_ = book_.live_order_count_;
+        saved_event_count_ = book_.event_count_;
+        saved_next_id_ = book_.next_id_;
+        saved_book_time_ = book_.book_time_;
+
+        if (ext_log_ != nullptr) {
+            active_log_ = ext_log_;
+            if (prev_log_ == ext_log_) {
+                start_count_ = ext_log_->size();
+            } else {
+                ext_log_->reset();
+                ext_log_->saved_best_bid_idx = saved_best_bid_idx_;
+                ext_log_->saved_best_ask_idx = saved_best_ask_idx_;
+                ext_log_->saved_live_order_count = saved_live_order_count_;
+                ext_log_->saved_event_count = saved_event_count_;
+                ext_log_->saved_next_id = saved_next_id_;
+                ext_log_->saved_book_time = saved_book_time_;
+                start_count_ = 0U;
+            }
+            book_.active_undo_log_ = ext_log_;
+        } else if (prev_log_ != nullptr) {
+            active_log_ = prev_log_;
+            start_count_ = prev_log_->size();
+            book_.active_undo_log_ = prev_log_;
+        } else {
+            active_log_ = &local_log_;
+            local_log_.reset();
+            local_log_.saved_best_bid_idx = saved_best_bid_idx_;
+            local_log_.saved_best_ask_idx = saved_best_ask_idx_;
+            local_log_.saved_live_order_count = saved_live_order_count_;
+            local_log_.saved_event_count = saved_event_count_;
+            local_log_.saved_next_id = saved_next_id_;
+            local_log_.saved_book_time = saved_book_time_;
+            start_count_ = 0U;
+            book_.active_undo_log_ = &local_log_;
+        }
+    }
+
+    void commit_merge() noexcept {
+        if (prev_log_ != nullptr && active_log_ != prev_log_) {
+            const std::size_t n = active_log_->size();
+            for (std::size_t i = start_count_; i < n; ++i) {
+                prev_log_->push(active_log_->entry_at(i));
+            }
+        }
+        book_.active_undo_log_ = prev_log_;
+    }
+
     FlatLadderBook& book_;
     LadderUndoLog local_log_{};
     LadderUndoLog* ext_log_ = nullptr;
     LadderUndoLog* prev_log_ = nullptr;
+    LadderUndoLog* active_log_ = nullptr;
+    std::size_t start_count_ = 0U;
+    std::size_t saved_best_bid_idx_ = std::numeric_limits<std::size_t>::max();
+    std::size_t saved_best_ask_idx_ = std::numeric_limits<std::size_t>::max();
+    std::size_t saved_live_order_count_ = 0;
+    std::uint64_t saved_event_count_ = 0;
+    OrderId saved_next_id_ = 1;
+    TimeNs saved_book_time_ = 0;
     bool rolled_back_ = false;
     bool committed_ = false;
 };

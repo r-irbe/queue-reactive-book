@@ -384,3 +384,102 @@ TEST_CASE("Pillar 4.6: AVX2 Multi-Level OFI over TopKBookSnapshot<8> parity vs s
     REQUIRE(std::abs(integrated - scalar_out.weighted_ofi) < 1e-9);
   }
 }
+
+TEST_CASE("Pillar 4.4b: Nested ReversibleSubgameScope (depth >= 2), STP DecrementAndCancel, and free-list reuse", "[pillar4][reversible][nested]") {
+  // 1. Nested scopes (both shared undo_log and default local_log) with inner rollback + outer continue + outer rollback
+  {
+    FlatLadderBook book(9900, 10100, 1024);
+    FlatLadderBook oracle(9900, 10100, 1024);
+    Order o1{}; o1.agent = 1; o1.side = Side::Buy; o1.type = OrderType::Limit; o1.price = 9990; o1.qty = 10;
+    book.add_into(o1, 1, nullptr, 0);
+    oracle.add_into(o1, 1, nullptr, 0);
+
+    LadderUndoLog shared_log;
+    {
+      ReversibleSubgameScope outer(book, shared_log);
+      Order o2{}; o2.agent = 2; o2.side = Side::Sell; o2.type = OrderType::Limit; o2.price = 10010; o2.qty = 20;
+      outer.add(o2, 2);
+      const std::uint64_t mid_digest = book.state_digest();
+
+      {
+        ReversibleSubgameScope inner(book, shared_log);
+        Order o3{}; o3.agent = 3; o3.side = Side::Buy; o3.type = OrderType::Limit; o3.price = 10010; o3.qty = 5;
+        inner.add(o3, 3);
+        inner.rollback();
+      }
+      REQUIRE(book.state_digest() == mid_digest);
+      REQUIRE(book.check_invariants_report().ok);
+
+      // Outer continues after inner rollback, plus a committed inner scope
+      {
+        ReversibleSubgameScope inner_commit(book);
+        Order o4{}; o4.agent = 4; o4.side = Side::Buy; o4.type = OrderType::Limit; o4.price = 9995; o4.qty = 15;
+        inner_commit.add(o4, 4);
+        inner_commit.commit();
+      }
+      outer.rollback();
+    }
+    REQUIRE(book.state_equals(oracle));
+    REQUIRE(book.check_invariants_report().ok);
+  }
+
+  // 2. Free-list multi-slot reuse before, inside, and after ReversibleSubgameScope rollback
+  {
+    FlatLadderBook book(9900, 10100, 1024);
+    FlatLadderBook oracle(9900, 10100, 1024);
+    Order o1{}; o1.agent = 1; o1.side = Side::Buy; o1.type = OrderType::Limit; o1.price = 9990; o1.qty = 10;
+    Order o2{}; o2.agent = 1; o2.side = Side::Buy; o2.type = OrderType::Limit; o2.price = 9991; o2.qty = 15;
+    auto s1 = book.add_into(o1, 1, nullptr, 0); oracle.add_into(o1, 1, nullptr, 0);
+    auto s2 = book.add_into(o2, 2, nullptr, 0); oracle.add_into(o2, 2, nullptr, 0);
+    book.cancel(s1.id, 3); oracle.cancel(s1.id, 3);
+    book.cancel(s2.id, 4); oracle.cancel(s2.id, 4);
+
+    {
+      ReversibleSubgameScope scope(book);
+      scope.add(o1, 5);
+      scope.add(o2, 6);
+      scope.rollback();
+    }
+    REQUIRE(book.state_equals(oracle));
+    book.add_into(o1, 10, nullptr, 0); oracle.add_into(o1, 10, nullptr, 0);
+    book.add_into(o2, 11, nullptr, 0); oracle.add_into(o2, 11, nullptr, 0);
+    REQUIRE(book.state_equals(oracle));
+    REQUIRE(book.check_invariants_report().ok);
+  }
+
+  // 3. StpMode::DecrementAndCancel inside ReversibleSubgameScope (unlink + partial decrement at same level)
+  {
+    FlatLadderBook book(9900, 10100, 1024);
+    FlatLadderBook oracle(9900, 10100, 1024);
+    Order m1{}; m1.agent = 7; m1.side = Side::Sell; m1.type = OrderType::Limit; m1.price = 10000; m1.qty = 10;
+    Order m2{}; m2.agent = 7; m2.side = Side::Sell; m2.type = OrderType::Limit; m2.price = 10000; m2.qty = 20;
+    Order m3{}; m3.agent = 8; m3.side = Side::Sell; m3.type = OrderType::Limit; m3.price = 10000; m3.qty = 15;
+    book.add_into(m1, 1, nullptr, 0); oracle.add_into(m1, 1, nullptr, 0);
+    book.add_into(m2, 2, nullptr, 0); oracle.add_into(m2, 2, nullptr, 0);
+    book.add_into(m3, 3, nullptr, 0); oracle.add_into(m3, 3, nullptr, 0);
+
+    {
+      ReversibleSubgameScope scope(book);
+      Order taker{}; taker.agent = 7; taker.side = Side::Buy; taker.type = OrderType::Limit; taker.price = 10000; taker.qty = 16;
+      Trade tbuf[4];
+      const auto ms = scope.add(taker, 4, tbuf, 4, StpMode::DecrementAndCancel);
+      REQUIRE(ms.filled == 0);
+      REQUIRE(book.volume_at(Side::Sell, 10000) == 29); // m1 unlinked (-10), m2 decremented by 6 (14 left) + m3 (15) = 29
+      scope.rollback();
+    }
+    REQUIRE(book.state_equals(oracle));
+    REQUIRE(book.check_invariants_report().ok);
+  }
+
+  // 4. Verify 4-arg verified_veb3_4096_encode and SparseBitwiseVeb16M::reserve_page zero-alloc
+  REQUIRE(verified_veb3_4096_encode(1ULL, 2ULL, 3ULL, 4ULL) == ((1ULL << 36ULL) | (2ULL << 24ULL) | (3ULL << 12ULL) | 4ULL));
+  SparseBitwiseVeb16M veb16m;
+  REQUIRE(veb16m.reserve_page(100U));
+  {
+    sim::diag::ScopedAllocCounter guard;
+    veb16m.insert((100U << 12U) | 42U);
+    REQUIRE(veb16m.contains((100U << 12U) | 42U));
+    veb16m.remove((100U << 12U) | 42U);
+    REQUIRE(guard.delta().allocations == 0);
+  }
+}

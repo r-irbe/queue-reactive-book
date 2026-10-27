@@ -247,10 +247,16 @@ private:
 
 inline constexpr std::uint32_t kVebNullTick = 0xFFFFFFFFU;
 
-// Verified 3-level radix-64 (or 6+6 bit) coordinate encode/decode helpers
+// Verified 3-level radix-64 (or 6+6 bit) and 4-level radix-4096 coordinate encode/decode helpers
 // ported from generated_verified_kernels.rs and Rules.BitwiseVebWarpCodec.
 constexpr std::uint32_t verified_veb3_4096_encode(std::uint32_t c1, std::uint32_t b0) noexcept {
     return ((c1 & 63U) << 6U) | (b0 & 63U);
+}
+
+constexpr std::uint64_t verified_veb3_4096_encode(std::uint64_t c0, std::uint64_t c1,
+                                                  std::uint64_t c2, std::uint64_t c3) noexcept {
+    return ((c0 & 0xFFFULL) << 36ULL) | ((c1 & 0xFFFULL) << 24ULL) |
+           ((c2 & 0xFFFULL) << 12ULL) | (c3 & 0xFFFULL);
 }
 
 constexpr void verified_veb3_4096_decode(std::uint32_t tick, std::uint32_t& out_c1, std::uint32_t& out_b0) noexcept {
@@ -502,14 +508,27 @@ public:
         if (was_empty) top_.insert(page_idx);
     }
 
+    // Pre-populates the 4,096-tick leaf page for page_idx (or tick >> 12) so subsequent
+    // insert/remove operations within that page execute with zero heap allocations.
+    bool reserve_page(std::uint32_t page_idx) noexcept {
+        if (page_idx >= 4096U) return false;
+        if (!pages_[page_idx]) {
+            pages_[page_idx].reset(new (std::nothrow) BitwiseVeb4096());
+            if (!pages_[page_idx]) return false;
+            ++allocated_pages_;
+        }
+        return true;
+    }
+
     void remove(std::uint32_t tick) noexcept {
         if (tick >= kUniverse) return;
         const std::uint32_t page_idx = (tick >> 12U) & 0xFFFU;
         const std::uint32_t low12 = tick & 0xFFFU;
         auto* page = pages_[page_idx].get();
         if (!page) return;
+        const bool was_non_empty = !page->empty();
         page->remove(low12);
-        if (page->empty()) top_.remove(page_idx);
+        if (was_non_empty && page->empty()) top_.remove(page_idx);
     }
 
     bool contains(std::uint32_t tick) const noexcept {
