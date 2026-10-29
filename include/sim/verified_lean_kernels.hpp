@@ -82,7 +82,7 @@ inline constexpr char kQrlobRolloutPtx[] =
     .reg .pred  %p<3>;
     .reg .b32   %r<9>;
     .reg .b64   %rd<24>;
-    .reg .f32   %f<2>;
+    .reg .f32   %f<3>;
     // Load kernel parameters
     ld.param.u64    %rd1, [param_traj_state];
     ld.param.u64    %rd2, [param_rng_seeds];
@@ -117,10 +117,13 @@ inline constexpr char kQrlobRolloutPtx[] =
     shr.u64         %rd16, %rd9, 7;
     xor.b64         %rd17, %rd9, %rd16;
     st.global.u64   [%rd8], %rd17;
-    // intensity part = decay >>> 16 (integer part of Q48.16)
-    shr.u64         %rd18, %rd15, 16;
-    cvt.u32.u64     %r5, %rd18;
-    // survival sample: intensity part > (rng' & 0x7FFFFFFF)
+    // intensity = decay * 2^-16 as f32 (true Q16 intensity, council F2)
+    cvt.rn.f32.u64   %f1, %rd15;
+    mov.f32         %f2, 0f37800000;
+    mul.f32         %f1, %f1, %f2;
+    // survival: (decay << 15) > (rng' & 0x7FFFFFFF) : P(survive) = decay/65536 (council F2)
+    cvt.u32.u64     %r5, %rd15;
+    shl.b32         %r5, %r5, 15;
     and.b64         %rd19, %rd17, 2147483647;
     cvt.u32.u64     %r6, %rd19;
     setp.gt.u32     %p2, %r5, %r6;
@@ -131,7 +134,6 @@ inline constexpr char kQrlobRolloutPtx[] =
     add.u64         %rd22, %rd3, %rd21;
     st.global.u32   [%rd22], %r7;
     add.u64         %rd23, %rd4, %rd21;
-    cvt.rn.f32.u32   %f1, %r5;
     st.global.f32   [%rd23], %f1;
   $L_EXIT:
     ret;
@@ -178,7 +180,11 @@ inline constexpr char kQrlobOzakiPtx[] =
     mov.u32         %r9, %tid.x;
     mad.lo.u32      %r4, %r2, %r3, %r9;
     setp.ge.s32     %p1, %r4, %r1;
-    @%p1 bra        $L_EXIT;
+    // OOB lanes carry neutral partials through the reduction (council F1)
+    mov.f32         %f11, 0.0;
+    mov.f32         %f13, 0.0;
+    mov.f32         %f15, 0.0;
+    @%p1 bra        $L_EVENT_DONE;
     // byte offset = event * 4 (u32 event records)
     cvt.u64.u32     %rd9, %r4;
     shl.b64         %rd9, %rd9, 2;
@@ -215,7 +221,8 @@ inline constexpr char kQrlobOzakiPtx[] =
     mul.f32         %f13, %f2, %f12;
     mul.f32         %f14, %f10, %f10;
     mul.f32         %f15, %f2, %f14;
-    // 5-stage full-mask warp butterfly reduction of 4 statistics
+  $L_EVENT_DONE:
+    // 5-stage full-mask warp butterfly reduction of 3 statistics
     shfl.sync.down.b32 %f16, %f11, 16, 31, 0xffffffff;
     add.f32         %f11, %f11, %f16;
     shfl.sync.down.b32 %f16, %f11, 8, 31, 0xffffffff;
@@ -236,16 +243,6 @@ inline constexpr char kQrlobOzakiPtx[] =
     add.f32         %f13, %f13, %f16;
     shfl.sync.down.b32 %f16, %f13, 1, 31, 0xffffffff;
     add.f32         %f13, %f13, %f16;
-    shfl.sync.down.b32 %f16, %f14, 16, 31, 0xffffffff;
-    add.f32         %f14, %f14, %f16;
-    shfl.sync.down.b32 %f16, %f14, 8, 31, 0xffffffff;
-    add.f32         %f14, %f14, %f16;
-    shfl.sync.down.b32 %f16, %f14, 4, 31, 0xffffffff;
-    add.f32         %f14, %f14, %f16;
-    shfl.sync.down.b32 %f16, %f14, 2, 31, 0xffffffff;
-    add.f32         %f14, %f14, %f16;
-    shfl.sync.down.b32 %f16, %f14, 1, 31, 0xffffffff;
-    add.f32         %f14, %f14, %f16;
     shfl.sync.down.b32 %f16, %f15, 16, 31, 0xffffffff;
     add.f32         %f15, %f15, %f16;
     shfl.sync.down.b32 %f16, %f15, 8, 31, 0xffffffff;
