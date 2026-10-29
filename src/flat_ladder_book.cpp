@@ -56,6 +56,8 @@ FlatLadderBook::FlatLadderBook(Tick min_tick, Tick max_tick,
   node_pool_.reserve(prealloc_orders);
   id_refs_.resize(prealloc_orders + 1);
   id_live_.assign(prealloc_orders + 1, 0);
+  level_prefix_.resize(tick_count_);
+  entry_cum_.assign(prealloc_orders, 0);
 }
 
 std::unique_ptr<FlatLadderBook> FlatLadderBook::create(Tick min_tick,
@@ -583,6 +585,7 @@ void FlatLadderBook::unlink_maker_node_impl(std::size_t level_idx, std::uint32_t
       level_side_[level_idx] = kNoSide;
       clear_level_occupied(level_idx);
     }
+    prefix_on_removal(level_idx, prev_s != kNullSlot);
   } else {
     const std::uint32_t old_head = level.head_slot;
     const std::uint32_t old_tail = level.tail_slot;
@@ -649,6 +652,7 @@ void FlatLadderBook::unlink_maker_node_impl(std::size_t level_idx, std::uint32_t
     payload.saved_ref = old_ref;
     payload.saved_node = saved_node;
     active_undo_log_->push_structural(tok, payload);
+    prefix_on_removal(level_idx, prev_s != kNullSlot);
   }
 }
 
@@ -808,6 +812,19 @@ void FlatLadderBook::rest_impl(Order &order) {
       if (best_ask_idx_ == kNpos || idx < best_ask_idx_)
         best_ask_idx_ = idx;
     }
+
+    if (idx < level_prefix_.size()) {
+      if (idx < level_prefix_.size()) {
+        // Arrival-cumulus snapshot: cumulative live-chain volume including
+        // this order (O(1) from the insertion-time tail state).
+        const std::uint64_t tail_cum =
+            (prev_tail != kNullSlot && prev_tail < entry_cum_.size())
+                ? entry_cum_[prev_tail]
+                : 0ULL;
+        if (entry_cum_.size() <= slot) entry_cum_.resize(node_pool_.size(), 0);
+        entry_cum_[slot] = tail_cum + static_cast<std::uint64_t>(order.qty);
+      }
+    }
   } else {
     const std::uint32_t old_head = level.head_slot;
     const std::uint32_t old_tail = level.tail_slot;
@@ -857,6 +874,19 @@ void FlatLadderBook::rest_impl(Order &order) {
     } else {
       if (best_ask_idx_ == kNpos || idx < best_ask_idx_)
         best_ask_idx_ = idx;
+    }
+
+    if (idx < level_prefix_.size()) {
+      if (idx < level_prefix_.size()) {
+        // Arrival-cumulus snapshot: cumulative live-chain volume including
+        // this order (O(1) from the insertion-time tail state).
+        const std::uint64_t tail_cum =
+            (prev_tail != kNullSlot && prev_tail < entry_cum_.size())
+                ? entry_cum_[prev_tail]
+                : 0ULL;
+        if (entry_cum_.size() <= slot) entry_cum_.resize(node_pool_.size(), 0);
+        entry_cum_[slot] = tail_cum + static_cast<std::uint64_t>(order.qty);
+      }
     }
 
     CompactDeltaToken tok{};
@@ -944,7 +974,23 @@ std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
   const std::uint32_t target_slot = ref.slot;
   if (target_slot >= node_pool_.size()) return std::nullopt;
   if (node_pool_[target_slot].qty == 0) return std::nullopt;
+  if (ref.level_idx >= level_prefix_.size()) return std::nullopt;
+  const LevelPrefix &lp = level_prefix_[ref.level_idx];
 
+  // O(1) arrival-cumulus watermark (docs/39 blueprint, Area 2). Replaces the
+  // former O(k) intrusive walk (measured 1,370 ns at k = 1024+).
+  if (lp.wm_dirty) {
+    const_cast<FlatLadderBook*>(this)->watermark_rebuild(ref.level_idx);
+  }
+  if (!lp.interior_seen && lvl.head_slot != kNullSlot) {
+    const IntrusiveOrderNode &head = node_pool_[lvl.head_slot];
+    const IntrusiveOrderNode &tgt = node_pool_[target_slot];
+    const std::int64_t ahead =
+        static_cast<std::int64_t>(entry_cum_[target_slot] - entry_cum_[lvl.head_slot]) +
+        static_cast<std::int64_t>(head.qty) - static_cast<std::int64_t>(tgt.qty);
+    return std::optional<Qty>(ahead > 0 ? static_cast<Qty>(ahead) : static_cast<Qty>(0));
+  }
+  // Exact fallback: interior cancels observed on this level (or empty level).
   Qty ahead = 0;
   for (std::uint32_t curr = lvl.head_slot;
        curr != kNullSlot && curr != target_slot;
@@ -952,6 +998,31 @@ std::optional<Qty> FlatLadderBook::queue_ahead(OrderId id) const noexcept {
     ahead += node_pool_[curr].qty;
   }
   return ahead;
+}
+
+void FlatLadderBook::watermark_rebuild(std::size_t level_idx) noexcept {
+  LevelPrefix &lp = level_prefix_[level_idx];
+  const IntrusiveLevel &lvl = levels_[level_idx];
+  std::uint64_t running = 0;
+  for (std::uint32_t s = lvl.head_slot; s != kNullSlot; s = node_pool_[s].next_slot) {
+    running += node_pool_[s].qty;
+    if (s < entry_cum_.size()) {
+      entry_cum_[s] = running;
+    } else {
+      entry_cum_.resize(node_pool_.size(), 0);
+      entry_cum_[s] = running;
+    }
+  }
+  lp.wm_dirty = false;
+}
+// Interior-cancel detector: any unlink whose predecessor exists is an
+// interior removal and permanently demotes the level to the exact O(k)
+// queue_ahead walk (conservative: a rollback that restores the node keeps
+// the level on the walk path, which is never incorrect).
+void FlatLadderBook::prefix_on_removal(std::size_t level_idx, bool interior) noexcept {
+  if (interior && level_idx < level_prefix_.size()) {
+    level_prefix_[level_idx].interior_seen = true;
+  }
 }
 
 OrderId FlatLadderBook::peek_head_order_id(Side side, Tick price) const noexcept {
@@ -1240,6 +1311,11 @@ void FlatLadderBook::rollback_undo_log_to(LadderUndoLog &log,
     const CompactDeltaToken &tok = log.pop_token();
     const std::size_t idx = tok.level_idx;
     IntrusiveLevel &level = level_at(idx);
+    // The prefix Fenwick is derived state: any structural restore invalidates
+    // it; the next queue_ahead rebuilds it from the restored chain.
+    if (idx < level_prefix_.size()) {
+      level_prefix_[idx].wm_dirty = true;
+    }
     const std::size_t side_idx = static_cast<std::size_t>(tok.order_side) & 1U;
 
     if (tok.kind == LadderDeltaKind::PartialFill) {

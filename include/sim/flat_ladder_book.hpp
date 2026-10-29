@@ -443,6 +443,27 @@ private:
     std::array<UndoScopeState, kMaxScopeDepth> scope_stack_{};
     std::uint16_t scope_depth_ = 0U;
 
+    // O(1) queue-prefix acceleration (docs/39_QRLOB_LEAN_GPU_INTEGRATION_BLUEPRINT.md,
+    // Area 2): per-level arrival-cumulus watermark, zero allocations at run
+    // time (all state preallocated at construction).
+    // - entry_cum_[slot] snapshot: cumulative live-chain volume up to and
+    //   including the order at insertion time.
+    // - Pure-FIFO + head-partial regime (the common case) answers in O(1):
+    //       ahead = cum(target) - qty(target) - cum(head) + qty(head).
+    // - The first interior cancel of a level permanently selects the exact
+    //   O(k) chain walk for that level (conservative, never wrong).
+    // - Rollbacks only set wm_dirty (O(1) per token); the next query rebuilds
+    //   entry_cum_ from the restored chain, so no undo-token layout changes.
+    struct LevelPrefix {
+        bool interior_seen = false;
+        bool wm_dirty = false;
+    };
+    std::pmr::vector<LevelPrefix> level_prefix_;
+    std::pmr::vector<std::uint64_t> entry_cum_;  // slot -> cumulative arrival volume snapshot
+
+    void watermark_rebuild(std::size_t level_idx) noexcept;
+    void prefix_on_removal(std::size_t level_idx, bool interior) noexcept;
+
     std::pmr::memory_resource* resource() noexcept { return &pool_; }
     const std::pmr::memory_resource* resource() const noexcept { return &pool_; }
 

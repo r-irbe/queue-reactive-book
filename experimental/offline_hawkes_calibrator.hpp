@@ -1029,6 +1029,324 @@ static_assert(!is_matching_kernel_input_v<HawkesMleResult>,
               "HawkesMleResult is an offline diagnostic, never a kernel input");
 static_assert(!is_matching_kernel_input_v<VolumeBucket>,
               "VolumeBucket is an offline diagnostic, never a kernel input");
+
+// ============================================================================
+// 6-CHANNEL SIGN-AWARE QUEUE-REACTIVE HAWKES MLE (docs/39 blueprint, Area 3)
+// ============================================================================
+
+// Channel encoding for the six event streams.
+//   0 = BuyLimit   1 = SellLimit    (baseline modulated by phi = 1/(1+g*q))
+//   2 = BuyCancel  3 = SellCancel   (baseline modulated by phi = 1 + g*q)
+//   4 = BuyMarket  5 = SellMarket   (baseline modulated by phi = 1 + g*q)
+inline constexpr std::uint8_t kSixChannelBuyLimit = 0;
+inline constexpr std::uint8_t kSixChannelSellLimit = 1;
+
+// LOBSTER event type (ArrivalEvent::mark) + side -> six-channel id.
+//   mark 1        -> limit submission (addition)
+//   mark 2 or 3   -> cancel / delete
+//   mark 4 or 5   -> execution (visible / hidden), aggressive flow
+//   anything else -> execution bucket (conservative)
+inline std::uint8_t six_channel_from_lobster(std::int32_t mark, bool is_buy) noexcept {
+    const std::uint8_t side_bit = is_buy ? 0 : 1;
+    // Group index: 0 = limit additions, 1 = cancels/deletes, 2 = executions.
+    std::uint8_t group = 2;
+    if (mark == 1) group = 0;
+    else if (mark == 2 || mark == 3) group = 1;
+    return static_cast<std::uint8_t>(2 * group + side_bit);
+}
+
+struct SixChannelEvent {
+    EventTime time = 0;
+    std::uint8_t channel = 0;  // 0..5, see constants above
+    std::int64_t queue_depth = 0;
+};
+
+// Per-channel analytical quantities. SoA layout over the 6 channels: the
+// per-channel loops below auto-vectorize to AVX2 under the project's
+// -mavx2 -O3 (QRLOB_ARCH_FLAGS); no intrinsics required for [6]-wide doubles.
+struct HawkesSixChannelEval {
+    double log_likelihood = 0.0;
+    double grad_mu[6] = {};
+    double grad_gamma[6] = {};
+    double grad_alpha = 0.0;
+    double grad_beta = 0.0;
+    double fisher_mu[6] = {};
+    double fisher_gamma[6] = {};
+    double fisher_alpha = 0.0;
+    double fisher_beta = 0.0;
+};
+
+// Sign-aware per-channel baseline modulator:
+//   additions (channel 0/1):  phi = 1 / (1 + gamma * q)      in (0, 1]
+//   removals  (channel 2..5): phi = 1 + gamma * q            in [phi_min, ...)
+// Both keep 1 + gamma*q bounded away from zero via phi_floor.
+inline double six_channel_phi(std::uint8_t channel, double gamma, double q,
+                              double phi_floor = 0.05) noexcept {
+    const double gq = gamma * q;
+    if (channel < 2) {
+        return 1.0 / std::max(phi_floor, 1.0 + gq);
+    }
+    return std::max(phi_floor, 1.0 + gq);
+}
+
+// Exact O(N) six-channel Ozaki log-likelihood with shared single-index
+// excitation (alpha, beta common to all channels) and per-channel
+// (mu_m, gamma_m) baselines. Analytical score and observed Fisher diagonal
+// follow the same compensator algebra as the scalar evaluator above.
+static HawkesSixChannelEval evaluate_log_likelihood_6ch(
+    std::span<const SixChannelEvent> events,
+    const double* mu,
+    double alpha,
+    double beta,
+    const double* gamma,
+    double q_bar_override = 0.0) noexcept {
+    HawkesSixChannelEval out{};
+    const std::size_t n = events.size();
+    if (n == 0 || beta <= 0.0) return out;
+
+    double q_bar = q_bar_override;
+    if (q_bar <= 0.0) {
+        double sum_q = 0.0;
+        for (std::size_t k = 0; k < n; ++k) {
+            sum_q += static_cast<double>(std::max<std::int64_t>(0, events[k].queue_depth));
+        }
+        q_bar = std::max(1.0, sum_q / static_cast<double>(n));
+    } else {
+        q_bar = std::max(1.0, q_bar);
+    }
+
+    const double inv_beta = 1.0 / beta;
+    const double inv_beta2 = inv_beta * inv_beta;
+    const double inv_beta3 = inv_beta2 * inv_beta;
+
+    double r = 0.0;
+    double rp = 0.0;
+    double rpp = 0.0;
+
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::uint8_t ch = static_cast<std::uint8_t>(events[k].channel % 6U);
+        const double q_k = static_cast<double>(
+            std::max<std::int64_t>(0, events[k].queue_depth)) / q_bar;
+
+        if (k > 0) {
+            const std::int64_t raw_dt_us = events[k].time - events[k - 1].time;
+            const double dt = (raw_dt_us > 0)
+                ? (static_cast<double>(raw_dt_us) * 1e-6)
+                : 1e-7;
+            const std::uint8_t chp = static_cast<std::uint8_t>(events[k - 1].channel % 6U);
+            const double q_prev = static_cast<double>(
+                std::max<std::int64_t>(0, events[k - 1].queue_depth)) / q_bar;
+            const double phi_prev = six_channel_phi(chp, gamma[chp], q_prev);
+            const double bdt = beta * dt;
+            const double e_bdt = std::exp(-bdt);
+            const double one_m_e = 1.0 - e_bdt;
+            const double r_plus = r + 1.0;
+            const double rp_prev = rp;
+            const double rpp_prev = rpp;
+
+            // Compensator of the shared excitation + previous channel baseline.
+            const double comp_k =
+                mu[chp] * phi_prev * dt + (alpha * inv_beta) * r_plus * one_m_e;
+            out.log_likelihood -= comp_k;
+
+            out.grad_mu[chp] -= phi_prev * dt;
+            out.grad_alpha -= (r_plus * inv_beta) * one_m_e;
+            if (chp < 2) {
+                const double denom = std::max(0.05, 1.0 + gamma[chp] * q_prev);
+                out.grad_gamma[chp] += mu[chp] * dt * q_prev / (denom * denom);
+            } else {
+                out.grad_gamma[chp] -= mu[chp] * dt * q_prev;
+            }
+
+            const double d_comp_dbeta =
+                (alpha * inv_beta) * rp_prev * one_m_e +
+                alpha * r_plus * (bdt * e_bdt - one_m_e) * inv_beta2;
+            const double d2_comp_dbeta2 =
+                (alpha * inv_beta) * rpp_prev * one_m_e +
+                2.0 * alpha * rp_prev * (bdt * e_bdt - one_m_e) * inv_beta2 +
+                alpha * r_plus * (-(bdt * bdt) * e_bdt - 2.0 * bdt * e_bdt + 2.0 * one_m_e) * inv_beta3;
+            out.grad_beta -= d_comp_dbeta;
+            out.fisher_beta += d2_comp_dbeta2;
+
+            // Baseline compensator second-order (mu and gamma of prev channel).
+            out.fisher_mu[chp] += 0.0;  // comp linear in mu: no second-order term
+            if (chp < 2) {
+                const double denom = std::max(0.05, 1.0 + gamma[chp] * q_prev);
+                const double d2 = 2.0 * mu[chp] * dt * q_prev * q_prev / (denom * denom * denom);
+                out.fisher_gamma[chp] += d2;
+            }
+
+            r = e_bdt * r_plus;
+            rp = e_bdt * (rp_prev - dt * r_plus);
+            rpp = e_bdt * (rpp_prev - 2.0 * dt * rp_prev + (dt * dt) * r_plus);
+        }
+
+        const double phi_k = six_channel_phi(ch, gamma[ch], q_k);
+        const double lam = std::max(1e-12, mu[ch] * phi_k + alpha * r);
+        out.log_likelihood += std::log(lam);
+
+        const double inv_lam = 1.0 / lam;
+        const double inv_lam2 = inv_lam * inv_lam;
+
+        const double d_lam_dmu = phi_k;
+        const double d_lam_dalpha = r;
+        const double d_lam_dbeta = alpha * rp;
+        const double d2_lam_dbeta2 = alpha * rpp;
+        double d_lam_dgamma;
+        double d2_lam_dgamma2;
+        if (ch < 2) {
+            const double denom = std::max(0.05, 1.0 + gamma[ch] * q_k);
+            d_lam_dgamma = -mu[ch] * q_k / (denom * denom);
+            d2_lam_dgamma2 = 2.0 * mu[ch] * q_k * q_k / (denom * denom * denom);
+        } else {
+            d_lam_dgamma = mu[ch] * q_k;
+            d2_lam_dgamma2 = 0.0;
+        }
+
+        out.grad_mu[ch] += d_lam_dmu * inv_lam;
+        out.grad_alpha += d_lam_dalpha * inv_lam;
+        out.grad_beta += d_lam_dbeta * inv_lam;
+        out.grad_gamma[ch] += d_lam_dgamma * inv_lam;
+
+        out.fisher_mu[ch] += (d_lam_dmu * d_lam_dmu) * inv_lam2;
+        out.fisher_alpha += (d_lam_dalpha * d_lam_dalpha) * inv_lam2;
+        out.fisher_beta += (d_lam_dbeta * d_lam_dbeta) * inv_lam2 - d2_lam_dbeta2 * inv_lam;
+        out.fisher_gamma[ch] += (d_lam_dgamma * d_lam_dgamma) * inv_lam2
+                                - d2_lam_dgamma2 * inv_lam;
+    }
+    return out;
+}
+
+// Six-channel calibration: stage 1 fits the shared (alpha, beta) excitation
+// with the scalar single-channel model; stage 2 runs projected damped Newton
+// with Armijo backtracking on the 12 baselines (mu[6], gamma[6]) with the
+// excitation held fixed, using the analytical per-channel score and Fisher
+// diagonal from evaluate_log_likelihood_6ch. Newton steps are clamped per
+// channel and the Fisher diagonal is floored for conditioning.
+struct HawkesSixChannelResult {
+    double mu[6] = {};
+    double gamma[6] = {};
+    double alpha = 0.0;
+    double beta = 0.0;
+    double log_likelihood = 0.0;
+    double score_max_abs = 0.0;
+    double fisher_min = 0.0;
+    std::uint32_t iterations = 0;
+    bool converged = false;
+};
+
+static HawkesSixChannelResult calibrate_mle_6ch(
+    std::span<const SixChannelEvent> events,
+    double train_fraction = 0.70) {
+    HawkesSixChannelResult res{};
+
+    // Stage 1: shared excitation via the scalar model on mark-agnostic events.
+    std::vector<ArrivalEvent> scalar_events;
+    scalar_events.reserve(events.size());
+    for (const SixChannelEvent& e : events) {
+        scalar_events.push_back(ArrivalEvent{
+            .seq = 0, .time = e.time, .mark = 1,
+            .queue_depth = e.queue_depth, .opp_queue_depth = 0, .spread_ticks = 1});
+    }
+    const std::size_t n_total = events.size();
+    if (n_total < 32) return res;
+    const std::size_t n_train = std::max<std::size_t>(
+        16, static_cast<std::size_t>(static_cast<double>(n_total) * train_fraction));
+    const HawkesMleResult scalar =
+        StateDependentHawkesCalibrator::calibrate_mle(
+            std::span<const ArrivalEvent>(scalar_events.data(), n_train), train_fraction);
+    res.alpha = scalar.alpha_hz;
+    res.beta = scalar.beta_hz;
+    if (!(res.beta > 0.0)) return res;
+
+    // Stage 2 initialization: per-channel Poisson rates; gamma at neutral.
+    std::size_t counts[6] = {};
+    for (std::size_t k = 0; k < n_train; ++k) {
+        ++counts[events[k].channel % 6U];
+    }
+    const double span_s = static_cast<double>(
+        events[n_train - 1].time - events[0].time) * 1e-6;
+    const double span = std::max(1e-6, span_s);
+    for (int c = 0; c < 6; ++c) {
+        res.mu[c] = std::max(1e-3, static_cast<double>(counts[c]) / span);
+        res.gamma[c] = 0.0;
+    }
+
+    const auto train = std::span<const SixChannelEvent>(events.data(), n_train);
+    HawkesSixChannelEval ev =
+        evaluate_log_likelihood_6ch(train, res.mu, res.alpha, res.beta, res.gamma);
+    double ll = ev.log_likelihood;
+    const double phi_floor = 0.05;
+
+    constexpr std::uint32_t kMaxIters = 60;
+    for (std::uint32_t it = 0; it < kMaxIters; ++it) {
+        res.iterations = it + 1;
+        double step_norm = 0.0;
+        bool improved = false;
+
+        for (int c = 0; c < 6; ++c) {
+            // Joint damped-Newton step on (mu_c, gamma_c) using the Fisher
+            // diagonal as the damping metric (per-channel 2x2 system).
+            const double g_mu = ev.grad_mu[c];
+            const double g_ga = ev.grad_gamma[c];
+            const double f_mu = std::max(1e-8, ev.fisher_mu[c]);
+            const double f_ga = std::max(1e-8, ev.fisher_gamma[c]);
+            const double d_mu = std::clamp(g_mu / f_mu, -0.50, 0.50);
+            const double d_ga = std::clamp(g_ga / f_ga, -0.50, 0.50);
+
+            double step = 1.0;
+            bool took = false;
+            for (int bt = 0; bt < 12; ++bt) {
+                const double new_mu = std::max(1e-6, res.mu[c] + step * d_mu);
+                const double new_ga = std::clamp(res.gamma[c] + step * d_ga,
+                                                 -0.90, 10.0);
+                double mu_t[6];
+                double ga_t[6];
+                for (int j = 0; j < 6; ++j) {
+                    mu_t[j] = res.mu[j];
+                    ga_t[j] = res.gamma[j];
+                }
+                mu_t[c] = new_mu;
+                ga_t[c] = new_ga;
+                const HawkesSixChannelEval trial =
+                    evaluate_log_likelihood_6ch(train, mu_t, res.alpha, res.beta, ga_t);
+                if (trial.log_likelihood >= ll - 1e-12) {
+                    res.mu[c] = new_mu;
+                    res.gamma[c] = new_ga;
+                    ll = trial.log_likelihood;
+                    ev = trial;
+                    took = true;
+                    improved = true;
+                    break;
+                }
+                step *= 0.5;
+            }
+            step_norm = std::max(step_norm, std::fabs(d_mu) + std::fabs(d_ga));
+            if (!took) break;  // no admissible step: stop on this sweep
+        }
+
+        if (!improved || step_norm < 1e-6) {
+            if (step_norm < 1e-6) res.converged = true;
+            break;
+        }
+    }
+
+    (void)phi_floor;
+    res.log_likelihood = ll;
+    res.score_max_abs = 0.0;
+    for (int c = 0; c < 6; ++c) {
+        res.score_max_abs = std::max(res.score_max_abs,
+                                     std::fabs(ev.grad_mu[c]));
+        res.score_max_abs = std::max(res.score_max_abs,
+                                     std::fabs(ev.grad_gamma[c]));
+        res.fisher_min = (c == 0)
+            ? std::min(ev.fisher_mu[c], ev.fisher_gamma[c])
+            : std::min(res.fisher_min,
+                       std::min(ev.fisher_mu[c], ev.fisher_gamma[c]));
+    }
+    return res;
+}
+
 static_assert(!is_matching_kernel_input_v<VpinResult>,
               "VpinResult is an offline diagnostic, never a kernel input");
 

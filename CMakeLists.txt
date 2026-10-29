@@ -64,6 +64,8 @@ enable_testing()
 set(QRLOB_TEST_SOURCES
     tests/main.cpp
     tests/test_pillar4_breakthroughs.cpp
+    tests/test_lean_gpu_parity.cpp
+    tests/test_flat_ladder_prefix.cpp
 )
 if(QRLOB_BUILD_EXPERIMENTAL)
     list(APPEND QRLOB_TEST_SOURCES tests/test_experimental_q_surface.cpp)
