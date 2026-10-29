@@ -26,6 +26,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -48,19 +49,20 @@ struct Xorshift64 {
 //   q      = state & 0xFFFF
 //   decay  = 65536 - q + ((q*q) >>> 17)          (verified hawkesDecayQ16)
 //   seed'  = seed ^ (seed >>> 7)
-//   ipart  = decay >>> 16
-//   surv   = ipart > (seed' & 0x7FFFFFFF) ? 1 : 0
-//   intens = (float) ipart
+//   surv   = ((decay << 15) > (seed' & 0x7FFFFFFF)) ? 1 : 0
+//            Exact thinning: P(survive) = decay/65536 (council F2 fix; the
+//            old integer-part predicate was degenerate, P <= 2^-31).
+//   intens = (float) decay * 2^-16   (true Q16 intensity, council F2 fix)
 void rollout_cpu_reference(const std::uint64_t* states, const std::uint64_t* seeds,
                            std::uint32_t* survival, float* intensity, std::int32_t n) noexcept {
     for (std::int32_t i = 0; i < n; ++i) {
         const std::uint64_t q = states[i] & 0xFFFFull;
         const std::uint64_t decay = 65536ull - q + ((q * q) >> 17);
         const std::uint64_t seed2 = seeds[i] ^ (seeds[i] >> 7);
-        const std::uint32_t ipart = static_cast<std::uint32_t>(decay >> 16);
+        const std::uint64_t scaled = decay << 15;  // decay <= 65536 -> fits u32
         const std::uint64_t thr = seed2 & 0x7FFFFFFFull;
-        survival[i] = ipart > thr ? 1u : 0u;
-        intensity[i] = static_cast<float>(ipart);
+        survival[i] = scaled > thr ? 1u : 0u;
+        intensity[i] = static_cast<float>(decay) * 1.52587890625e-05f;  // 2^-16
     }
 }
 
@@ -94,12 +96,24 @@ void ozaki_cpu_reference(const float* offsets, const std::uint32_t* channels,
 
 }  // namespace
 
+// Falsifier objection (REV-2026-10-29): a silent pass-through makes
+// "190/190" inadmissible as GPU-parity evidence. QRLOB_REQUIRE_GPU=1 turns
+// the driverless path into a loud failure; admissible evidence is
+//   QRLOB_REQUIRE_GPU=1 ./build/sim_test
+bool lean_gpu_evidence_required() noexcept {
+    static const bool v = std::getenv("QRLOB_REQUIRE_GPU") != nullptr;
+    return v;
+}
+
 TEST_CASE("Lean-verified qrlob rollout kernel CPU/GPU parity", "[lean_gpu][qrlob]") {
     sim::lean::LeanGpu gpu;
     const sim::lean::GpuStatus init = sim::lean::lean_gpu_init(&gpu);
     if (init != sim::lean::GpuStatus::kOk) {
-        std::printf("[skip] lean gpu parity: %s\n", sim::lean::gpu_status_string(init));
-        return;  // pass-through: CPU path stays authoritative without a driver
+        std::printf("[lean-gpu-skip] lean gpu parity: %s\n", sim::lean::gpu_status_string(init));
+        if (lean_gpu_evidence_required()) {
+            REQUIRE(init == sim::lean::GpuStatus::kOk);
+        }
+        return;  // driverless: CPU path stays authoritative unless QRLOB_REQUIRE_GPU
     }
 
     constexpr std::int32_t kN = 8192;  // multiple of the 256-thread block
@@ -152,7 +166,25 @@ TEST_CASE("Lean-verified qrlob rollout kernel CPU/GPU parity", "[lean_gpu][qrlob
     }
     const sim::ParityResult inten = sim::check_parity_double(
         ref_d.data(), ref_d.size(), cand_d.data(), cand_d.size());
+    if (!inten.accelerator_acceptable) {
+        const std::size_t m = inten.first_mismatch;
+        std::printf("[inten-mismatch] idx=%zu cpu=%.9g gpu=%.9g decay=%llu\n", m,
+                    ref_d[m], cand_d[m], (unsigned long long)(states[m] & 0xFFFFull));
+    }
     REQUIRE(inten.accelerator_acceptable);
+
+    // F2 regression guard: survival must thin at the true intensity rate
+    // (mean survival over many draws ~ mean intensity; the old degenerate
+    // predicate had mean survival ~ 0 and fails this loudly).
+    double sum_surv = 0.0, sum_intens = 0.0;
+    for (std::int32_t i = 0; i < kN; ++i) {
+        sum_surv += static_cast<double>(gpu_survival[static_cast<std::size_t>(i)]);
+        sum_intens += static_cast<double>(gpu_intensity[static_cast<std::size_t>(i)]);
+    }
+    const double mean_surv = sum_surv / static_cast<double>(kN);
+    const double mean_intens = sum_intens / static_cast<double>(kN);
+    REQUIRE(mean_intens > 0.5);  // Q16 decay lives in [0.5, 1)
+    REQUIRE(std::fabs(mean_surv - mean_intens) < 0.02 * mean_intens + 1e-6);
 
     REQUIRE(sim::lean::lean_gpu_shutdown(&gpu) == sim::lean::GpuStatus::kOk);
 }
@@ -161,15 +193,22 @@ TEST_CASE("Lean-verified qrlob ozaki score/fisher kernel CPU/GPU parity", "[lean
     sim::lean::LeanGpu gpu;
     const sim::lean::GpuStatus init = sim::lean::lean_gpu_init(&gpu);
     if (init != sim::lean::GpuStatus::kOk) {
-        std::printf("[skip] lean gpu parity: %s\n", sim::lean::gpu_status_string(init));
+        std::printf("[lean-gpu-skip] lean gpu parity: %s\n", sim::lean::gpu_status_string(init));
+        if (lean_gpu_evidence_required()) {
+            REQUIRE(init == sim::lean::GpuStatus::kOk);
+        }
         return;
     }
 
-    constexpr std::int32_t kN = 8192;  // block multiple for warp uniformity
+    // Council F1 settling: the butterfly reduction is now UB-free for ANY
+    // event count, so the cases include n_events % 32 != 0 (the old
+    // pre-fix kernel was only exercised at a block multiple of 32).
+    const std::int32_t caseN[2] = {8192, 1000};
+    for (const std::int32_t kN : caseN) {
     std::vector<float> offsets(static_cast<std::size_t>(kN));
     std::vector<std::uint32_t> channels(static_cast<std::size_t>(kN));
     std::vector<float> depths(static_cast<std::size_t>(kN));
-    Xorshift64 rng(0x0BADC0DECAFEBABEull);
+    Xorshift64 rng(0x0BADC0DECAFEBABEull + static_cast<std::uint64_t>(kN));
     for (std::int32_t i = 0; i < kN; ++i) {
         offsets[static_cast<std::size_t>(i)] =
             0.001f + static_cast<float>(rng.next() % 1000ull) / 1000.0f;
@@ -203,12 +242,14 @@ TEST_CASE("Lean-verified qrlob ozaki score/fisher kernel CPU/GPU parity", "[lean
     const double c_ll = static_cast<double>(gpu_ll);
     const double c_sc = static_cast<double>(gpu_sc);
     const double c_fi = static_cast<double>(gpu_fi);
+    INFO("n_events = " << kN);
     const sim::ParityResult p_ll = sim::check_parity_double(&ref_ll, 1, &c_ll, 1, tol);
     const sim::ParityResult p_sc = sim::check_parity_double(&ref_sc, 1, &c_sc, 1, tol);
     const sim::ParityResult p_fi = sim::check_parity_double(&ref_fi, 1, &c_fi, 1, tol);
     REQUIRE(p_ll.accelerator_acceptable);
     REQUIRE(p_sc.accelerator_acceptable);
     REQUIRE(p_fi.accelerator_acceptable);
+    }  // per-case loop (8192 block-multiple + 1000 = n % 32 != 0, council F1)
 
     REQUIRE(sim::lean::lean_gpu_shutdown(&gpu) == sim::lean::GpuStatus::kOk);
 }
