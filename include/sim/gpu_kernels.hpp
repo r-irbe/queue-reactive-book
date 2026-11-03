@@ -230,6 +230,254 @@ inline constexpr const char kOzakiScoreFisherPtx[] = R"QRLOBPTX(
 inline constexpr std::size_t kOzakiScoreFisherPtxLen =
     sizeof(kOzakiScoreFisherPtx) - 1;
 
+// Embedded PTX: lob_rollout_l5_kernel (sm_89, PTX 8.0)
+inline constexpr const char kRolloutL5KernelPtx[] = R"QRLOBPTX(
+//
+// CUDA PTX 8.0 Kernel Module
+// Target: sm_89 (Ada Lovelace / sm_89)
+//
+.version 8.0
+.target sm_89
+.address_size 64
+
+.visible .entry lob_rollout_l5_kernel(
+    .param .u64 param_bids,
+    .param .u64 param_asks,
+    .param .u64 param_rng_seeds,
+    .param .u64 param_out_survival,
+    .param .u64 param_out_mid_moves,
+    .param .s32 param_num_trajectories
+)
+{
+    .reg .pred  %p<16>;
+    .reg .b32   %r<48>;
+    .reg .b64   %rd<24>;
+    .reg .f32   %f<0>;
+    // Load kernel parameters
+    ld.param.u64    %rd1, [param_bids];
+    ld.param.u64    %rd2, [param_asks];
+    ld.param.u64    %rd3, [param_rng_seeds];
+    ld.param.u64    %rd4, [param_out_survival];
+    ld.param.u64    %rd5, [param_out_mid_moves];
+    ld.param.s32    %r1, [param_num_trajectories];
+    // global thread id = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r2, %ctaid.x;
+    mov.u32         %r3, %ntid.x;
+    mov.u32         %r4, %tid.x;
+    mad.lo.u32      %r5, %r2, %r3, %r4;
+    setp.ge.s32     %p1, %r5, %r1;
+    @%p1 bra        $L_EXIT;
+    // byte offsets for 5 queues per side (20 bytes per trajectory)
+    cvt.u64.u32     %rd6, %r5;
+    mul.lo.u64      %rd7, %rd6, 20;
+    add.u64         %rd8, %rd1, %rd7;
+    add.u64         %rd9, %rd2, %rd7;
+    // Load 5 bid queues
+    ld.global.u32   %r10, [%rd8];
+    ld.global.u32   %r11, [%rd8+4];
+    ld.global.u32   %r12, [%rd8+8];
+    ld.global.u32   %r13, [%rd8+12];
+    ld.global.u32   %r14, [%rd8+16];
+    // Load 5 ask queues
+    ld.global.u32   %r15, [%rd9];
+    ld.global.u32   %r16, [%rd9+4];
+    ld.global.u32   %r17, [%rd9+8];
+    ld.global.u32   %r18, [%rd9+12];
+    ld.global.u32   %r19, [%rd9+16];
+    // Load RNG seed
+    shl.b64         %rd10, %rd6, 3;
+    add.u64         %rd11, %rd3, %rd10;
+    ld.global.u64   %rd12, [%rd11];
+    // Stateless counter mix: golden ratio Weyl increment
+    add.u32         %r6, %r5, 1;
+    cvt.u64.u32     %rd13, %r6;
+    mov.u64         %rd14, -7046029254386353131;
+    mul.lo.u64      %rd15, %rd13, %rd14;
+    xor.b64         %rd16, %rd12, %rd15;
+    shr.u64         %rd17, %rd16, 7;
+    xor.b64         %rd18, %rd16, %rd17;
+    st.global.u64   [%rd11], %rd18;
+    // Event fields: side, level, kind, delta
+    cvt.u32.u64     %r20, %rd18;
+    and.b32         %r21, %r20, 1;
+    shr.u32         %r22, %r20, 1;
+    and.b32         %r23, %r22, 7;
+    setp.ge.s32     %p2, %r23, 5;
+    sub.u32         %r24, %r23, 5;
+    selp.u32        %r23, %r24, %r23, %p2;
+    shr.u32         %r25, %r20, 4;
+    and.b32         %r26, %r25, 3;
+    setp.eq.s32     %p3, %r26, 3;
+    selp.u32        %r26, 0, %r26, %p3;
+    shr.u32         %r27, %r20, 8;
+    and.b32         %r28, %r27, 31;
+    add.u32         %r29, %r28, 10;
+    mov.u32         %r30, 0;
+    setp.eq.u32     %p4, %r21, 0;
+    @!%p4 bra       $L_ASK_SIDE;
+    // Bid side transition
+    setp.eq.u32     %p5, %r26, 0;
+    @%p5 bra        $L_BID_ADD;
+    setp.eq.u32     %p6, %r26, 1;
+    @%p6 bra        $L_BID_CANCEL;
+    // Bid execution (hits level 0)
+    setp.gt.u32     %p7, %r10, %r29;
+    sub.u32         %r31, %r10, %r29;
+    selp.u32        %r10, %r31, 0, %p7;
+    bra             $L_BID_DEPLETION;
+  $L_BID_ADD:
+    setp.eq.u32     %p8, %r23, 0;
+    add.u32         %r32, %r10, %r29;
+    selp.u32        %r10, %r32, %r10, %p8;
+    setp.eq.u32     %p9, %r23, 1;
+    add.u32         %r32, %r11, %r29;
+    selp.u32        %r11, %r32, %r11, %p9;
+    setp.eq.u32     %p10, %r23, 2;
+    add.u32         %r32, %r12, %r29;
+    selp.u32        %r12, %r32, %r12, %p10;
+    setp.eq.u32     %p11, %r23, 3;
+    add.u32         %r32, %r13, %r29;
+    selp.u32        %r13, %r32, %r13, %p11;
+    setp.eq.u32     %p12, %r23, 4;
+    add.u32         %r32, %r14, %r29;
+    selp.u32        %r14, %r32, %r14, %p12;
+    bra             $L_TOPOFBOOK;
+  $L_BID_CANCEL:
+    setp.eq.u32     %p8, %r23, 0;
+    setp.gt.u32     %p7, %r10, %r29;
+    sub.u32         %r31, %r10, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r10, %r33, %r10, %p8;
+    setp.eq.u32     %p9, %r23, 1;
+    setp.gt.u32     %p7, %r11, %r29;
+    sub.u32         %r31, %r11, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r11, %r33, %r11, %p9;
+    setp.eq.u32     %p10, %r23, 2;
+    setp.gt.u32     %p7, %r12, %r29;
+    sub.u32         %r31, %r12, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r12, %r33, %r12, %p10;
+    setp.eq.u32     %p11, %r23, 3;
+    setp.gt.u32     %p7, %r13, %r29;
+    sub.u32         %r31, %r13, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r13, %r33, %r13, %p11;
+    setp.eq.u32     %p12, %r23, 4;
+    setp.gt.u32     %p7, %r14, %r29;
+    sub.u32         %r31, %r14, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r14, %r33, %r14, %p12;
+  $L_BID_DEPLETION:
+    setp.eq.u32     %p13, %r10, 0;
+    selp.u32        %r10, %r11, %r10, %p13;
+    selp.u32        %r11, %r12, %r11, %p13;
+    selp.u32        %r12, %r13, %r12, %p13;
+    selp.u32        %r13, %r14, %r13, %p13;
+    selp.u32        %r14, 100, %r14, %p13;
+    selp.s32        %r30, -1, 0, %p13;
+    bra             $L_TOPOFBOOK;
+  $L_ASK_SIDE:
+    setp.eq.u32     %p5, %r26, 0;
+    @%p5 bra        $L_ASK_ADD;
+    setp.eq.u32     %p6, %r26, 1;
+    @%p6 bra        $L_ASK_CANCEL;
+    // Ask execution (hits level 0)
+    setp.gt.u32     %p7, %r15, %r29;
+    sub.u32         %r31, %r15, %r29;
+    selp.u32        %r15, %r31, 0, %p7;
+    bra             $L_ASK_DEPLETION;
+  $L_ASK_ADD:
+    setp.eq.u32     %p8, %r23, 0;
+    add.u32         %r32, %r15, %r29;
+    selp.u32        %r15, %r32, %r15, %p8;
+    setp.eq.u32     %p9, %r23, 1;
+    add.u32         %r32, %r16, %r29;
+    selp.u32        %r16, %r32, %r16, %p9;
+    setp.eq.u32     %p10, %r23, 2;
+    add.u32         %r32, %r17, %r29;
+    selp.u32        %r17, %r32, %r17, %p10;
+    setp.eq.u32     %p11, %r23, 3;
+    add.u32         %r32, %r18, %r29;
+    selp.u32        %r18, %r32, %r18, %p11;
+    setp.eq.u32     %p12, %r23, 4;
+    add.u32         %r32, %r19, %r29;
+    selp.u32        %r19, %r32, %r19, %p12;
+    bra             $L_TOPOFBOOK;
+  $L_ASK_CANCEL:
+    setp.eq.u32     %p8, %r23, 0;
+    setp.gt.u32     %p7, %r15, %r29;
+    sub.u32         %r31, %r15, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r15, %r33, %r15, %p8;
+    setp.eq.u32     %p9, %r23, 1;
+    setp.gt.u32     %p7, %r16, %r29;
+    sub.u32         %r31, %r16, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r16, %r33, %r16, %p9;
+    setp.eq.u32     %p10, %r23, 2;
+    setp.gt.u32     %p7, %r17, %r29;
+    sub.u32         %r31, %r17, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r17, %r33, %r17, %p10;
+    setp.eq.u32     %p11, %r23, 3;
+    setp.gt.u32     %p7, %r18, %r29;
+    sub.u32         %r31, %r18, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r18, %r33, %r18, %p11;
+    setp.eq.u32     %p12, %r23, 4;
+    setp.gt.u32     %p7, %r19, %r29;
+    sub.u32         %r31, %r19, %r29;
+    selp.u32        %r33, %r31, 0, %p7;
+    selp.u32        %r19, %r33, %r19, %p12;
+  $L_ASK_DEPLETION:
+    setp.eq.u32     %p13, %r15, 0;
+    selp.u32        %r15, %r16, %r15, %p13;
+    selp.u32        %r16, %r17, %r16, %p13;
+    selp.u32        %r17, %r18, %r17, %p13;
+    selp.u32        %r18, %r19, %r18, %p13;
+    selp.u32        %r19, 100, %r19, %p13;
+    selp.s32        %r30, 1, 0, %p13;
+  $L_TOPOFBOOK:
+    // Store updated 5 bid queues
+    st.global.u32   [%rd8], %r10;
+    st.global.u32   [%rd8+4], %r11;
+    st.global.u32   [%rd8+8], %r12;
+    st.global.u32   [%rd8+12], %r13;
+    st.global.u32   [%rd8+16], %r14;
+    // Store updated 5 ask queues
+    st.global.u32   [%rd9], %r15;
+    st.global.u32   [%rd9+4], %r16;
+    st.global.u32   [%rd9+8], %r17;
+    st.global.u32   [%rd9+12], %r18;
+    st.global.u32   [%rd9+16], %r19;
+    // Store mid_move
+    shl.b64         %rd20, %rd6, 2;
+    add.u64         %rd21, %rd5, %rd20;
+    st.global.s32   [%rd21], %r30;
+    // GLFT/CJP top-of-book survival thinning
+    add.u32         %r34, %r10, %r15;
+    and.b32         %r35, %r34, 65535;
+    mov.u32         %r37, 65536;
+    sub.u32         %r38, %r37, %r35;
+    mul.lo.u32      %r39, %r35, %r35;
+    shr.u32         %r40, %r39, 17;
+    add.u32         %r41, %r38, %r40;
+    shl.b32         %r42, %r41, 15;
+    and.b64         %rd22, %rd18, 2147483647;
+    cvt.u32.u64     %r43, %rd22;
+    setp.gt.u32     %p14, %r42, %r43;
+    selp.u32        %r44, 1, 0, %p14;
+    add.u64         %rd23, %rd4, %rd20;
+    st.global.u32   [%rd23], %r44;
+  $L_EXIT:
+    ret;
+}
+)QRLOBPTX";
+
+inline constexpr std::size_t kRolloutL5KernelPtxLen =
+    sizeof(kRolloutL5KernelPtx) - 1;
+
 // Embedded sm_89 cubin: market_subgame_cfr_kernel (4904 bytes)
 alignas(16) inline constexpr std::uint8_t kMarketSubgameCubin[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x41, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1467,6 +1715,8 @@ struct GpuContext {
     CUfunction rollout_fn = nullptr;
     CUmodule ozaki_mod = nullptr;
     CUfunction ozaki_fn = nullptr;
+    CUmodule rollout_l5_mod = nullptr;
+    CUfunction rollout_l5_fn = nullptr;
     CUmodule subgame_mod = nullptr;
     CUfunction subgame_fn = nullptr;
     CUmodule online_regret_mod = nullptr;
@@ -1554,6 +1804,12 @@ inline int gpu_init(GpuContext* ctx) noexcept {
             ctx->online_regret_mod,
             "solve_lob_online_regret_kernel") != CUDA_SUCCESS) { gpu_shutdown(ctx); return -14; }
 
+    if (ctx->cuModuleLoadData(&ctx->rollout_l5_mod, kRolloutL5KernelPtx) != CUDA_SUCCESS) { gpu_shutdown(ctx); return -15; }
+    if (ctx->cuModuleGetFunction(
+            &ctx->rollout_l5_fn,
+            ctx->rollout_l5_mod,
+            "lob_rollout_l5_kernel") != CUDA_SUCCESS) { gpu_shutdown(ctx); return -16; }
+
     return 0;
 }
 
@@ -1570,6 +1826,10 @@ inline void gpu_shutdown(GpuContext* ctx) noexcept {
     if (ctx->ozaki_mod && ctx->cuModuleUnload) {
         ctx->cuModuleUnload(ctx->ozaki_mod);
         ctx->ozaki_mod = nullptr;
+    }
+    if (ctx->rollout_l5_mod && ctx->cuModuleUnload) {
+        ctx->cuModuleUnload(ctx->rollout_l5_mod);
+        ctx->rollout_l5_mod = nullptr;
     }
     if (ctx->rollout_mod && ctx->cuModuleUnload) {
         ctx->cuModuleUnload(ctx->rollout_mod);
@@ -1638,6 +1898,74 @@ inline int gpu_rollout(
         ctx->cuMemcpyDtoH(host_out_survival, d_surv,  n * sizeof(std::uint32_t)) != CUDA_SUCCESS ||
         ctx->cuMemcpyDtoH(host_out_intensity,d_inten, n * sizeof(float))         != CUDA_SUCCESS) {
         rc = -8;
+    }
+    cleanup();
+    return rc;
+}
+
+// Host wrapper for 5-level (L=5, 10 queues: 5 bid, 5 ask) lob_rollout_l5_kernel.
+inline int gpu_rollout_l5(
+    GpuContext* ctx,
+    std::uint32_t* host_bid_queues,
+    std::uint32_t* host_ask_queues,
+    std::uint64_t* host_rng_seeds,
+    std::uint32_t* host_out_survival,
+    std::int32_t* host_out_mid_moves,
+    std::int32_t n_trajectories) noexcept {
+    if (!ctx || !ctx->rollout_l5_fn || n_trajectories <= 0) return -1;
+    const std::size_t n = static_cast<std::size_t>(n_trajectories);
+    const std::size_t queue_bytes = n * 5U * sizeof(std::uint32_t);
+
+    CUdeviceptr d_bids = 0;
+    CUdeviceptr d_asks = 0;
+    CUdeviceptr d_seeds = 0;
+    CUdeviceptr d_surv = 0;
+    CUdeviceptr d_mid = 0;
+    int rc = 0;
+
+    auto cleanup = [&]() noexcept {
+        if (d_mid)   ctx->cuMemFree(d_mid);
+        if (d_surv)  ctx->cuMemFree(d_surv);
+        if (d_seeds) ctx->cuMemFree(d_seeds);
+        if (d_asks)  ctx->cuMemFree(d_asks);
+        if (d_bids)  ctx->cuMemFree(d_bids);
+    };
+
+    if (ctx->cuMemAlloc(&d_bids, queue_bytes)                   != CUDA_SUCCESS ||
+        ctx->cuMemAlloc(&d_asks, queue_bytes)                   != CUDA_SUCCESS ||
+        ctx->cuMemAlloc(&d_seeds, n * sizeof(std::uint64_t))    != CUDA_SUCCESS ||
+        ctx->cuMemAlloc(&d_surv,  n * sizeof(std::uint32_t))    != CUDA_SUCCESS ||
+        ctx->cuMemAlloc(&d_mid,   n * sizeof(std::int32_t))     != CUDA_SUCCESS) {
+        cleanup();
+        return -2;
+    }
+
+    if (ctx->cuMemcpyHtoD(d_bids,  host_bid_queues, queue_bytes)                != CUDA_SUCCESS ||
+        ctx->cuMemcpyHtoD(d_asks,  host_ask_queues, queue_bytes)                != CUDA_SUCCESS ||
+        ctx->cuMemcpyHtoD(d_seeds, host_rng_seeds,  n * sizeof(std::uint64_t))  != CUDA_SUCCESS) {
+        cleanup();
+        return -3;
+    }
+
+    void* params[6] = { &d_bids, &d_asks, &d_seeds, &d_surv, &d_mid, &n_trajectories };
+    const unsigned int block = 128U;
+    const unsigned int grid  = static_cast<unsigned int>((n + block - 1U) / block);
+    if (ctx->cuLaunchKernel(
+            ctx->rollout_l5_fn,
+            grid, 1U, 1U,
+            block, 1U, 1U,
+            0U, nullptr, params, nullptr) != CUDA_SUCCESS ||
+        ctx->cuCtxSynchronize() != CUDA_SUCCESS) {
+        cleanup();
+        return -4;
+    }
+
+    if (ctx->cuMemcpyDtoH(host_bid_queues,   d_bids,  queue_bytes)                != CUDA_SUCCESS ||
+        ctx->cuMemcpyDtoH(host_ask_queues,   d_asks,  queue_bytes)                != CUDA_SUCCESS ||
+        ctx->cuMemcpyDtoH(host_rng_seeds,    d_seeds, n * sizeof(std::uint64_t))  != CUDA_SUCCESS ||
+        ctx->cuMemcpyDtoH(host_out_survival, d_surv,  n * sizeof(std::uint32_t))  != CUDA_SUCCESS ||
+        ctx->cuMemcpyDtoH(host_out_mid_moves,d_mid,   n * sizeof(std::int32_t))   != CUDA_SUCCESS) {
+        rc = -5;
     }
     cleanup();
     return rc;

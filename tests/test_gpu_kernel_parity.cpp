@@ -63,6 +63,83 @@ void rollout_cpu_reference(
     }
 }
 
+// CPU reference matching lob_rollout_l5_kernel (HLR Model III 5-level 10 queues):
+void rollout_l5_cpu_reference(
+    std::uint32_t* bids,
+    std::uint32_t* asks,
+    std::uint64_t* seeds,
+    std::uint32_t* out_survival,
+    std::int32_t* out_mid_moves,
+    std::int32_t n) noexcept {
+    for (std::int32_t i = 0; i < n; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        const std::uint64_t s = seeds[idx];
+        const std::uint64_t mix = s ^ (static_cast<std::uint64_t>(i + 1) * sim::gpu::kWeylGoldenIncrement);
+        const std::uint64_t s_next = sim::gpu::rng_mix_step(mix);
+        seeds[idx] = s_next;
+
+        const std::uint32_t side = static_cast<std::uint32_t>(s_next & 1ULL);
+        std::uint32_t level = static_cast<std::uint32_t>((s_next >> 1U) & 7ULL);
+        if (level >= 5U) level -= 5U;
+        std::uint32_t kind = static_cast<std::uint32_t>((s_next >> 4U) & 3ULL);
+        if (kind == 3U) kind = 0U;
+        const std::uint32_t delta = static_cast<std::uint32_t>(10U + ((s_next >> 8U) & 31ULL));
+
+        std::int32_t mid_m = 0;
+        if (side == 0U) {
+            if (kind == 0U) {
+                bids[idx * 5U + level] += delta;
+            } else if (kind == 1U) {
+                bids[idx * 5U + level] = (bids[idx * 5U + level] > delta)
+                    ? (bids[idx * 5U + level] - delta)
+                    : 0U;
+            } else {
+                bids[idx * 5U + 0U] = (bids[idx * 5U + 0U] > delta)
+                    ? (bids[idx * 5U + 0U] - delta)
+                    : 0U;
+            }
+            if (bids[idx * 5U + 0U] == 0U) {
+                bids[idx * 5U + 0U] = bids[idx * 5U + 1U];
+                bids[idx * 5U + 1U] = bids[idx * 5U + 2U];
+                bids[idx * 5U + 2U] = bids[idx * 5U + 3U];
+                bids[idx * 5U + 3U] = bids[idx * 5U + 4U];
+                bids[idx * 5U + 4U] = 100U;
+                mid_m = -1;
+            }
+        } else {
+            if (kind == 0U) {
+                asks[idx * 5U + level] += delta;
+            } else if (kind == 1U) {
+                asks[idx * 5U + level] = (asks[idx * 5U + level] > delta)
+                    ? (asks[idx * 5U + level] - delta)
+                    : 0U;
+            } else {
+                asks[idx * 5U + 0U] = (asks[idx * 5U + 0U] > delta)
+                    ? (asks[idx * 5U + 0U] - delta)
+                    : 0U;
+            }
+            if (asks[idx * 5U + 0U] == 0U) {
+                asks[idx * 5U + 0U] = asks[idx * 5U + 1U];
+                asks[idx * 5U + 1U] = asks[idx * 5U + 2U];
+                asks[idx * 5U + 2U] = asks[idx * 5U + 3U];
+                asks[idx * 5U + 3U] = asks[idx * 5U + 4U];
+                asks[idx * 5U + 4U] = 100U;
+                mid_m = 1;
+            }
+        }
+
+        out_mid_moves[idx] = mid_m;
+
+        const std::uint64_t q_tot = static_cast<std::uint64_t>(
+            bids[idx * 5U + 0U] + asks[idx * 5U + 0U]) & 0xFFFFULL;
+        const std::uint64_t decay = sim::gpu::q16_horner_decay_step(q_tot);
+        out_survival[idx] = ((static_cast<std::uint32_t>(decay) << 15U) >
+                             static_cast<std::uint32_t>(s_next & 0x7FFFFFFFULL))
+                                ? 1U
+                                : 0U;
+    }
+}
+
 // CPU reference matching qrlob_gpu_ozaki_score_fisher_kernel:
 //   c      = (raw_c & 7) >= 6 ? 0 : (raw_c & 7)
 //   phi    = (c < 2) ? (1.0f - gamma[c] * q_tilde) : (1.0f + gamma[c] * q_tilde)
@@ -109,7 +186,10 @@ void ozaki_cpu_reference(
 TEST_CASE("GPU kernel header embeds valid PTX and sm_89 cubin magic",
           "[gpu_parity][qrlob]") {
     REQUIRE(sim::gpu::kRolloutKernelPtxLen > 512U);
+    REQUIRE(sim::gpu::kRolloutL5KernelPtxLen > 512U);
     REQUIRE(sim::gpu::kOzakiScoreFisherPtxLen > 512U);
+    REQUIRE(std::strstr(sim::gpu::kRolloutL5KernelPtx,
+                        ".visible .entry lob_rollout_l5_kernel") != nullptr);
     REQUIRE(std::strstr(sim::gpu::kRolloutKernelPtx,
                         ".visible .entry qrlob_gpu_batch_qr_hawkes_rollout_kernel") != nullptr);
     REQUIRE(std::strstr(sim::gpu::kOzakiScoreFisherPtx,
@@ -247,4 +327,66 @@ TEST_CASE("qrlob_gpu_ozaki_score_fisher_kernel warp reduction GPU vs CPU parity"
         REQUIRE(std::fabs(static_cast<double>(gpu_sc) - cpu_sc) <= 1e-4 * std::max(1.0, std::fabs(cpu_sc)));
         REQUIRE(std::fabs(static_cast<double>(gpu_fi) - cpu_fi) <= 1e-4 * std::max(1.0, std::fabs(cpu_fi)));
     }
+}
+
+TEST_CASE("lob_rollout_l5_kernel bit-exact GPU vs CPU parity",
+          "[gpu_parity][qrlob]") {
+    ScopedGpuContext gpu;
+    if (gpu.init_rc != 0) {
+        if (gpu_required()) {
+            REQUIRE(gpu.init_rc == 0);
+        }
+        return;
+    }
+
+    constexpr std::int32_t kN = 4096;
+    std::vector<std::uint32_t> bids_gpu(kN * 5), bids_cpu(kN * 5);
+    std::vector<std::uint32_t> asks_gpu(kN * 5), asks_cpu(kN * 5);
+    std::vector<std::uint64_t> seeds_gpu(kN), seeds_cpu(kN);
+    std::vector<std::uint32_t> surv_gpu(kN, 0U), surv_cpu(kN, 0U);
+    std::vector<std::int32_t> mid_gpu(kN, 0), mid_cpu(kN, 0);
+
+    for (std::int32_t i = 0; i < kN; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        for (std::size_t l = 0; l < 5U; ++l) {
+            const std::uint32_t b = static_cast<std::uint32_t>(100U + l * 20U + (static_cast<std::size_t>(i) % 7U));
+            const std::uint32_t a = static_cast<std::uint32_t>(100U + l * 20U + (static_cast<std::size_t>(i) % 11U));
+            bids_gpu[idx * 5U + l] = bids_cpu[idx * 5U + l] = b;
+            asks_gpu[idx * 5U + l] = asks_cpu[idx * 5U + l] = a;
+        }
+        const std::uint64_t r = 0x9E3779B97F4A7C15ULL ^ (static_cast<std::uint64_t>(i + 1) * 0xBF58476D1CE4E5B9ULL);
+        seeds_gpu[idx] = seeds_cpu[idx] = r;
+    }
+
+    REQUIRE(sim::gpu::gpu_rollout_l5(
+                &gpu.ctx,
+                bids_gpu.data(),
+                asks_gpu.data(),
+                seeds_gpu.data(),
+                surv_gpu.data(),
+                mid_gpu.data(),
+                kN) == 0);
+
+    rollout_l5_cpu_reference(
+        bids_cpu.data(),
+        asks_cpu.data(),
+        seeds_cpu.data(),
+        surv_cpu.data(),
+        mid_cpu.data(),
+        kN);
+
+    std::uint32_t survived_total = 0;
+    for (std::int32_t i = 0; i < kN; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        for (std::size_t l = 0; l < 5U; ++l) {
+            REQUIRE(bids_gpu[idx * 5U + l] == bids_cpu[idx * 5U + l]);
+            REQUIRE(asks_gpu[idx * 5U + l] == asks_cpu[idx * 5U + l]);
+        }
+        REQUIRE(seeds_gpu[idx] == seeds_cpu[idx]);
+        REQUIRE(surv_gpu[idx] == surv_cpu[idx]);
+        REQUIRE(mid_gpu[idx] == mid_cpu[idx]);
+        survived_total += surv_gpu[idx];
+    }
+    REQUIRE(survived_total > 1000U);
+    REQUIRE(survived_total < static_cast<std::uint32_t>(kN));
 }

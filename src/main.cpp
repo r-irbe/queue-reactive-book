@@ -495,6 +495,9 @@ int run_parity_mode(int sim_events, std::uint64_t seed) {
               << " gpu_rollout_trajs=" << gpu_rep.rollout_trajectories
               << " gpu_rollout_survived=" << gpu_rep.rollout_survived
               << " gpu_rollout_mismatches=" << gpu_rep.rollout_mismatches
+              << " gpu_rollout_l5_trajs=" << gpu_rep.rollout_l5_trajectories
+              << " gpu_rollout_l5_survived=" << gpu_rep.rollout_l5_survived
+              << " gpu_rollout_l5_mismatches=" << gpu_rep.rollout_l5_mismatches
               << " gpu_ozaki_events=" << gpu_rep.ozaki_events
               << " gpu_ozaki_loglik=" << std::fixed << std::setprecision(4) << gpu_rep.ozaki_gpu_loglik
               << " cpu_ozaki_loglik=" << gpu_rep.ozaki_cpu_loglik
@@ -579,10 +582,17 @@ void write_calibration_json(const std::string& json_path,
         ofs << "],\n";
         ofs << "        \"alpha_hz\": " << e.mle_6ch.alpha << ",\n";
         ofs << "        \"beta_hz\": " << e.mle_6ch.beta << ",\n";
+        ofs << "        \"beta_channel_hz\": [";
+        for (int c = 0; c < 6; ++c) {
+            ofs << e.mle_6ch.beta_channel[c] << (c + 1 < 6 ? ", " : "");
+        }
+        ofs << "],\n";
         ofs << "        \"spectral_radius\": " << e.mle_6ch.spectral_radius << ",\n";
         ofs << "        \"log_likelihood_train\": " << e.mle_6ch.log_likelihood << ",\n";
         ofs << "        \"log_likelihood_oos\": " << e.mle_6ch.log_likelihood_oos << ",\n";
         ofs << "        \"oos_llr_per_event\": " << e.mle_6ch.oos_llr_per_event << ",\n";
+        ofs << "        \"aic\": " << e.mle_6ch.aic << ",\n";
+        ofs << "        \"bic\": " << e.mle_6ch.bic << ",\n";
         ofs << "        \"iterations\": " << e.mle_6ch.iterations << ",\n";
         ofs << "        \"converged\": " << (e.mle_6ch.converged ? "true" : "false") << ",\n";
         ofs << "        \"alpha_matrix_hz\": [\n";

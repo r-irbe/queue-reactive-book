@@ -58,6 +58,22 @@ Headerless 20-column CSV aligned row-for-row with the message file (`4 * K` colu
 
 ---
 
+### 2.4 6-Channel Sign-Aware Ozaki Hawkes-QR MLE Calibration Summary (`lobster_calibration_summary.json`)
+
+Calibrated 6-channel sign-aware Ozaki Hawkes-QR parameters (48-parameter and 54-parameter joint damped-Newton MLE solvers) across the 5 NASDAQ TotalView-ITCH LOBSTER sample sessions (70/30 train/OOS split):
+
+| Ticker | Events | Train Log-Likelihood | AIC | BIC | Spectral Radius rho(Gamma) | OOS LLR / Event |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `AAPL` | 2000 | 5844.08 | -11592.17 | -11340.44 | 0.5528 | +2.4487 |
+| `AMZN` | 2000 | 2979.28 | -5862.56 | -5610.84 | 0.6629 | +4.0466 |
+| `GOOG` | 2000 | 3642.76 | -7189.52 | -6937.79 | 0.6837 | +3.7042 |
+| `INTC` | 2000 | 7520.63 | -14945.26 | -14693.54 | 0.5626 | +4.7353 |
+| `MSFT` | 2000 | 5568.26 | -11040.52 | -10788.80 | 0.5908 | +4.1802 |
+
+All calibrated models satisfy the subcritical stability condition rho(Gamma) < 1.0 and demonstrate strictly positive out-of-sample likelihood ratio gains over independent Poisson baseline processes.
+
+---
+
 ## 3. File Inventory & SHA-256 Checksums
 
 | File | Size (Bytes) | Rows | SHA-256 Checksum |
@@ -76,7 +92,7 @@ Headerless 20-column CSV aligned row-for-row with the message file (`4 * K` colu
 | `lobster_INTC_2012-06-21_orderbook_5.csv` | 227541 | 2000 | `86987d071c8834fec9c87f0cb0b914bee9bbfa97e3234a79e55e8bd7a5aa385e` |
 | `lobster_MSFT_2012-06-21_message_5.csv` | 80569 | 2000 | `aa87c7723f0df0cea832e9e04a0921731d76726e11e970dedccd9532cb0d5aa1` |
 | `lobster_MSFT_2012-06-21_orderbook_5.csv` | 233373 | 2000 | `645fb40170ae480fb51ea570ba63b01bee251f6e0df30ea58f7f49fe0fe2584e` |
-| `lobster_calibration_summary.json` | 13813 | 328 | `a4d0d906c9ab8f444d220842558e4375e6c9aa9cc916eea63a24d138bebd219e` |
+| `lobster_calibration_summary.json` | 14639 | 343 | `e584645e9b51db28d76ed3e29ad739c83777ca7938675928c55c9f71ef0e52bf` |
 | `qr_simulator_intensities.json` | 38780 | 1514 | `4f1b305ac9ca457d4405f8a36f6f5b7be7ad8bb424829ab7684e5bcc39e066ca` |
 
 ### Extended 10,000-Row Raw Archive Reference Checksums

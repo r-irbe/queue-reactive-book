@@ -603,9 +603,57 @@ TEST_CASE("experimental 6-channel sign-aware Ozaki Hawkes MLE and 6x6 cross-exci
     for (int m = 0; m < 6; ++m) {
         REQUIRE(res.mu[m] > 0.0);
         REQUIRE(std::isfinite(res.gamma[m]));
+        REQUIRE(res.beta_channel[m] > 0.0);
         for (int n = 0; n < 6; ++n) {
             REQUIRE(res.alpha_matrix[m][n] > 0.0);
             REQUIRE(res.branching_matrix[m][n] > 0.0);
         }
     }
+
+    // 54-parameter joint damped-Newton (free beta_m per channel)
+    const auto res54 = calibrate_mle_6ch(
+        std::span<const SixChannelEvent>(events.data(), events.size()), 0.70,
+        HawkesMle6chMode::DampedNewton54Param);
+    REQUIRE(res54.beta > 0.0);
+    REQUIRE(res54.alpha > 0.0);
+    REQUIRE(res54.spectral_radius > 0.0);
+    REQUIRE(res54.spectral_radius < 1.0);
+    REQUIRE(std::isfinite(res54.log_likelihood));
+    REQUIRE(std::isfinite(res54.log_likelihood_oos));
+    REQUIRE(std::isfinite(res54.oos_llr_per_event));
+    REQUIRE(std::isfinite(res54.aic));
+    REQUIRE(std::isfinite(res54.bic));
+
+    for (int m = 0; m < 6; ++m) {
+        REQUIRE(res54.mu[m] > 0.0);
+        REQUIRE(std::isfinite(res54.gamma[m]));
+        REQUIRE(res54.beta_channel[m] > 0.0);
+        for (int n = 0; n < 6; ++n) {
+            REQUIRE(res54.alpha_matrix[m][n] > 0.0);
+            REQUIRE(res54.branching_matrix[m][n] > 0.0);
+        }
+    }
+}
+
+TEST_CASE("experimental lobster_calibration_summary.json verified",
+          "[experimental][hawkes][calibration_summary]") {
+    std::string summary_path = "data/lobster_calibration_summary.json";
+    std::ifstream ifs(summary_path);
+    if (!ifs.is_open()) {
+        summary_path = "../data/lobster_calibration_summary.json";
+        ifs.open(summary_path);
+    }
+    REQUIRE(ifs.is_open());
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    REQUIRE(content.size() > 5000);
+    REQUIRE(content.find("\"schema_version\": \"2.0\"") != std::string::npos);
+    const char* tickers[] = {"AAPL", "AMZN", "GOOG", "INTC", "MSFT"};
+    for (const char* sym : tickers) {
+        REQUIRE(content.find(std::string("\"") + sym + "\": {") != std::string::npos);
+    }
+    REQUIRE(content.find("\"spectral_radius\":") != std::string::npos);
+    REQUIRE(content.find("\"log_likelihood_train\":") != std::string::npos);
+    REQUIRE(content.find("\"aic\":") != std::string::npos);
+    REQUIRE(content.find("\"bic\":") != std::string::npos);
 }

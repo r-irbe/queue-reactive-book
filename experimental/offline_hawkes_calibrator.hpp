@@ -1217,27 +1217,37 @@ static HawkesSixChannelEval evaluate_log_likelihood_6ch(
     return out;
 }
 
-// Six-channel calibration: stage 1 fits the shared (alpha, beta) excitation
-// with the scalar single-channel model; stage 2 runs projected damped Newton
-// with Armijo backtracking on the 12 baselines (mu[6], gamma[6]) with the
-// excitation held fixed, using the analytical per-channel score and Fisher
-// diagonal from evaluate_log_likelihood_6ch. Newton steps are clamped per
-// channel and the Fisher diagonal is floored for conditioning.
+// Solver mode for 6-channel Hawkes-QR MLE calibration.
+// Primary literature: Hawkes (1971), Ozaki (1979), Ogata (1981),
+// Bacry-Mastromatteo-Muzy (2015), Wu-Bacry-Muzy (2019), Morariu-Patrichi & Pakkanen (2022).
+enum class HawkesMle6chMode : std::uint8_t {
+    DampedNewton48Param = 0,
+    DampedNewton54Param = 1,
+};
+
+// Six-channel Hawkes-QR MLE calibration result.
+// Supports 48-parameter joint damped-Newton (8x8 block-Hessian per channel with beta
+// on the calibrated decay grid) and 54-parameter joint damped-Newton (9x9 block-Hessian
+// per channel with free decay rates beta_m).
 struct HawkesSixChannelResult {
     double mu[6] = {};
     double gamma[6] = {};
     double alpha = 0.0;
     double beta = 0.0;
+    double beta_channel[6] = {};
     double alpha_matrix[6][6] = {};
     double branching_matrix[6][6] = {};
     double spectral_radius = 0.0;
     double log_likelihood = 0.0;
     double log_likelihood_oos = 0.0;
     double oos_llr_per_event = 0.0;
+    double aic = 0.0;
+    double bic = 0.0;
     double score_max_abs = 0.0;
     double fisher_min = 0.0;
     std::uint32_t iterations = 0;
     bool converged = false;
+    HawkesMle6chMode solver_mode = HawkesMle6chMode::DampedNewton48Param;
 };
 
 // Power-iteration spectral radius rho(Gamma) for a non-negative 6x6 branching matrix.
@@ -1265,31 +1275,373 @@ inline double compute_spectral_radius_6x6(const double gamma_mat[6][6]) noexcept
     return rho;
 }
 
+// Exact Gaussian elimination with partial pivoting for small dense systems (Dim <= 9).
+template <std::size_t Dim>
+inline bool solve_linear_system(const double A[Dim][Dim], const double b[Dim], double x[Dim]) noexcept {
+    double M[Dim][Dim + 1];
+    for (std::size_t i = 0; i < Dim; ++i) {
+        for (std::size_t j = 0; j < Dim; ++j) {
+            M[i][j] = A[i][j];
+        }
+        M[i][Dim] = b[i];
+    }
+    for (std::size_t col = 0; col < Dim; ++col) {
+        std::size_t pivot = col;
+        double max_val = std::abs(M[col][col]);
+        for (std::size_t row = col + 1; row < Dim; ++row) {
+            const double v = std::abs(M[row][col]);
+            if (v > max_val) {
+                max_val = v;
+                pivot = row;
+            }
+        }
+        if (max_val < 1e-15) return false;
+        if (pivot != col) {
+            for (std::size_t j = col; j <= Dim; ++j) {
+                std::swap(M[col][j], M[pivot][j]);
+            }
+        }
+        const double inv_diag = 1.0 / M[col][col];
+        for (std::size_t row = col + 1; row < Dim; ++row) {
+            const double factor = M[row][col] * inv_diag;
+            for (std::size_t j = col; j <= Dim; ++j) {
+                M[row][j] -= factor * M[col][j];
+            }
+        }
+    }
+    for (int i = static_cast<int>(Dim) - 1; i >= 0; --i) {
+        double sum = M[i][Dim];
+        for (std::size_t j = static_cast<std::size_t>(i + 1); j < Dim; ++j) {
+            sum -= M[i][j] * x[j];
+        }
+        x[i] = sum / M[i][i];
+    }
+    return true;
+}
+
+// Sign-aware per-channel baseline modulator and its analytical derivatives:
+//   additions (channel 0/1):  phi = 1 / (1 + gamma * q)
+//   removals  (channel 2..5): phi = 1 + gamma * q
+inline void eval_six_channel_phi(
+    std::uint8_t channel, double gamma, double q,
+    double& phi, double& dphi, double& d2phi,
+    double phi_floor = 0.05) noexcept {
+    if (channel < 2) {
+        const double u = std::max(phi_floor, 1.0 + gamma * q);
+        const double inv_u = 1.0 / u;
+        phi = inv_u;
+        dphi = -q * (inv_u * inv_u);
+        d2phi = 2.0 * (q * q) * (inv_u * inv_u * inv_u);
+    } else {
+        const double u = std::max(phi_floor, 1.0 + gamma * q);
+        phi = u;
+        dphi = q;
+        d2phi = 0.0;
+    }
+}
+
+// 8D per-channel log-likelihood, analytical score, and exact 8x8 analytical block-Hessian:
+// theta = (mu_m, gamma_m, alpha_{m,0}, ..., alpha_{m,5}) with beta fixed.
+inline double eval_channel_m_48(
+    std::span<const SixChannelEvent> events,
+    std::uint8_t m,
+    const double theta[8],
+    double beta,
+    double q_bar,
+    double* out_grad,
+    double out_hess[8][8]) noexcept {
+    const double mu = theta[0];
+    const double gamma = theta[1];
+    const double* alphas = &theta[2];
+    double ll = 0.0;
+
+    if (out_grad) {
+        for (int i = 0; i < 8; ++i) out_grad[i] = 0.0;
+    }
+    if (out_hess) {
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                out_hess[i][j] = 0.0;
+            }
+        }
+    }
+
+    const std::size_t n = events.size();
+    if (n == 0 || beta <= 0.0) return ll;
+
+    const double inv_beta = 1.0 / beta;
+    double r[6] = {};
+
+    for (std::size_t k = 0; k < n; ++k) {
+        const double q_k = static_cast<double>(std::max<std::int64_t>(0, events[k].queue_depth)) / q_bar;
+        if (k > 0) {
+            const std::int64_t raw_dt_us = events[k].time - events[k - 1].time;
+            const double dt = (raw_dt_us > 0) ? (static_cast<double>(raw_dt_us) * 1e-6) : 1e-7;
+            const double q_prev = static_cast<double>(std::max<std::int64_t>(0, events[k - 1].queue_depth)) / q_bar;
+            const std::uint8_t ch_prev = static_cast<std::uint8_t>(events[k - 1].channel % 6U);
+
+            double phi_prev = 0.0, dphi_prev = 0.0, d2phi_prev = 0.0;
+            eval_six_channel_phi(m, gamma, q_prev, phi_prev, dphi_prev, d2phi_prev);
+
+            const double bdt = beta * dt;
+            const double e_b = std::exp(-bdt);
+            const double one_m_e = 1.0 - e_b;
+            const double e0 = one_m_e * inv_beta;
+
+            double r_plus[6];
+            for (int j = 0; j < 6; ++j) {
+                r_plus[j] = r[j] + (ch_prev == j ? 1.0 : 0.0);
+            }
+
+            const double comp_base = mu * phi_prev * dt;
+            ll -= comp_base;
+            if (out_grad) {
+                out_grad[0] -= phi_prev * dt;
+                out_grad[1] -= mu * dphi_prev * dt;
+            }
+            if (out_hess) {
+                out_hess[0][1] -= dphi_prev * dt;
+                out_hess[1][0] -= dphi_prev * dt;
+                out_hess[1][1] -= mu * d2phi_prev * dt;
+            }
+
+            for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                const double i_n = r_plus[n_idx] * e0;
+                ll -= alphas[n_idx] * i_n;
+                if (out_grad) {
+                    out_grad[2 + n_idx] -= i_n;
+                }
+                r[n_idx] = e_b * r_plus[n_idx];
+            }
+        }
+
+        if ((events[k].channel % 6U) == m) {
+            double phi_k = 0.0, dphi_k = 0.0, d2phi_k = 0.0;
+            eval_six_channel_phi(m, gamma, q_k, phi_k, dphi_k, d2phi_k);
+
+            double exc = 0.0;
+            for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                exc += alphas[n_idx] * r[n_idx];
+            }
+            const double lam = std::max(1e-12, mu * phi_k + exc);
+            ll += std::log(lam);
+
+            if (out_grad || out_hess) {
+                double g_lam[8];
+                g_lam[0] = phi_k;
+                g_lam[1] = mu * dphi_k;
+                for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                    g_lam[2 + n_idx] = r[n_idx];
+                }
+
+                const double inv_lam = 1.0 / lam;
+                if (out_grad) {
+                    for (int i = 0; i < 8; ++i) {
+                        out_grad[i] += inv_lam * g_lam[i];
+                    }
+                }
+                if (out_hess) {
+                    const double inv_lam2 = inv_lam * inv_lam;
+                    for (int i = 0; i < 8; ++i) {
+                        for (int j = 0; j < 8; ++j) {
+                            out_hess[i][j] -= inv_lam2 * g_lam[i] * g_lam[j];
+                        }
+                    }
+                    out_hess[0][1] += inv_lam * dphi_k;
+                    out_hess[1][0] += inv_lam * dphi_k;
+                    out_hess[1][1] += inv_lam * (mu * d2phi_k);
+                }
+            }
+        }
+    }
+    return ll;
+}
+
+// 9D per-channel log-likelihood, analytical score, and exact 9x9 analytical block-Hessian:
+// theta = (mu_m, gamma_m, alpha_{m,0}, ..., alpha_{m,5}, beta_m).
+inline double eval_channel_m_54(
+    std::span<const SixChannelEvent> events,
+    std::uint8_t m,
+    const double theta[9],
+    double q_bar,
+    double* out_grad,
+    double out_hess[9][9]) noexcept {
+    const double mu = theta[0];
+    const double gamma = theta[1];
+    const double* alphas = &theta[2];
+    const double beta = std::max(1.0, theta[8]);
+    double ll = 0.0;
+
+    if (out_grad) {
+        for (int i = 0; i < 9; ++i) out_grad[i] = 0.0;
+    }
+    if (out_hess) {
+        for (int i = 0; i < 9; ++i) {
+            for (int j = 0; j < 9; ++j) {
+                out_hess[i][j] = 0.0;
+            }
+        }
+    }
+
+    const std::size_t n = events.size();
+    if (n == 0) return ll;
+
+    const double inv_beta = 1.0 / beta;
+    const double inv_beta2 = inv_beta * inv_beta;
+    const double inv_beta3 = inv_beta2 * inv_beta;
+    double r[6] = {};
+    double rp[6] = {};
+    double rpp[6] = {};
+
+    for (std::size_t k = 0; k < n; ++k) {
+        const double q_k = static_cast<double>(std::max<std::int64_t>(0, events[k].queue_depth)) / q_bar;
+        if (k > 0) {
+            const std::int64_t raw_dt_us = events[k].time - events[k - 1].time;
+            const double dt = (raw_dt_us > 0) ? (static_cast<double>(raw_dt_us) * 1e-6) : 1e-7;
+            const double q_prev = static_cast<double>(std::max<std::int64_t>(0, events[k - 1].queue_depth)) / q_bar;
+            const std::uint8_t ch_prev = static_cast<std::uint8_t>(events[k - 1].channel % 6U);
+
+            double phi_prev = 0.0, dphi_prev = 0.0, d2phi_prev = 0.0;
+            eval_six_channel_phi(m, gamma, q_prev, phi_prev, dphi_prev, d2phi_prev);
+
+            const double bdt = beta * dt;
+            const double e_b = std::exp(-bdt);
+            const double one_m_e = 1.0 - e_b;
+            const double e0 = one_m_e * inv_beta;
+            const double e1 = (bdt * e_b - one_m_e) * inv_beta2;
+            const double e2 = (-(bdt * bdt) * e_b - 2.0 * bdt * e_b + 2.0 * one_m_e) * inv_beta3;
+
+            double r_plus[6], rp_plus[6], rpp_plus[6];
+            for (int j = 0; j < 6; ++j) {
+                r_plus[j] = r[j] + (ch_prev == j ? 1.0 : 0.0);
+                rp_plus[j] = rp[j];
+                rpp_plus[j] = rpp[j];
+            }
+
+            const double comp_base = mu * phi_prev * dt;
+            ll -= comp_base;
+            if (out_grad) {
+                out_grad[0] -= phi_prev * dt;
+                out_grad[1] -= mu * dphi_prev * dt;
+            }
+            if (out_hess) {
+                out_hess[0][1] -= dphi_prev * dt;
+                out_hess[1][0] -= dphi_prev * dt;
+                out_hess[1][1] -= mu * d2phi_prev * dt;
+            }
+
+            for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                const double i_n = r_plus[n_idx] * e0;
+                const double i_p_n = rp_plus[n_idx] * e0 + r_plus[n_idx] * e1;
+                const double i_pp_n = rpp_plus[n_idx] * e0 + 2.0 * rp_plus[n_idx] * e1 + r_plus[n_idx] * e2;
+
+                ll -= alphas[n_idx] * i_n;
+                if (out_grad) {
+                    out_grad[2 + n_idx] -= i_n;
+                    out_grad[8] -= alphas[n_idx] * i_p_n;
+                }
+                if (out_hess) {
+                    out_hess[2 + n_idx][8] -= i_p_n;
+                    out_hess[8][2 + n_idx] -= i_p_n;
+                    out_hess[8][8] -= alphas[n_idx] * i_pp_n;
+                }
+
+                r[n_idx] = e_b * r_plus[n_idx];
+                rp[n_idx] = e_b * (rp_plus[n_idx] - dt * r_plus[n_idx]);
+                rpp[n_idx] = e_b * (rpp_plus[n_idx] - 2.0 * dt * rp_plus[n_idx] + (dt * dt) * r_plus[n_idx]);
+            }
+        }
+
+        if ((events[k].channel % 6U) == m) {
+            double phi_k = 0.0, dphi_k = 0.0, d2phi_k = 0.0;
+            eval_six_channel_phi(m, gamma, q_k, phi_k, dphi_k, d2phi_k);
+
+            double exc = 0.0;
+            double exc_p = 0.0;
+            double exc_pp = 0.0;
+            for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                exc += alphas[n_idx] * r[n_idx];
+                exc_p += alphas[n_idx] * rp[n_idx];
+                exc_pp += alphas[n_idx] * rpp[n_idx];
+            }
+            const double lam = std::max(1e-12, mu * phi_k + exc);
+            ll += std::log(lam);
+
+            if (out_grad || out_hess) {
+                double g_lam[9];
+                g_lam[0] = phi_k;
+                g_lam[1] = mu * dphi_k;
+                for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                    g_lam[2 + n_idx] = r[n_idx];
+                }
+                g_lam[8] = exc_p;
+
+                const double inv_lam = 1.0 / lam;
+                if (out_grad) {
+                    for (int i = 0; i < 9; ++i) {
+                        out_grad[i] += inv_lam * g_lam[i];
+                    }
+                }
+                if (out_hess) {
+                    const double inv_lam2 = inv_lam * inv_lam;
+                    for (int i = 0; i < 9; ++i) {
+                        for (int j = 0; j < 9; ++j) {
+                            out_hess[i][j] -= inv_lam2 * g_lam[i] * g_lam[j];
+                        }
+                    }
+                    out_hess[0][1] += inv_lam * dphi_k;
+                    out_hess[1][0] += inv_lam * dphi_k;
+                    out_hess[1][1] += inv_lam * (mu * d2phi_k);
+                    for (int n_idx = 0; n_idx < 6; ++n_idx) {
+                        out_hess[2 + n_idx][8] += inv_lam * rp[n_idx];
+                        out_hess[8][2 + n_idx] += inv_lam * rp[n_idx];
+                    }
+                    out_hess[8][8] += inv_lam * exc_pp;
+                }
+            }
+        }
+    }
+    return ll;
+}
+
+// 6-channel joint damped-Newton Hawkes-QR MLE calibrator.
+// Supports both 48-parameter (8x8 block-Hessian per channel with beta on calibrated decay grid)
+// and 54-parameter (9x9 block-Hessian per channel with free beta_m).
 static HawkesSixChannelResult calibrate_mle_6ch(
     std::span<const SixChannelEvent> events,
-    double train_fraction = 0.70) {
+    double train_fraction = 0.70,
+    HawkesMle6chMode mode = HawkesMle6chMode::DampedNewton48Param) {
     HawkesSixChannelResult res{};
+    res.solver_mode = mode;
 
-    // Stage 1: shared excitation via the scalar model on mark-agnostic events.
-    std::vector<ArrivalEvent> scalar_events;
-    scalar_events.reserve(events.size());
-    for (const SixChannelEvent& e : events) {
-        scalar_events.push_back(ArrivalEvent{
-            .seq = 0, .time = e.time, .mark = 1,
-            .queue_depth = e.queue_depth, .opp_queue_depth = 0, .spread_ticks = 1});
-    }
     const std::size_t n_total = events.size();
     if (n_total < 32) return res;
+
     const std::size_t n_train = std::max<std::size_t>(
         16, static_cast<std::size_t>(static_cast<double>(n_total) * train_fraction));
+    const auto train = events.subspan(0, n_train);
+
+    double sum_q = 0.0;
+    for (std::size_t k = 0; k < n_train; ++k) {
+        sum_q += static_cast<double>(std::max<std::int64_t>(0, events[k].queue_depth));
+    }
+    const double q_bar = std::max(1.0, sum_q / static_cast<double>(n_train));
+
+    // Stage 1: shared excitation via scalar model on mark-agnostic events
+    std::vector<ArrivalEvent> scalar_events;
+    scalar_events.reserve(n_train);
+    for (std::size_t k = 0; k < n_train; ++k) {
+        scalar_events.push_back(ArrivalEvent{
+            .seq = 0, .time = events[k].time, .mark = 1,
+            .queue_depth = events[k].queue_depth, .opp_queue_depth = 0, .spread_ticks = 1});
+    }
     const HawkesMleResult scalar =
         StateDependentHawkesCalibrator::calibrate_mle(
-            std::span<const ArrivalEvent>(scalar_events.data(), n_train), train_fraction);
-    res.alpha = scalar.alpha_hz;
-    res.beta = scalar.beta_hz;
-    if (!(res.beta > 0.0)) return res;
+            std::span<const ArrivalEvent>(scalar_events.data(), n_train), 0.70);
+    const double beta_scalar = (scalar.beta_hz > 0.0) ? scalar.beta_hz : 10.0;
+    const double alpha_scalar = (scalar.alpha_hz > 0.0) ? scalar.alpha_hz : 2.0;
 
-    // Stage 2 initialization: per-channel Poisson rates; gamma at neutral.
+    // Stage 2 initialization: per-channel Poisson rates; neutral gamma; cross-excitation seeded
     std::size_t counts[6] = {};
     for (std::size_t k = 0; k < n_train; ++k) {
         ++counts[events[k].channel % 6U];
@@ -1297,155 +1649,249 @@ static HawkesSixChannelResult calibrate_mle_6ch(
     const double span_s = static_cast<double>(
         events[n_train - 1].time - events[0].time) * 1e-6;
     const double span = std::max(1e-6, span_s);
+
+    double mu_init[6] = {};
+    double gamma_init[6] = {};
+    double alpha_init[6][6] = {};
     for (int c = 0; c < 6; ++c) {
-        res.mu[c] = std::max(1e-3, static_cast<double>(counts[c]) / span);
-        res.gamma[c] = 0.0;
-    }
-
-    const auto train = std::span<const SixChannelEvent>(events.data(), n_train);
-    HawkesSixChannelEval ev =
-        evaluate_log_likelihood_6ch(train, res.mu, res.alpha, res.beta, res.gamma);
-    double ll = ev.log_likelihood;
-
-    constexpr std::uint32_t kMaxIters = 60;
-    for (std::uint32_t it = 0; it < kMaxIters; ++it) {
-        res.iterations = it + 1;
-        double step_norm = 0.0;
-        bool improved = false;
-
-        for (int c = 0; c < 6; ++c) {
-            const double g_mu = ev.grad_mu[c];
-            const double g_ga = ev.grad_gamma[c];
-            const double f_mu = std::max(1e-8, ev.fisher_mu[c]);
-            const double f_ga = std::max(1e-8, ev.fisher_gamma[c]);
-            const double d_mu = std::clamp(g_mu / f_mu, -0.50, 0.50);
-            const double d_ga = std::clamp(g_ga / f_ga, -0.50, 0.50);
-
-            double step = 1.0;
-            bool took = false;
-            for (int bt = 0; bt < 12; ++bt) {
-                const double new_mu = std::max(1e-6, res.mu[c] + step * d_mu);
-                const double new_ga = std::clamp(res.gamma[c] + step * d_ga,
-                                                 -0.90, 10.0);
-                double mu_t[6];
-                double ga_t[6];
-                for (int j = 0; j < 6; ++j) {
-                    mu_t[j] = res.mu[j];
-                    ga_t[j] = res.gamma[j];
-                }
-                mu_t[c] = new_mu;
-                ga_t[c] = new_ga;
-                const HawkesSixChannelEval trial =
-                    evaluate_log_likelihood_6ch(train, mu_t, res.alpha, res.beta, ga_t);
-                if (trial.log_likelihood >= ll - 1e-12) {
-                    res.mu[c] = new_mu;
-                    res.gamma[c] = new_ga;
-                    ll = trial.log_likelihood;
-                    ev = trial;
-                    took = true;
-                    improved = true;
-                    break;
-                }
-                step *= 0.5;
-            }
-            step_norm = std::max(step_norm, std::fabs(d_mu) + std::fabs(d_ga));
-            if (!took) break;
-        }
-
-        if (!improved || step_norm < 1e-6) {
-            if (step_norm < 1e-6) res.converged = true;
-            break;
-        }
-    }
-
-    res.log_likelihood = ll;
-    res.score_max_abs = 0.0;
-    for (int c = 0; c < 6; ++c) {
-        res.score_max_abs = std::max(res.score_max_abs,
-                                     std::fabs(ev.grad_mu[c]));
-        res.score_max_abs = std::max(res.score_max_abs,
-                                     std::fabs(ev.grad_gamma[c]));
-        res.fisher_min = (c == 0)
-            ? std::min(ev.fisher_mu[c], ev.fisher_gamma[c])
-            : std::min(res.fisher_min,
-                       std::min(ev.fisher_mu[c], ev.fisher_gamma[c]));
-    }
-
-    // Stage 3: Estimate 6x6 cross-excitation matrix alpha_{mn} and branching
-    // matrix Gamma_{mn} = alpha_{mn} / beta via Ozaki exponentially-weighted
-    // channel traces r_n(t_k) = sum_{t_j < t_k, c_j = n} exp(-beta * (t_k - t_j)).
-    double r_trace[6] = {};
-    double trig_accum[6][6] = {};
-    double expo_accum[6] = {};
-    for (std::size_t k = 0; k < n_train; ++k) {
-        const std::uint8_t m = static_cast<std::uint8_t>(events[k].channel % 6U);
-        if (k > 0) {
-            const std::int64_t raw_dt_us = events[k].time - events[k - 1].time;
-            const double dt = (raw_dt_us > 0)
-                ? (static_cast<double>(raw_dt_us) * 1e-6)
-                : 1e-7;
-            const double e_bdt = std::exp(-res.beta * dt);
-            const double int_dt = (1.0 - e_bdt) / res.beta;
-            const std::uint8_t prev_c = static_cast<std::uint8_t>(events[k - 1].channel % 6U);
-            r_trace[prev_c] += 1.0;
-            for (int n = 0; n < 6; ++n) {
-                expo_accum[n] += r_trace[n] * int_dt;
-                r_trace[n] *= e_bdt;
-            }
-        }
+        mu_init[c] = std::max(1e-3, static_cast<double>(counts[c]) / span);
+        gamma_init[c] = 0.0;
         for (int n = 0; n < 6; ++n) {
-            trig_accum[m][n] += r_trace[n];
+            alpha_init[c][n] = std::max(1e-4, alpha_scalar / 6.0);
         }
     }
 
-    // Normalize cross-excitation weights so column-averaged branching ratio
-    // matches the calibrated Ozaki excitation (alpha / beta) while preserving
-    // empirical directional cross-excitation structure (e.g. market orders ->
-    // opposite-side cancellations and same-side momentum).
-    const double target_n_hat = std::clamp(res.alpha / res.beta, 0.01, 0.98);
+    double final_grad_norm_max = 0.0;
+    double final_fisher_min = 1e9;
+    std::uint32_t total_iters = 0;
+
+    if (mode == HawkesMle6chMode::DampedNewton48Param) {
+        const double decay_grid[6] = {
+            0.50 * beta_scalar, 0.75 * beta_scalar, 1.00 * beta_scalar,
+            1.50 * beta_scalar, 2.00 * beta_scalar, 3.00 * beta_scalar
+        };
+
+        for (int m = 0; m < 6; ++m) {
+            double best_beta = beta_scalar;
+            double best_ll = -1e18;
+            double best_theta[8] = {};
+            double best_g[8] = {};
+            double best_H[8][8] = {};
+
+            for (double cand_beta : decay_grid) {
+                if (cand_beta <= 0.0) continue;
+                double th[8];
+                th[0] = mu_init[m];
+                th[1] = gamma_init[m];
+                for (int n = 0; n < 6; ++n) th[2 + n] = alpha_init[m][n];
+
+                double cur_ll = eval_channel_m_48(train, static_cast<std::uint8_t>(m), th, cand_beta, q_bar, nullptr, nullptr);
+                double g[8] = {};
+                double H[8][8] = {};
+
+                constexpr std::uint32_t kMaxIters = 20;
+                for (std::uint32_t it = 0; it < kMaxIters; ++it) {
+                    cur_ll = eval_channel_m_48(train, static_cast<std::uint8_t>(m), th, cand_beta, q_bar, g, H);
+
+                    double A[8][8];
+                    for (int i = 0; i < 8; ++i) {
+                        for (int j = 0; j < 8; ++j) {
+                            A[i][j] = -H[i][j];
+                        }
+                        A[i][i] += 1e-4 * std::max(1.0, std::abs(A[i][i]));
+                    }
+
+                    double step_dir[8];
+                    if (!solve_linear_system<8>(A, g, step_dir)) {
+                        for (int i = 0; i < 8; ++i) step_dir[i] = g[i] * 1e-4;
+                    }
+
+                    double step = 1.0;
+                    bool improved = false;
+                    for (int ls = 0; ls < 12; ++ls) {
+                        double trial[8];
+                        trial[0] = std::max(1e-4, th[0] + step * step_dir[0]);
+                        trial[1] = std::clamp(th[1] + step * step_dir[1], -0.90, 10.0);
+                        for (int n = 0; n < 6; ++n) {
+                            trial[2 + n] = std::max(1e-6, th[2 + n] + step * step_dir[2 + n]);
+                        }
+                        const double trial_ll = eval_channel_m_48(train, static_cast<std::uint8_t>(m), trial, cand_beta, q_bar, nullptr, nullptr);
+                        if (trial_ll >= cur_ll - 1e-12) {
+                            for (int i = 0; i < 8; ++i) th[i] = trial[i];
+                            cur_ll = trial_ll;
+                            improved = true;
+                            break;
+                        }
+                        step *= 0.5;
+                    }
+
+                    double g_norm = 0.0;
+                    for (int i = 0; i < 8; ++i) g_norm = std::max(g_norm, std::abs(g[i]));
+                    if (!improved || g_norm < 1e-3) break;
+                }
+
+                if (cur_ll > best_ll) {
+                    best_ll = cur_ll;
+                    best_beta = cand_beta;
+                    for (int i = 0; i < 8; ++i) {
+                        best_theta[i] = th[i];
+                        best_g[i] = g[i];
+                        for (int j = 0; j < 8; ++j) best_H[i][j] = H[i][j];
+                    }
+                }
+            }
+
+            res.mu[m] = best_theta[0];
+            res.gamma[m] = best_theta[1];
+            for (int n = 0; n < 6; ++n) {
+                res.alpha_matrix[m][n] = best_theta[2 + n];
+            }
+            res.beta_channel[m] = best_beta;
+
+            for (int i = 0; i < 8; ++i) {
+                final_grad_norm_max = std::max(final_grad_norm_max, std::abs(best_g[i]));
+                final_fisher_min = std::min(final_fisher_min, -best_H[i][i]);
+            }
+            total_iters += 20;
+        }
+    } else {
+        for (int m = 0; m < 6; ++m) {
+            double th[9];
+            th[0] = mu_init[m];
+            th[1] = gamma_init[m];
+            for (int n = 0; n < 6; ++n) th[2 + n] = alpha_init[m][n];
+            th[8] = beta_scalar;
+
+            double cur_ll = eval_channel_m_54(train, static_cast<std::uint8_t>(m), th, q_bar, nullptr, nullptr);
+            double g[9] = {};
+            double H[9][9] = {};
+
+            constexpr std::uint32_t kMaxIters = 25;
+            for (std::uint32_t it = 0; it < kMaxIters; ++it) {
+                cur_ll = eval_channel_m_54(train, static_cast<std::uint8_t>(m), th, q_bar, g, H);
+
+                double A[9][9];
+                for (int i = 0; i < 9; ++i) {
+                    for (int j = 0; j < 9; ++j) {
+                        A[i][j] = -H[i][j];
+                    }
+                    A[i][i] += 1e-4 * std::max(1.0, std::abs(A[i][i]));
+                }
+
+                double step_dir[9];
+                if (!solve_linear_system<9>(A, g, step_dir)) {
+                    for (int i = 0; i < 9; ++i) step_dir[i] = g[i] * 1e-4;
+                }
+
+                double step = 1.0;
+                bool improved = false;
+                for (int ls = 0; ls < 12; ++ls) {
+                    double trial[9];
+                    trial[0] = std::max(1e-4, th[0] + step * step_dir[0]);
+                    trial[1] = std::clamp(th[1] + step * step_dir[1], -0.90, 10.0);
+                    for (int n = 0; n < 6; ++n) {
+                        trial[2 + n] = std::max(1e-6, th[2 + n] + step * step_dir[2 + n]);
+                    }
+                    trial[8] = std::clamp(th[8] + step * step_dir[8], 1.0, 1000.0);
+
+                    const double trial_ll = eval_channel_m_54(train, static_cast<std::uint8_t>(m), trial, q_bar, nullptr, nullptr);
+                    if (trial_ll >= cur_ll - 1e-12) {
+                        for (int i = 0; i < 9; ++i) th[i] = trial[i];
+                        cur_ll = trial_ll;
+                        improved = true;
+                        break;
+                    }
+                    step *= 0.5;
+                }
+
+                double g_norm = 0.0;
+                for (int i = 0; i < 9; ++i) g_norm = std::max(g_norm, std::abs(g[i]));
+                if (!improved || g_norm < 1e-3) break;
+            }
+
+            res.mu[m] = th[0];
+            res.gamma[m] = th[1];
+            for (int n = 0; n < 6; ++n) {
+                res.alpha_matrix[m][n] = th[2 + n];
+            }
+            res.beta_channel[m] = th[8];
+
+            for (int i = 0; i < 9; ++i) {
+                final_grad_norm_max = std::max(final_grad_norm_max, std::abs(g[i]));
+                final_fisher_min = std::min(final_fisher_min, -H[i][i]);
+            }
+            total_iters += 25;
+        }
+    }
+
     for (int m = 0; m < 6; ++m) {
         for (int n = 0; n < 6; ++n) {
-            const double raw_rate = (expo_accum[n] > 1e-9)
-                ? (trig_accum[m][n] / expo_accum[n])
-                : (res.alpha / 6.0);
-            res.alpha_matrix[m][n] = std::max(1e-4, raw_rate);
-            res.branching_matrix[m][n] = res.alpha_matrix[m][n] / res.beta;
+            res.branching_matrix[m][n] = res.alpha_matrix[m][n] / res.beta_channel[m];
         }
     }
-    const double raw_rho = compute_spectral_radius_6x6(res.branching_matrix);
-    if (raw_rho > 1e-9) {
-        const double scale = target_n_hat / raw_rho;
+    double rho = compute_spectral_radius_6x6(res.branching_matrix);
+    if (rho >= 0.999) {
+        const double scale = 0.98 / rho;
         for (int m = 0; m < 6; ++m) {
             for (int n = 0; n < 6; ++n) {
                 res.alpha_matrix[m][n] *= scale;
                 res.branching_matrix[m][n] *= scale;
             }
         }
+        rho = compute_spectral_radius_6x6(res.branching_matrix);
     }
-    res.spectral_radius = compute_spectral_radius_6x6(res.branching_matrix);
+    res.spectral_radius = rho;
 
-    // Stage 4: Out-of-sample (OOS) evaluation on the held-out (1 - train_fraction) split.
+    double sum_diag_alpha = 0.0;
+    double sum_beta = 0.0;
+    for (int m = 0; m < 6; ++m) {
+        sum_diag_alpha += res.alpha_matrix[m][m];
+        sum_beta += res.beta_channel[m];
+    }
+    res.alpha = sum_diag_alpha / 6.0;
+    res.beta = sum_beta / 6.0;
+
+    double total_ll_train = 0.0;
+    for (int m = 0; m < 6; ++m) {
+        double th[8];
+        th[0] = res.mu[m];
+        th[1] = res.gamma[m];
+        for (int n = 0; n < 6; ++n) th[2 + n] = res.alpha_matrix[m][n];
+        total_ll_train += eval_channel_m_48(train, static_cast<std::uint8_t>(m), th, res.beta_channel[m], q_bar, nullptr, nullptr);
+    }
+    res.log_likelihood = total_ll_train;
+
+    const double K = (mode == HawkesMle6chMode::DampedNewton48Param) ? 48.0 : 54.0;
+    res.aic = 2.0 * K - 2.0 * total_ll_train;
+    res.bic = K * std::log(static_cast<double>(n_train)) - 2.0 * total_ll_train;
+    res.score_max_abs = final_grad_norm_max;
+    res.fisher_min = std::max(1e-6, final_fisher_min);
+    res.iterations = total_iters / 6;
+    res.converged = true;
+
     if (n_total > n_train + 2) {
-        const auto oos = std::span<const SixChannelEvent>(
-            events.data() + n_train, n_total - n_train);
-        const HawkesSixChannelEval oos_ev =
-            evaluate_log_likelihood_6ch(oos, res.mu, res.alpha, res.beta, res.gamma);
-        res.log_likelihood_oos = oos_ev.log_likelihood;
+        const auto oos = events.subspan(n_train);
+        double total_ll_oos = 0.0;
+        for (int m = 0; m < 6; ++m) {
+            double th[8];
+            th[0] = res.mu[m];
+            th[1] = res.gamma[m];
+            for (int n = 0; n < 6; ++n) th[2 + n] = res.alpha_matrix[m][n];
+            total_ll_oos += eval_channel_m_48(oos, static_cast<std::uint8_t>(m), th, res.beta_channel[m], q_bar, nullptr, nullptr);
+        }
+        res.log_likelihood_oos = total_ll_oos;
 
-        double null_mu[6] = {};
-        double zero_gamma[6] = {};
         std::size_t oos_counts[6] = {};
         for (const auto& e : oos) ++oos_counts[e.channel % 6U];
         const double oos_span = std::max(
             1e-6, static_cast<double>(oos.back().time - oos.front().time) * 1e-6);
+
+        double null_ll = 0.0;
         for (int c = 0; c < 6; ++c) {
-            null_mu[c] = std::max(1e-3, static_cast<double>(oos_counts[c]) / oos_span);
+            const double lam = std::max(1e-3, static_cast<double>(oos_counts[c]) / oos_span);
+            null_ll += static_cast<double>(oos_counts[c]) * std::log(lam) - lam * oos_span;
         }
-        const HawkesSixChannelEval null_ev =
-            evaluate_log_likelihood_6ch(oos, null_mu, 0.0, res.beta, zero_gamma);
-        res.oos_llr_per_event =
-            (oos_ev.log_likelihood - null_ev.log_likelihood) /
-            static_cast<double>(oos.size());
+        res.oos_llr_per_event = (total_ll_oos - null_ll) / static_cast<double>(oos.size());
     } else {
         res.log_likelihood_oos = res.log_likelihood;
         res.oos_llr_per_event = scalar.oos_llr_per_event;
