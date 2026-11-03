@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 #include "export_schema.hpp"
@@ -29,13 +32,8 @@ struct FeeSchedule {
     std::int64_t taker_fee_per_qty = 0;
 };
 
-// --- TCA convention metadata (Tier-1, non-kernel, documents not computes) -----
-// A TcaSummary/FillTcaMetrics is only interpretable against the conventions used
-// to produce it. The roadmap counterexample: a passive maker looks profitable
-// until fees/rebates are signed correctly and latency + adverse-selection
-// markouts are applied. This metadata makes the convention axes explicit so two
-// reports are only compared head-to-head when they share the same footing. It
-// changes none of the existing accumulation logic.
+// TCA convention descriptor (fee sign, markout horizon, arrival/terminal
+// benchmarks, residual handling, and assumed latency) for comparing reports.
 enum class FeeSignConvention : std::uint8_t {
     Unspecified = 0,
     PositiveIsCost,  // fee_per_qty/fee_cost > 0 is a cost paid; < 0 is a rebate

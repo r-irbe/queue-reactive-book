@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 #include "catch_approx.hpp"
@@ -332,7 +335,7 @@ inline int run_all_tests() {
 #define CAPTURE(var) do {} while(false)
 
 #ifndef CATCH_CONFIG_RUNNER
-int main(int argc, char* argv[]) {
+__attribute__((weak)) int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
     return ::test_shim::run_all_tests();

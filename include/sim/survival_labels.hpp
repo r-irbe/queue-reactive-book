@@ -1,3 +1,6 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #pragma once
 
 #include "event_trace.hpp"   // EventSeq (kernel-free: pulls only types.hpp)
@@ -7,13 +10,8 @@
 
 namespace sim {
 
-// --- Resting-order fill / survival LABELS (Tier-3 item 14, offline labels) -----
-//
-// Roadmap item 14 asks for "fill / survival labels" for resting limit orders.
-// This scaffold produces a no-look-ahead survival label for ONE resting order
-// from the events that touch it, in event-sequence order. It is header-only,
-// cold-path, and never feeds the frozen matching kernel (it only LABELS the
-// kernel's already-produced event stream).
+// Single-order survival and right-censoring label tracker over a half-open
+// event/time horizon `[start, start + H)`.
 //
 // Terminal states (a resting order resolves to exactly one):
 //   Filled            cumulative fills reached the ORIGINAL resting qty within

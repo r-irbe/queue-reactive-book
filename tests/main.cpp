@@ -1,3 +1,7 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
+#include "sim/bitwise_veb_codings.hpp"
 #include <catch2/catch_test_macros.hpp>
 
 #include "sim/alloc_probe.hpp"
@@ -36,6 +40,12 @@
 #include <set>
 #include <type_traits>
 #include <utility>
+
+#include <cstdlib>
+#include <limits>
+#include <new>
+
+#include "qr/alloc_guard.hpp"
 
 namespace {
 
@@ -1661,8 +1671,8 @@ TEST_CASE("export schema meta defaults to the current schema version",
 TEST_CASE("identical numeric frames are interpretation-incompatible when units, "
           "time basis, or label horizon differ",
           "[features][schema][meta]") {
-    // The roadmap T1 counterexample: two frames whose numbers are byte-identical
-    // but whose meaning differs must NOT be treated as comparable.
+    // Two frames whose numbers are byte-identical but whose units or horizons
+    // differ must not be treated as comparable.
     sim::ExportSchemaMeta ticks_eventtime{};
     ticks_eventtime.schema_name = "book_observables";
     ticks_eventtime.timestamp_basis = sim::TimestampBasis::EventTime;
@@ -3102,13 +3112,8 @@ TEST_CASE("execution baselines create TWAP limit schedules for passive baselines
     REQUIRE(schedule[1].qty == 2);
 }
 
-// --- CMU-002: allocation probe is replay-hash neutral -----------------------
-//
-// The bench binary replaces global operator new/delete to count allocations;
-// the test binary does NOT (per design, to keep Catch2 static-init safe). Here
-// we only verify that arming/disarming a ScopedAllocCounter -- which merely
-// reads and bumps a thread-local integer -- cannot perturb the deterministic
-// replay hash.
+// Allocation probe is replay-hash neutral: arming/disarming ScopedAllocCounter
+// does not perturb the deterministic replay digest.
 TEST_CASE("scoped alloc counter does not perturb replay hash",
           "[diagnostics][alloc-probe]") {
     auto run = [](bool arm_counter) {
@@ -3155,7 +3160,7 @@ TEST_CASE("scoped alloc counter does not perturb replay hash",
     REQUIRE(sim::diag::alloc_arm_depth() == 0);
 }
 
-// --- CC-002: feature-export contract honours the prefix-hash determinism -----
+// Feature-export contract honours prefix-hash determinism.
 TEST_CASE("sync feature export sink verifies prefix-hash parity",
           "[features][export-contract]") {
     sim::ReplayDriver replay(0, 100, 16);
@@ -3269,7 +3274,7 @@ TEST_CASE("sync feature export sink rejects reordered and duplicated frames",
     }
 }
 
-// --- CXM-001: dataset-size guard classifies and fails loud -------------------
+// Dataset-size guard classification and budget enforcement.
 TEST_CASE("dataset size guard is a no-op when disabled",
           "[replay][dataset-guard]") {
     sim::DatasetSizeBudget budget{};
@@ -3329,7 +3334,7 @@ TEST_CASE("dataset size guard tolerates an invalid warn fraction",
 }
 
 TEST_CASE("queue-state observer seeds queue-ahead and trades consume the front",
-          "[queue-state][observer][tier2]") {
+          "[queue-state][observer]") {
     sim::QueueStateObserver obs;
     // Our order rests behind 10 units already at the level.
     obs.on_submit(/*id=*/1, sim::Side::Buy, /*price=*/50, /*qty=*/5,
@@ -3370,7 +3375,7 @@ TEST_CASE("queue-state observer seeds queue-ahead and trades consume the front",
 }
 
 TEST_CASE("queue-state observer censors queue-ahead on unknown-position cancels",
-          "[queue-state][observer][censoring][tier2]") {
+          "[queue-state][observer][censoring]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Buy, 50, 5, 10, 100, /*qty_ahead=*/8);
 
@@ -3402,7 +3407,7 @@ TEST_CASE("queue-state observer censors queue-ahead on unknown-position cancels"
 }
 
 TEST_CASE("queue-state observer tracks fill lifecycle without lookahead",
-          "[queue-state][observer][lifecycle][tier2]") {
+          "[queue-state][observer][lifecycle]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Sell, 70, 6, 5, 50, /*qty_ahead=*/4);
 
@@ -3437,7 +3442,7 @@ TEST_CASE("queue-state observer tracks fill lifecycle without lookahead",
 }
 
 TEST_CASE("queue-state observer right-censors unresolved orders, fabricating nothing",
-          "[queue-state][observer][right-censoring][tier2]") {
+          "[queue-state][observer][right-censoring]") {
     sim::QueueStateObserver obs;
     obs.on_submit(1, sim::Side::Buy, 50, 5, 1, 10, 0);  // never resolved
     obs.on_submit(2, sim::Side::Buy, 50, 5, 1, 10, 0);
@@ -3460,7 +3465,7 @@ TEST_CASE("queue-state observer right-censors unresolved orders, fabricating not
 }
 
 TEST_CASE("queue-state observer schema and metadata are explicit",
-          "[queue-state][observer][schema][tier2]") {
+          "[queue-state][observer][schema]") {
     REQUIRE(sim::kQueueStateExportSchema.size() == sim::kQueueStateExportCount);
     const auto meta = sim::queue_state_schema_meta();
     REQUIRE(meta.schema_name == "queue_state");
@@ -3480,7 +3485,7 @@ TEST_CASE("queue-state observer schema and metadata are explicit",
 }
 
 TEST_CASE("queue-state observer is replay-hash invariant: A/B against the real book",
-          "[queue-state][observer][replay-invariant][tier2]") {
+          "[queue-state][observer][replay-invariant]") {
     // The observer is an external read-only sink. Driving it from the SAME
     // observations must not perturb matching: the book's fills and top-of-book
     // trajectory are byte-identical with and without the observer attached.
@@ -3539,7 +3544,7 @@ TEST_CASE("queue-state observer is replay-hash invariant: A/B against the real b
 }
 
 TEST_CASE("execution-baseline taxonomy gates comparability to one harness",
-          "[execution][baseline-taxonomy][tier2]") {
+          "[execution][baseline-taxonomy]") {
     sim::TcaConventions conv{};
     conv.fee_sign = sim::FeeSignConvention::PositiveIsCost;
     conv.benchmark = sim::BenchmarkReference::ArrivalMid;
@@ -3576,7 +3581,7 @@ TEST_CASE("execution-baseline taxonomy gates comparability to one harness",
 }
 
 TEST_CASE("VWAP schedule completes the parent exactly via largest-remainder",
-          "[execution][vwap][tier2]") {
+          "[execution][vwap]") {
     sim::ParentExecutionOrder order{};
     order.parent_id = 9001;
     order.side = sim::Side::Sell;
@@ -3610,7 +3615,7 @@ TEST_CASE("VWAP schedule completes the parent exactly via largest-remainder",
 }
 
 TEST_CASE("POV schedule may honestly under-fill when volume runs out",
-          "[execution][pov][tier2]") {
+          "[execution][pov]") {
     sim::ParentExecutionOrder order{};
     order.side = sim::Side::Buy;
     order.qty = 100;
@@ -3657,7 +3662,7 @@ inline sim::BookObservables make_l1(sim::Tick best_bid, sim::Qty bid_qty,
 } // namespace
 
 TEST_CASE("consecutive-snapshot OFI follows the Cont-Kukanov-Stoikov signs",
-          "[ofi][microstructure][tier2]") {
+          "[ofi][microstructure]") {
     const auto base = make_l1(99, 10, 101, 12, 1, 100);
 
     SECTION("bid price up adds the new bid size") {
@@ -3701,7 +3706,7 @@ TEST_CASE("consecutive-snapshot OFI follows the Cont-Kukanov-Stoikov signs",
 }
 
 TEST_CASE("OFI is distinct from single-snapshot volume imbalance and censors gaps",
-          "[ofi][microstructure][censoring][tier2]") {
+          "[ofi][microstructure][censoring]") {
     // A balanced book with a one-sided OFI: equal qty both sides (volume
     // imbalance ~ 0) but the bid just stepped up -> strictly positive OFI.
     const auto prev = make_l1(99, 10, 101, 10, 1, 1);
@@ -3727,7 +3732,7 @@ TEST_CASE("OFI is distinct from single-snapshot volume imbalance and censors gap
 }
 
 TEST_CASE("depth sparsity exposes fixed-grid holes so zeros are not read as liquidity",
-          "[depth][sparsity][tier2]") {
+          "[depth][sparsity]") {
     sim::TopKBookSnapshot<4> snap{};
     snap.seq = 7;
     snap.ts = 70;
@@ -3749,7 +3754,7 @@ TEST_CASE("depth sparsity exposes fixed-grid holes so zeros are not read as liqu
 }
 
 TEST_CASE("allocation budget gates offline regions without affecting matching",
-          "[alloc][budget][tier2]") {
+          "[alloc][budget]") {
     using sim::diag::AllocBudget;
     using sim::diag::AllocStats;
 
@@ -3785,7 +3790,7 @@ TEST_CASE("allocation budget gates offline regions without affecting matching",
 }
 
 TEST_CASE("replay checkpoint verifies reproduced state and localizes divergence",
-          "[replay][checkpoint][tier2]") {
+          "[replay][checkpoint]") {
     sim::ReplayDiagnostics d{};
     d.input_events = 100;
     d.accepted_events = 95;
@@ -3846,7 +3851,7 @@ inline sim::QuoteInputs as_inputs(std::int64_t mid_x2, sim::Qty inv) {
 } // namespace
 
 TEST_CASE("AS quote skews against inventory and stays tick-valid",
-          "[quote-adapter][as][tier2]") {
+          "[quote-adapter][as]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);
 
     const auto flat = sim::make_as_quote(p, as_inputs(200, 0));   // mid = 100
@@ -3868,7 +3873,7 @@ TEST_CASE("AS quote skews against inventory and stays tick-valid",
 }
 
 TEST_CASE("AS quotes never cross across a parameter sweep",
-          "[quote-adapter][as][non-crossing][tier2]") {
+          "[quote-adapter][as][non-crossing]") {
     for (double gamma : {0.05, 0.1, 0.5}) {
         for (double k : {0.05, 0.1, 1.0}) {
             for (double sigma2 : {0.0, 0.5, 2.0}) {
@@ -3884,7 +3889,7 @@ TEST_CASE("AS quotes never cross across a parameter sweep",
     }
 }
 
-TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards][tier2]") {
+TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);  // flat quote is bid 93 / ask 107
 
     SECTION("invalid parameters yield no quote at all") {
@@ -3921,7 +3926,7 @@ TEST_CASE("AS guards suppress rather than distort", "[quote-adapter][as][guards]
 }
 
 TEST_CASE("quote adapters never produce phantom fills, only SubmitLimit intents",
-          "[quote-adapter][no-phantom-fill][tier2]") {
+          "[quote-adapter][no-phantom-fill]") {
     const auto p = as_params(0.1, 1.0, 0.1, 5);
     const auto q = sim::make_as_quote(p, as_inputs(200, 0));
     const auto intents = sim::to_quote_intents(
@@ -3938,14 +3943,31 @@ TEST_CASE("quote adapters never produce phantom fills, only SubmitLimit intents"
     REQUIRE(intents[1].side == sim::Side::Sell);
     REQUIRE(intents[1].price == 107);
 
-    // GLFT/CJP placeholders are deferred: they fabricate neither a quote nor a fill.
-    const auto glft = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
-                                              as_inputs(200, 0));
-    REQUIRE_FALSE(glft.model_supported);
-    REQUIRE(sim::to_quote_intents(glft, 42).empty());
-    const auto cjp = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p,
-                                             as_inputs(200, 0));
-    REQUIRE(sim::to_quote_intents(cjp, 42).empty());
+    // GLFT (2013) and CJP (2015) closed-form models emit valid SubmitLimit intents
+    // with inventory monotonicity and OFI skew directionality.
+    const auto glft_flat = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
+                                                   as_inputs(200, 0));
+    REQUIRE(glft_flat.model_supported);
+    REQUIRE(glft_flat.has_bid);
+    REQUIRE(glft_flat.has_ask);
+    REQUIRE(glft_flat.bid_px < glft_flat.ask_px);
+    REQUIRE(sim::to_quote_intents(glft_flat, 42).size() == 2);
+
+    const auto glft_long = sim::make_guarded_quote(sim::QuoteModelKind::GlftHeuristic, p,
+                                                   as_inputs(200, 15));
+    REQUIRE(glft_long.bid_px <= glft_flat.bid_px);
+    REQUIRE(glft_long.ask_px <= glft_flat.ask_px);
+
+    auto cjp_in_pos = as_inputs(200, 0);
+    cjp_in_pos.alpha_ofi = 6.0;
+    auto cjp_in_neg = as_inputs(200, 0);
+    cjp_in_neg.alpha_ofi = -6.0;
+    const auto cjp_pos = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p, cjp_in_pos);
+    const auto cjp_neg = sim::make_guarded_quote(sim::QuoteModelKind::CjpHeuristic, p, cjp_in_neg);
+    REQUIRE(cjp_pos.model_supported);
+    REQUIRE(cjp_pos.bid_px < cjp_pos.ask_px);
+    REQUIRE(cjp_pos.bid_px >= cjp_neg.bid_px);
+    REQUIRE(cjp_pos.ask_px >= cjp_neg.ask_px);
 }
 
 
@@ -3959,7 +3981,7 @@ inline bool approx_eq(double a, double b, double eps = 1e-9) {
 }
 
 TEST_CASE("impact diagnostics: direction-normalized realized sign",
-          "[impact-diagnostics][tier3][sign]") {
+          "[impact-diagnostics][sign]") {
     sim::ImpactObservation buy{};
     buy.side = sim::Side::Buy;
     buy.pre_mid_x2 = 200;    // mid 100.0
@@ -3975,7 +3997,7 @@ TEST_CASE("impact diagnostics: direction-normalized realized sign",
 }
 
 TEST_CASE("impact diagnostics: adverse move yields negative realized",
-          "[impact-diagnostics][tier3][adverse]") {
+          "[impact-diagnostics][adverse]") {
     sim::ImpactObservation o{};
     o.side = sim::Side::Buy;
     o.pre_mid_x2 = 200;
@@ -3986,14 +4008,14 @@ TEST_CASE("impact diagnostics: adverse move yields negative realized",
 }
 
 TEST_CASE("impact diagnostics: prediction is caller's coef, no internal fitting",
-          "[impact-diagnostics][tier3][no-fit]") {
+          "[impact-diagnostics][no-fit]") {
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(0.5, 4.0), 1.0));
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(0.5, -4.0), 1.0));
     REQUIRE(sim_test::approx_eq(sim::predicted_impact_ticks(1.0, 4.0), 2.0));
 }
 
 TEST_CASE("impact diagnostics: known residual, rmse and bias",
-          "[impact-diagnostics][tier3][residual]") {
+          "[impact-diagnostics][residual]") {
     sim::ImpactObservation a{};
     a.side = sim::Side::Buy; a.participation = 1.0;
     a.pre_mid_x2 = 200; a.post_mid_x2 = 204;  // realized +2 -> residual +1
@@ -4011,7 +4033,7 @@ TEST_CASE("impact diagnostics: known residual, rmse and bias",
 }
 
 TEST_CASE("impact diagnostics: pending and missing-mid observations excluded",
-          "[impact-diagnostics][tier3][exclusions]") {
+          "[impact-diagnostics][exclusions]") {
     sim::ImpactObservation base{};
     base.side = sim::Side::Buy; base.participation = 1.0;
     base.pre_mid_x2 = 200; base.post_mid_x2 = 204;
@@ -4030,7 +4052,7 @@ TEST_CASE("impact diagnostics: pending and missing-mid observations excluded",
 }
 
 TEST_CASE("impact diagnostics: schema meta is event-time, diagnostics-only",
-          "[impact-diagnostics][tier3][schema]") {
+          "[impact-diagnostics][schema]") {
     const auto m = sim::impact_diagnostics_schema_meta();
     REQUIRE(m.timestamp_basis == sim::TimestampBasis::EventTime);
     REQUIRE(m.quantity_unit == sim::QuantityUnit::Ratio);
@@ -4040,7 +4062,7 @@ TEST_CASE("impact diagnostics: schema meta is event-time, diagnostics-only",
 #include "sim/survival_labels.hpp"
 
 TEST_CASE("survival: full fill within horizon resolves Filled",
-          "[survival][tier3][filled]") {
+          "[survival][filled]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 100; cfg.start_ts = 0; cfg.original_qty = 10;
     cfg.horizon_events = 50;
@@ -4053,7 +4075,7 @@ TEST_CASE("survival: full fill within horizon resolves Filled",
 }
 
 TEST_CASE("survival: partial fill stays Pending, then completes Filled",
-          "[survival][tier3][partial]") {
+          "[survival][partial]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4067,7 +4089,7 @@ TEST_CASE("survival: partial fill stays Pending, then completes Filled",
 }
 
 TEST_CASE("survival: partial fill then cancel -> CensoredCancel with filled recorded",
-          "[survival][tier3][cancel]") {
+          "[survival][cancel]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4080,7 +4102,7 @@ TEST_CASE("survival: partial fill then cancel -> CensoredCancel with filled reco
 }
 
 TEST_CASE("survival: cancel with no fills -> CensoredCancel filled 0",
-          "[survival][tier3][cancel-nofill]") {
+          "[survival][cancel-nofill]") {
     sim::SurvivalConfig cfg{};
     cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4090,7 +4112,7 @@ TEST_CASE("survival: cancel with no fills -> CensoredCancel filled 0",
 }
 
 TEST_CASE("survival: event horizon closes before fill -> CensoredHorizon at start+H",
-          "[survival][tier3][horizon-event]") {
+          "[survival][horizon-event]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 100; cfg.original_qty = 10; cfg.horizon_events = 50;
     sim::SurvivalTracker t(cfg);
@@ -4100,7 +4122,7 @@ TEST_CASE("survival: event horizon closes before fill -> CensoredHorizon at star
 }
 
 TEST_CASE("survival: time horizon closes -> CensoredHorizon at start_ts+H",
-          "[survival][tier3][horizon-time]") {
+          "[survival][horizon-time]") {
     sim::SurvivalConfig cfg{};
     cfg.start_ts = 1000; cfg.original_qty = 10; cfg.horizon_ns = 200;
     sim::SurvivalTracker t(cfg);
@@ -4110,7 +4132,7 @@ TEST_CASE("survival: time horizon closes -> CensoredHorizon at start_ts+H",
 }
 
 TEST_CASE("survival: fill at the horizon boundary is too late -> CensoredHorizon",
-          "[survival][tier3][late-fill]") {
+          "[survival][late-fill]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 50;
     sim::SurvivalTracker t(cfg);
@@ -4120,7 +4142,7 @@ TEST_CASE("survival: fill at the horizon boundary is too late -> CensoredHorizon
 }
 
 TEST_CASE("survival: end-of-data before horizon -> CensoredEndOfData (not Horizon)",
-          "[survival][tier3][end-of-data]") {
+          "[survival][end-of-data]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 1000;
     sim::SurvivalTracker t(cfg);
@@ -4132,7 +4154,7 @@ TEST_CASE("survival: end-of-data before horizon -> CensoredEndOfData (not Horizo
 }
 
 TEST_CASE("survival: same-seq fill-before-cancel -> full fill wins, cancel ignored",
-          "[survival][tier3][same-seq]") {
+          "[survival][same-seq]") {
     sim::SurvivalConfig cfg{};
     cfg.start_seq = 0; cfg.original_qty = 10; cfg.horizon_events = 100;
     sim::SurvivalTracker t(cfg);
@@ -4146,7 +4168,7 @@ TEST_CASE("survival: same-seq fill-before-cancel -> full fill wins, cancel ignor
 #include <limits>
 
 TEST_CASE("exploitability: incumbent best -> zero gain, never a certificate",
-          "[exploitability][tier3][no-gain]") {
+          "[exploitability][no-gain]") {
     const double devs[3] = {0.5, 0.9, 1.0};   // none beat incumbent 1.5
     const auto r = sim::probe_exploitability(1.5, devs, 3);
     REQUIRE(r.gain_lower_bound == 0.0);
@@ -4156,7 +4178,7 @@ TEST_CASE("exploitability: incumbent best -> zero gain, never a certificate",
 }
 
 TEST_CASE("exploitability: profitable deviation yields positive lower bound",
-          "[exploitability][tier3][gain]") {
+          "[exploitability][gain]") {
     const double devs[3] = {1.0, 2.5, 1.2};   // best 2.5 beats incumbent 2.0
     const auto r = sim::probe_exploitability(2.0, devs, 3);
     REQUIRE(sim_test::approx_eq(r.best_deviation_payoff, 2.5));
@@ -4165,7 +4187,7 @@ TEST_CASE("exploitability: profitable deviation yields positive lower bound",
 }
 
 TEST_CASE("exploitability: non-finite deviation payoffs are rejected, not compared",
-          "[exploitability][tier3][reject]") {
+          "[exploitability][reject]") {
     const double inf = std::numeric_limits<double>::infinity();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double devs[4] = {1.0, inf, nan, 2.2};
@@ -4177,7 +4199,7 @@ TEST_CASE("exploitability: non-finite deviation payoffs are rejected, not compar
 }
 
 TEST_CASE("exploitability: zero deviations -> gain 0 flagged no-deviations-tested",
-          "[exploitability][tier3][zero-dev]") {
+          "[exploitability][zero-dev]") {
     const auto r = sim::probe_exploitability(1.0, nullptr, 0);
     REQUIRE(r.gain_lower_bound == 0.0);
     REQUIRE(r.no_deviations_tested);
@@ -4186,7 +4208,7 @@ TEST_CASE("exploitability: zero deviations -> gain 0 flagged no-deviations-teste
 }
 
 TEST_CASE("exploitability: non-finite incumbent invalidates the gap",
-          "[exploitability][tier3][bad-incumbent]") {
+          "[exploitability][bad-incumbent]") {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double devs[2] = {1.0, 5.0};
     const auto r = sim::probe_exploitability(nan, devs, 2);
@@ -4198,7 +4220,7 @@ TEST_CASE("exploitability: non-finite incumbent invalidates the gap",
 #include "sim/accelerator_parity.hpp"
 
 TEST_CASE("accelerator parity: integer outputs must match exactly",
-          "[accelerator][tier3][int]") {
+          "[accelerator][int]") {
     const std::int64_t ref[4] = {1, 2, 3, 4};
     const std::int64_t same[4] = {1, 2, 3, 4};
     const std::int64_t diff[4] = {1, 2, 9, 4};
@@ -4212,7 +4234,7 @@ TEST_CASE("accelerator parity: integer outputs must match exactly",
 }
 
 TEST_CASE("accelerator parity: doubles within / beyond tolerance",
-          "[accelerator][tier3][double-tol]") {
+          "[accelerator][double-tol]") {
     const double ref[3] = {1.0, 2.0, 1e6};
     const double close[3] = {1.0 + 1e-12, 2.0, 1e6 + 1e-4};  // abs+rel ok
     const double far[3] = {1.0, 2.5, 1e6};                    // 2.5 vs 2.0 fails
@@ -4223,7 +4245,7 @@ TEST_CASE("accelerator parity: doubles within / beyond tolerance",
 }
 
 TEST_CASE("accelerator parity: size mismatch fails immediately",
-          "[accelerator][tier3][size]") {
+          "[accelerator][size]") {
     const std::int64_t a[3] = {1, 2, 3};
     const std::int64_t b[2] = {1, 2};
     const auto r = sim::check_parity_int(a, 3, b, 2);
@@ -4233,7 +4255,7 @@ TEST_CASE("accelerator parity: size mismatch fails immediately",
 }
 
 TEST_CASE("accelerator parity: non-finite double semantics are explicit",
-          "[accelerator][tier3][nonfinite]") {
+          "[accelerator][nonfinite]") {
     const double inf = std::numeric_limits<double>::infinity();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     sim::ParityTolerance tol{};
@@ -4245,7 +4267,7 @@ TEST_CASE("accelerator parity: non-finite double semantics are explicit",
 }
 
 TEST_CASE("accelerator parity: fast-but-wrong accelerator is rejected",
-          "[accelerator][tier3][parity-gates-speed]") {
+          "[accelerator][parity-gates-speed]") {
     const std::int64_t ref[3] = {10, 20, 30};
     const std::int64_t wrong[3] = {10, 20, 31};
     const auto parity = sim::check_parity_int(ref, 3, wrong, 3);
@@ -4256,7 +4278,7 @@ TEST_CASE("accelerator parity: fast-but-wrong accelerator is rejected",
 }
 
 TEST_CASE("accelerator parity: correct + faster accelerator is accepted",
-          "[accelerator][tier3][accepted]") {
+          "[accelerator][accepted]") {
     const std::int64_t ref[3] = {10, 20, 30};
     const std::int64_t same[3] = {10, 20, 30};
     const auto parity = sim::check_parity_int(ref, 3, same, 3);
@@ -4268,7 +4290,7 @@ TEST_CASE("accelerator parity: correct + faster accelerator is accepted",
 #include "sim/join_manifest.hpp"
 
 TEST_CASE("join manifest: causally clean join is usable",
-          "[join][tier4][usable]") {
+          "[join][usable]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.feature_ts = 1000;
     r.label_start_seq = 102; r.label_start_ts = 1200;  // starts after embargo
@@ -4281,7 +4303,7 @@ TEST_CASE("join manifest: causally clean join is usable",
 }
 
 TEST_CASE("join manifest: label starting at embargo boundary is leaky (seq)",
-          "[join][tier4][leaky-seq]") {
+          "[join][leaky-seq]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.label_start_seq = 101;  // == feature_seq + embargo(1)
     r.label_eval_seq = 105;
@@ -4291,7 +4313,7 @@ TEST_CASE("join manifest: label starting at embargo boundary is leaky (seq)",
 }
 
 TEST_CASE("join manifest: time embargo violation is leaky (time)",
-          "[join][tier4][leaky-time]") {
+          "[join][leaky-time]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 100;  r.label_start_seq = 110;  r.label_eval_seq = 120;  // seq clean
     r.feature_ts = 1000;  r.label_start_ts = 1050;  // < feature_ts + embargo_ns(100)
@@ -4300,7 +4322,7 @@ TEST_CASE("join manifest: time embargo violation is leaky (time)",
 }
 
 TEST_CASE("join manifest: eval before start is non-causal",
-          "[join][tier4][non-causal]") {
+          "[join][non-causal]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 10; r.label_start_seq = 20; r.label_eval_seq = 15;  // eval < start
     sim::JoinPolicy p{};
@@ -4308,7 +4330,7 @@ TEST_CASE("join manifest: eval before start is non-causal",
 }
 
 TEST_CASE("join manifest: cross-split join is rejected",
-          "[join][tier4][split]") {
+          "[join][split]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 1; r.label_start_seq = 5; r.label_eval_seq = 9;
     r.label_start_ts = 50; r.label_eval_ts = 90;
@@ -4320,7 +4342,7 @@ TEST_CASE("join manifest: cross-split join is rejected",
 }
 
 TEST_CASE("join manifest: diagnostic-only rows never count as training labels",
-          "[join][tier4][diagnostic]") {
+          "[join][diagnostic]") {
     sim::JoinManifestRow r{};
     r.feature_seq = 1; r.label_start_seq = 100; r.label_eval_seq = 200;
     r.diagnostic_only = true;
@@ -4330,7 +4352,7 @@ TEST_CASE("join manifest: diagnostic-only rows never count as training labels",
 }
 
 TEST_CASE("join manifest: summary tallies outcomes deterministically",
-          "[join][tier4][summary]") {
+          "[join][summary]") {
     sim::JoinPolicy p{}; p.embargo_events = 1;
     sim::JoinManifestSummary s{};
     sim::JoinManifestRow clean{};
@@ -4347,7 +4369,7 @@ TEST_CASE("join manifest: summary tallies outcomes deterministically",
 }
 
 TEST_CASE("join manifest: schema meta declares event-time basis",
-          "[join][tier4][schema]") {
+          "[join][schema]") {
     const auto m = sim::join_manifest_schema_meta();
     REQUIRE(m.schema_name == "join_manifest");
     REQUIRE(m.timestamp_basis == sim::TimestampBasis::EventTime);
@@ -4358,7 +4380,7 @@ TEST_CASE("join manifest: schema meta declares event-time basis",
 // (a) A causal/embargoed join passes the hook, the frame is admitted to the
 // export sink, and the hook exports the join-manifest schema-meta.
 TEST_CASE("join wiring: causal join is admitted and exports the manifest meta",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::JoinPolicy p{};
     p.embargo_events = 1;
     p.embargo_ns = 100;
@@ -4390,7 +4412,7 @@ TEST_CASE("join wiring: causal join is admitted and exports the manifest meta",
 // contract: the labelled frame is DROPPED (never admitted to the sink) and the
 // leak is observable via the hook's summary / any_leak().
 TEST_CASE("join wiring: leaky join is flagged and dropped from the export path",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::JoinPolicy p{};
     p.embargo_events = 1;
     sim::JoinManifestExportHook hook(p);
@@ -4423,7 +4445,7 @@ TEST_CASE("join wiring: leaky join is flagged and dropped from the export path",
 // is byte-for-byte unchanged -- a plain sink fed via on_frame admits frames and
 // enforces prefix-hash parity exactly as before the wiring.
 TEST_CASE("join wiring: unused hook leaves existing export behaviour unchanged",
-          "[join][tier4][wire]") {
+          "[join][wire]") {
     sim::SyncFeatureExportSink sink;
     sink.on_frame(sim::ExportFrame{.seq = 1, .replay_hash = 11});
     sink.on_frame(sim::ExportFrame{.seq = 2, .replay_hash = 22});
@@ -4440,10 +4462,7 @@ TEST_CASE("join wiring: unused hook leaves existing export behaviour unchanged",
     REQUIRE(sink.accepted_frames() == 2);
 }
 
-// ============================================================================
-// RTA-001: Reward ledger disjointness from TCA
-// ============================================================================
-TEST_CASE("RTA-001: reward ledger is disjoint from TCA", "[rta][reward][tca]") {
+TEST_CASE("reward ledger operations and conventions", "[reward][tca]") {
     sim::RewardLedger ledger;
     sim::RewardKey key{.parent_id = 1, .agent = 2, .source = 3};
 
@@ -4528,11 +4547,8 @@ TEST_CASE("RTA-001: reward ledger is disjoint from TCA", "[rta][reward][tca]") {
     }
 }
 
-// ============================================================================
-// RTA-005: Reward-contamination unit tests (replay-hash neutral)
-// ============================================================================
-TEST_CASE("RTA-005: reward ledger does not contaminate TCA",
-          "[rta][contamination][tca]") {
+TEST_CASE("reward ledger does not contaminate TCA",
+          "[reward][contamination][tca]") {
     sim::RewardLedger reward_ledger;
     sim::TcaSummary tca_summary{};
 
@@ -4563,11 +4579,8 @@ TEST_CASE("RTA-005: reward ledger does not contaminate TCA",
     REQUIRE(rs->cumulative_reward_x1e6 != tca_summary.passive_qty);  // different types, different meanings
 }
 
-// ============================================================================
-// RTA-004: Three-risk diagnostic triplet (no netting)
-// ============================================================================
-TEST_CASE("RTA-004: three-risk triplet has independent fields",
-          "[rta][three-risk][no-netting]") {
+TEST_CASE("three-risk triplet has independent fields",
+          "[three-risk][no-netting]") {
     sim::ThreeRiskTriplet triplet{};
 
     SECTION("default values are zero") {
@@ -4902,4 +4915,552 @@ TEST_CASE("Zero-tombstone intrusive slotmap and non-throwing construction", "[si
     sim::CompactOrder co{.id = 42, .ts = 1000, .price = 100, .qty = 10};
     REQUIRE(co.id == 42);
     REQUIRE(co.price == 100);
+}
+
+TEST_CASE("Bitwise vEB 128/256/512, ARM MSB-first, Offset-Binary, Gray Basket, and Elias-Fano", "[sim][veb_codings]") {
+    sim::BitwiseVeb128 v128;
+    v128.insert(95);
+    v128.insert(12);
+    REQUIRE(v128.find_min() == 12);
+    REQUIRE(v128.find_max() == 95);
+    v128.remove(12);
+    REQUIRE(v128.find_min() == 95);
+
+    sim::BitwiseVeb256Avx2 v256;
+    v256.insert(210);
+    v256.insert(45);
+    REQUIRE(v256.find_min() == 45);
+    v256.remove(45);
+    REQUIRE(v256.find_min() == 210);
+
+    sim::BitwiseVeb512 v512;
+    v512.insert(499);
+    v512.insert(129);
+    REQUIRE(v512.find_min() == 129);
+    v512.remove(129);
+    REQUIRE(v512.find_min() == 499);
+
+    sim::ArmMsbBitboard64 arm_bb;
+    arm_bb.insert(41);
+    arm_bb.insert(7);
+    REQUIRE(arm_bb.find_min() == 7);
+    REQUIRE(arm_bb.find_max() == 41);
+
+    REQUIRE(sim::OffsetBinaryCodec::encode(-500) < sim::OffsetBinaryCodec::encode(0));
+    REQUIRE(sim::OffsetBinaryCodec::encode(0) < sim::OffsetBinaryCodec::encode(500));
+    REQUIRE(sim::OffsetBinaryCodec::decode(sim::OffsetBinaryCodec::encode(-123456)) == -123456);
+
+    sim::KnuthGrayBasket<6> basket({10, -20, 35, 5, -15, 40});
+    std::size_t flip = 0;
+    std::uint64_t mask = 0;
+    std::int64_t val = 0;
+    std::size_t count = 0;
+    while (basket.next_subset(flip, mask, val)) {
+        std::int64_t expected = 0;
+        for (std::size_t i = 0; i < 6; ++i) {
+            if ((mask & (1ULL << i)) != 0ULL) expected += basket.weights[i];
+        }
+        REQUIRE(val == expected);
+        ++count;
+    }
+    REQUIRE(count == 63);
+
+    std::vector<std::uint64_t> sorted_ts;
+    for (std::uint64_t i = 0; i < 512; ++i) {
+        sorted_ts.push_back(i * 100ULL + (i & 7ULL));
+    }
+    sim::EliasFanoIndex ef(sorted_ts);
+    for (std::size_t i = 0; i < sorted_ts.size(); ++i) {
+        REQUIRE(ef.get(i) == sorted_ts[i]);
+    }
+}
+
+TEST_CASE("FlatLadderBook zero-allocation hot path across passive add, add_into, cancel, and queue_ahead",
+          "[flat-ladder][alloc-probe][hot-path]") {
+#ifndef QRLOB_SANITIZER_ACTIVE
+    {
+        sim::diag::ScopedAllocCounter positive_ctrl;
+        std::vector<int> dummy(64, 1);
+        REQUIRE(dummy[0] == 1);
+        REQUIRE(positive_ctrl.delta().allocations >= 1);
+    }
+#endif
+
+    sim::FlatLadderBook book(90, 110, 512);
+    sim::Trade trade_buf[16]{};
+
+    sim::diag::AllocStats hot_delta{};
+    {
+        sim::diag::ScopedAllocCounter counter;
+
+        // 1. Passive Limit adds via add() and add_into()
+        for (int i = 0; i < 64; ++i) {
+            const sim::Order bid = make_limit_order(1, sim::Side::Buy, static_cast<sim::Tick>(95 - (i & 3)), 10);
+            const sim::Order ask = make_limit_order(2, sim::Side::Sell, static_cast<sim::Tick>(105 + (i & 3)), 10);
+            const auto r_bid = book.add(bid, static_cast<sim::TimeNs>(i * 2 + 1));
+            const auto s_ask = book.add_into(ask, static_cast<sim::TimeNs>(i * 2 + 2), trade_buf, 16);
+            REQUIRE(r_bid.filled == 0);
+            REQUIRE(r_bid.remaining == 10);
+            REQUIRE(s_ask.filled == 0);
+            REQUIRE(s_ask.remaining == 10);
+            REQUIRE(s_ask.trade_count == 0);
+        }
+
+        // 2. PostOnly (passive and crossing-rejected) and rejected FOK/IOC
+        sim::Order po_ok{.qty = 15, .orig_qty = 15, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        REQUIRE(book.add(po_ok, 500).remaining == 15);
+        sim::Order po_rej{.qty = 15, .orig_qty = 15, .price = 105, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        REQUIRE(book.add(po_rej, 501).remaining == 0);
+        sim::Order fok_rej{.qty = 5000, .orig_qty = 5000, .price = 108, .side = sim::Side::Buy, .type = sim::OrderType::FOK};
+        REQUIRE(book.add(fok_rej, 502).filled == 0);
+
+        // 3. L3 queue_ahead queries and top-of-book queries
+        for (sim::OrderId id = 1; id <= 32; ++id) {
+            auto qa = book.queue_ahead(id);
+            REQUIRE(qa.has_value());
+        }
+        sim::Tick bb = 0, ba = 0, mid2 = 0;
+        sim::Qty bv = 0, av = 0;
+        REQUIRE(book.best_bid(bb, bv));
+        REQUIRE(book.best_ask(ba, av));
+        REQUIRE(book.mid_tick_x2(mid2));
+        REQUIRE(book.volume_at(sim::Side::Buy, 99) == 15);
+
+        // 4. Multi-fill crossing orders via add_into()
+        sim::Order sweep_buy = make_limit_order(9, sim::Side::Buy, 108, 85);
+        const auto sweep = book.add_into(sweep_buy, 600, trade_buf, 16);
+        REQUIRE(sweep.filled == 85);
+        REQUIRE(sweep.remaining == 0);
+        REQUIRE(sweep.trade_count == 9);
+        REQUIRE(trade_buf[0].qty == 10);
+        REQUIRE(trade_buf[8].qty == 5);
+
+        // 5. O(1) cancellations
+        for (sim::OrderId id = 1; id <= 32; id += 2) {
+            REQUIRE(book.cancel(id, 700 + id));
+        }
+
+        hot_delta = counter.delta();
+    }
+
+    REQUIRE(hot_delta.allocations == 0);
+    REQUIRE(hot_delta.bytes == 0);
+    REQUIRE(book.check_invariants_report().ok);
+}
+
+TEST_CASE("Empty/invalid FlatLadderBook, Tick overflow guards, and non-positive qty handling",
+          "[flat-ladder][lob][edge-cases]") {
+    SECTION("Invalid FlatLadderBook(100, 90) queries and mutations are safe") {
+        sim::FlatLadderBook invalid(100, 90);
+        REQUIRE_FALSE(invalid.is_valid());
+        REQUIRE(invalid.tick_count() == 0);
+        REQUIRE(invalid.is_empty());
+
+        sim::Tick p = -1;
+        sim::Qty v = 99;
+        REQUIRE_FALSE(invalid.best_bid(p, v));
+        REQUIRE(p == 100);
+        REQUIRE(v == 0);
+        REQUIRE_FALSE(invalid.best_ask(p, v));
+        REQUIRE(p == 100);
+        REQUIRE(v == 0);
+
+        sim::Tick sum = 99;
+        REQUIRE_FALSE(invalid.mid_tick_x2(sum));
+        REQUIRE(sum == 0);
+
+        double mid = 99.0;
+        REQUIRE_FALSE(invalid.mid_price(mid));
+
+        REQUIRE(invalid.volume_at(sim::Side::Buy, 100) == 0);
+        REQUIRE(invalid.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min()) == 0);
+        REQUIRE(invalid.volume_at(sim::Side::Sell, std::numeric_limits<sim::Tick>::max()) == 0);
+
+        auto res = invalid.add(make_limit_order(1, sim::Side::Buy, 100, 10), 10);
+        REQUIRE(res.filled == 0);
+        REQUIRE(res.remaining == 0);
+        auto sum_res = invalid.add_into(make_limit_order(1, sim::Side::Buy, 100, 10), 10, nullptr, 0);
+        REQUIRE(sum_res.filled == 0);
+        REQUIRE(sum_res.remaining == 0);
+        REQUIRE(invalid.order_count() == 0);
+        REQUIRE(invalid.event_count() == 0);
+    }
+
+    SECTION("Extreme Tick values in volume_at do not overflow signed int32") {
+        sim::FlatLadderBook book(90, 110);
+        book.add(make_limit_order(1, sim::Side::Buy, 100, 25), 1);
+        REQUIRE(book.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min()) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, std::numeric_limits<sim::Tick>::min() + 1) == 0);
+        REQUIRE(book.volume_at(sim::Side::Sell, std::numeric_limits<sim::Tick>::max()) == 0);
+        REQUIRE(book.volume_at(sim::Side::Buy, 100) == 25);
+    }
+
+    SECTION("Zero and negative qty orders are rejected without resting or consuming OrderId") {
+        sim::FlatLadderBook flat(90, 110);
+        sim::LimitOrderBook tree;
+
+        for (sim::Qty bad_qty : {sim::Qty{0}, sim::Qty{-5}}) {
+            for (sim::OrderType tp : {sim::OrderType::Limit, sim::OrderType::PostOnly,
+                                      sim::OrderType::Market, sim::OrderType::IOC,
+                                      sim::OrderType::FOK}) {
+                sim::Order o{.qty = bad_qty, .orig_qty = bad_qty, .price = 100, .side = sim::Side::Buy, .type = tp};
+                auto rf = flat.add(o, 100);
+                auto sf = flat.add_into(o, 100, nullptr, 0);
+                auto rt = tree.add(o);
+                REQUIRE(rf.filled == 0);
+                REQUIRE(rf.remaining == 0);
+                REQUIRE(sf.filled == 0);
+                REQUIRE(sf.remaining == 0);
+                REQUIRE(rt.filled == 0);
+                REQUIRE(rt.remaining == 0);
+            }
+        }
+        REQUIRE(flat.order_count() == 0);
+        REQUIRE(tree.order_count() == 0);
+        REQUIRE(flat.check_invariants_report().ok);
+
+        // Next valid order still receives OrderId = 1 in both books
+        flat.add(make_limit_order(1, sim::Side::Buy, 100, 10), 200);
+        tree.add(make_limit_order(1, sim::Side::Buy, 100, 10));
+        REQUIRE(flat.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+        REQUIRE(tree.queue_ahead(1) == std::make_optional<sim::Qty>(0));
+    }
+
+    SECTION("Out-of-range PostOnly does not rest and reports 0 remaining") {
+        sim::FlatLadderBook flat(90, 110);
+        sim::Order po_low{.qty = 20, .orig_qty = 20, .price = 80, .side = sim::Side::Buy, .type = sim::OrderType::PostOnly};
+        auto r1 = flat.add(po_low, 10);
+        REQUIRE(r1.filled == 0);
+        REQUIRE(r1.remaining == 0);
+        REQUIRE(flat.order_count() == 0);
+    }
+}
+
+TEST_CASE("FOK + Self-Trade Prevention exact pre-flight parity in FlatLadderBook and LimitOrderBook",
+          "[flat-ladder][lob][fok][stp]") {
+    auto test_both = [](auto&& fn) {
+        sim::FlatLadderBook flat(90, 110);
+        sim::LimitOrderBook tree;
+        fn(flat, tree);
+        REQUIRE(flat.check_invariants_report().ok);
+        require_same_book_state(tree, flat, 90, 110);
+    };
+
+    SECTION("CancelAggressive: self-order blocking full fill rejects FOK with zero mutation") {
+        test_both([](auto& flat, auto& tree) {
+            // Agent 2 has 20 lots ahead of Agent 1's 30 lots at 100 Ask
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 100, 20), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 2);
+
+            // Agent 1 submits FOK Buy for 40 lots under CancelAggressive -> must reject!
+            sim::Order fok{.qty = 40, .agent = 1, .orig_qty = 40, .price = 100,
+                           .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                           .stp = sim::StpMode::CancelAggressive};
+            const auto rf = flat.add(fok, 3);
+            const auto rt = tree.add(fok);
+            REQUIRE(rf.trades.empty());
+            REQUIRE(rf.filled == 0);
+            REQUIRE(rf.remaining == 0);
+            REQUIRE(rt.trades.empty());
+            REQUIRE(rt.filled == 0);
+            REQUIRE(rt.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 50);
+
+            // Agent 1 submits FOK Buy for 20 lots under CancelAggressive -> fills 20 against Agent 2 before reaching self-order!
+            sim::Order fok_ok{.qty = 20, .agent = 1, .orig_qty = 20, .price = 100,
+                              .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                              .stp = sim::StpMode::CancelAggressive};
+            const auto rf2 = flat.add(fok_ok, 4);
+            const auto rt2 = tree.add(fok_ok);
+            REQUIRE(rf2.filled == 20);
+            REQUIRE(rf2.remaining == 0);
+            REQUIRE(rt2.filled == 20);
+            REQUIRE(rt2.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 30);
+        });
+    }
+
+    SECTION("DecrementAndCancel: self-order blocking full fill rejects FOK with zero mutation") {
+        test_both([](auto& flat, auto& tree) {
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 100, 20), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 2);
+
+            sim::Order fok{.qty = 30, .agent = 1, .orig_qty = 30, .price = 100,
+                           .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                           .stp = sim::StpMode::DecrementAndCancel};
+            const auto rf = flat.add(fok, 3);
+            const auto rt = tree.add(fok);
+            REQUIRE(rf.trades.empty());
+            REQUIRE(rf.filled == 0);
+            REQUIRE(rf.remaining == 0);
+            REQUIRE(rt.trades.empty());
+            REQUIRE(rt.filled == 0);
+            REQUIRE(rt.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 50);
+        });
+    }
+
+    SECTION("CancelPassive: FOK counts only non-self liquidity and cancels self-orders only when fillable") {
+        test_both([](auto& flat, auto& tree) {
+            // Agent 1 has 30 lots @ 100 Ask, Agent 2 has 25 lots @ 101 Ask
+            require_same_after_add(tree, flat, make_limit_order(1, sim::Side::Sell, 100, 30), 90, 110, 1);
+            require_same_after_add(tree, flat, make_limit_order(2, sim::Side::Sell, 101, 25), 90, 110, 2);
+
+            // Agent 1 FOK Buy 40 @ 101 with CancelPassive: non-self liquidity is 25 < 40 -> rejected without cancelling Agent 1's ask!
+            sim::Order fok_rej{.qty = 40, .agent = 1, .orig_qty = 40, .price = 101,
+                               .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                               .stp = sim::StpMode::CancelPassive};
+            const auto rf1 = flat.add(fok_rej, 3);
+            const auto rt1 = tree.add(fok_rej);
+            REQUIRE(rf1.trades.empty());
+            REQUIRE(rf1.filled == 0);
+            REQUIRE(rt1.trades.empty());
+            REQUIRE(rt1.filled == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 30);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 101) == 25);
+
+            // Agent 1 FOK Buy 25 @ 101 with CancelPassive: non-self liquidity is 25 >= 25 -> cancels Agent 1's 30 @ 100 and fills 25 @ 101!
+            sim::Order fok_ok{.qty = 25, .agent = 1, .orig_qty = 25, .price = 101,
+                              .side = sim::Side::Buy, .type = sim::OrderType::FOK,
+                              .stp = sim::StpMode::CancelPassive};
+            const auto rf2 = flat.add(fok_ok, 4);
+            const auto rt2 = tree.add(fok_ok);
+            REQUIRE(rf2.trades.size() == 1);
+            REQUIRE(rf2.filled == 25);
+            REQUIRE(rf2.remaining == 0);
+            REQUIRE(rt2.trades.size() == 1);
+            REQUIRE(rt2.filled == 25);
+            REQUIRE(rt2.remaining == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 100) == 0);
+            REQUIRE(flat.volume_at(sim::Side::Sell, 101) == 0);
+        });
+    }
+}
+
+
+#include "sim/sim.hpp"
+
+TEST_CASE("Bug 1 fix: eval_neg_ln_u_q16_from_raw never underflows on 0xFFFF mask",
+          "[qr][bug1][clz]") {
+    const std::uint64_t val_max = sim::QueueReactiveProcess::eval_neg_ln_u_q16_from_raw(0xFFFFFFFFFFFFFFFFULL);
+    const std::uint64_t val_zero = sim::QueueReactiveProcess::eval_neg_ln_u_q16_from_raw(0ULL);
+    REQUIRE(val_max <= 65536ULL);
+    REQUIRE(val_zero > val_max);
+
+    sim::QueueReactiveProcess qrp({}, sim::HawkesMatrix::default_microstructure(), 12345ULL);
+    std::array<sim::Qty, sim::kMaxQRLevels> bq{100, 80, 60, 40, 20};
+    std::array<sim::Qty, sim::kMaxQRLevels> aq{100, 80, 60, 40, 20};
+    for (int i = 0; i < 200; ++i) {
+        const auto ev = qrp.next_event_ogata_thinning(99, bq, 101, aq);
+        REQUIRE(ev.qty > 0);
+        REQUIRE(qrp.current_time() > 0);
+    }
+    REQUIRE(qrp.ogata_residuals().size() == 200);
+
+    const auto pmf = qrp.stationary_queue_pmf(0);
+    REQUIRE(pmf.size() == 64);
+    double sum_p = 0.0;
+    for (double p : pmf) sum_p += p;
+    REQUIRE(std::fabs(sum_p - 1.0) < 1e-6);
+}
+
+TEST_CASE("Bug 2 & 3 fix: ReplayDriver rejected order ID guard and FlatLadderBook peek order IDs",
+          "[replay][flat_ladder][bug2][bug3]") {
+    sim::FlatLadderBook book(90, 110, 128);
+    REQUIRE(book.peek_head_order_id(sim::Side::Buy, 100) == 0);
+    REQUIRE(book.peek_tail_order_id(sim::Side::Buy, 100) == 0);
+
+    const auto r1 = book.add(sim::Order{.qty = 10, .agent = 1, .orig_qty = 10, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 10);
+    const auto r2 = book.add(sim::Order{.qty = 20, .agent = 2, .orig_qty = 20, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 20);
+    const auto r3 = book.add(sim::Order{.qty = 30, .agent = 3, .orig_qty = 30, .price = 100,
+                                        .side = sim::Side::Buy, .type = sim::OrderType::Limit}, 30);
+    REQUIRE(book.peek_head_order_id(sim::Side::Buy, 100) == r1.id);
+    REQUIRE(book.peek_tail_order_id(sim::Side::Buy, 100) == r3.id);
+    REQUIRE(book.peek_nth_order_id(sim::Side::Buy, 100, 1) == r2.id);
+
+    // ReplayDriver rejected invalid order (qty=0 -> id=0) should not advance next_internal_order_id_
+    sim::ReplayDriver driver(90, 110, 128);
+    sim::TraceEvent bad_ev{};
+    bad_ev.seq = 1;
+    bad_ev.ts = 100;
+    bad_ev.kind = sim::TraceEventKind::SubmitLimit;
+    bad_ev.order_id = 500;
+    bad_ev.agent = 1;
+    bad_ev.side = sim::Side::Buy;
+    bad_ev.price = 100;
+    bad_ev.qty = 0; // RejectedInvalid -> execution.id == 0!
+    const auto step_bad = driver.apply(bad_ev);
+    REQUIRE(step_bad.execution.id == 0);
+    REQUIRE_FALSE(step_bad.accepted);
+
+    sim::TraceEvent good_ev{};
+    good_ev.seq = 2;
+    good_ev.ts = 200;
+    good_ev.kind = sim::TraceEventKind::SubmitLimit;
+    good_ev.order_id = 501;
+    good_ev.agent = 1;
+    good_ev.side = sim::Side::Buy;
+    good_ev.price = 100;
+    good_ev.qty = 15;
+    const auto step_good = driver.apply(good_ev);
+    REQUIRE(step_good.execution.id == 1);
+
+    // Cancelling external order 501 must cancel internal order 1
+    sim::TraceEvent cancel_ev{};
+    cancel_ev.seq = 3;
+    cancel_ev.ts = 300;
+    cancel_ev.kind = sim::TraceEventKind::Cancel;
+    cancel_ev.order_id = 501;
+    const auto step_cancel = driver.apply(cancel_ev);
+    REQUIRE(step_cancel.cancel_accepted);
+    REQUIRE(driver.book().volume_at(sim::Side::Buy, 100) == 0);
+}
+
+TEST_CASE("SimulationSession coordinates multi-agent latency pipeline and TCA",
+          "[simulation][coordinator]") {
+    sim::SimulationSessionConfig scfg{};
+    scfg.num_events = 300;
+    scfg.seed = 42ULL;
+
+    sim::StrategicAgentConfig as_agent{};
+    as_agent.agent_id = 10;
+    as_agent.kind = sim::StrategicAgentKind::AvellanedaStoikov;
+    as_agent.latency = sim::LatencyConfig{500, 200, 500};
+
+    sim::StrategicAgentConfig glft_agent{};
+    glft_agent.agent_id = 11;
+    glft_agent.kind = sim::StrategicAgentKind::GlftHeuristic;
+    glft_agent.latency = sim::LatencyConfig{1000, 300, 1000};
+
+    sim::SimulationSession session(scfg, {as_agent, glft_agent});
+    const auto res = session.run();
+    REQUIRE(res.events_processed == 300);
+    REQUIRE(res.invariants_ok);
+    REQUIRE(res.export_parity_ok);
+    REQUIRE(res.join_manifest_clean);
+    REQUIRE(res.agent_metrics.size() == 2);
+    REQUIRE(res.agent_metrics[0].quotes_emitted > 0);
+    REQUIRE(res.agent_metrics[1].quotes_emitted > 0);
+    REQUIRE_FALSE(res.exploitability.is_equilibrium_certificate);
+}
+
+
+TEST_CASE("Zero steady-state heap allocations in QueueReactiveProcess + FlatLadderBook loop",
+          "[qr][alloc_guard][zero_alloc]") {
+    sim::FlatLadderBook book(80, 120, 4096);
+    book.add_into(
+        sim::Order{.qty = 100, .orig_qty = 100, .price = 99, .side = sim::Side::Buy, .type = sim::OrderType::Limit},
+        100, nullptr, 0);
+    book.add_into(
+        sim::Order{.qty = 100, .orig_qty = 100, .price = 101, .side = sim::Side::Sell, .type = sim::OrderType::Limit},
+        100, nullptr, 0);
+
+    sim::QueueReactiveProcess qrp({}, sim::HawkesMatrix::default_microstructure(), 42ULL);
+    sim::Trade trades[16]{};
+
+    sim::diag::AllocStats allocs{};
+    {
+        sim::diag::ScopedAllocCounter guard;
+        for (int i = 0; i < 1000; ++i) {
+            sim::Tick bb = 99, ba = 101;
+            sim::Qty bv = 0, av = 0;
+            if (!book.best_bid(bb, bv)) { bb = 99; bv = 0; }
+            if (!book.best_ask(ba, av)) { ba = 101; av = 0; }
+            const auto ev = qrp.next_event(bb, bv, ba, av);
+            if (ev.order_type == sim::OrderType::Limit || ev.order_type == sim::OrderType::Market) {
+                sim::Order o{};
+                o.agent = (ev.order_type == sim::OrderType::Limit) ? 10 : 20;
+                o.side = ev.side;
+                o.price = std::clamp<sim::Tick>(ev.price, 80, 120);
+                o.qty = ev.qty;
+                o.orig_qty = ev.qty;
+                o.type = ev.order_type;
+                book.add_into(o, qrp.current_time(), trades, 16);
+            } else if (ev.order_type == sim::OrderType::Cancel) {
+                const sim::Tick px = std::clamp<sim::Tick>(ev.price, 80, 120);
+                const sim::OrderId tid = book.peek_tail_order_id(ev.side, px);
+                if (tid != 0) book.cancel(tid, qrp.current_time());
+            }
+        }
+        allocs = guard.delta();
+    }
+    REQUIRE(allocs.allocations == 0);
+}
+
+
+TEST_CASE("Multi-level Ogata thinning generates deeper level events and CreateBid/CreateAsk",
+          "[qr][multilevel][ogata]") {
+    sim::QRParams cfg{};
+    cfg.num_levels = 5;
+    cfg.enable_inside_spread_orders = true;
+    cfg.opposite_queue_beta = 0.25;
+    cfg.imbalance_sensitivity = 0.35;
+    cfg.enable_transient_impact = true;
+    cfg.enable_ou_alpha_drift = true;
+
+    sim::QueueReactiveProcess qrp(cfg, sim::HawkesMatrix::default_microstructure(), 7777ULL);
+    std::array<sim::Qty, sim::kMaxQRLevels> bq{120, 90, 70, 50, 30};
+    std::array<sim::Qty, sim::kMaxQRLevels> aq{60, 80, 70, 50, 30};
+
+    std::size_t deeper_levels = 0;
+    std::size_t inside_spread = 0;
+    for (int i = 0; i < 600; ++i) {
+        const auto ev = qrp.next_event_ogata_thinning(98, bq, 102, aq); // spread = 4 ticks
+        if (ev.level >= 2 && ev.level <= 5) {
+            ++deeper_levels;
+        }
+        if (ev.type == sim::QueueEventType::CreateBid || ev.type == sim::QueueEventType::CreateAsk) {
+            ++inside_spread;
+            REQUIRE(ev.level == 0);
+            REQUIRE(ev.price > 98);
+            REQUIRE(ev.price < 102);
+        }
+    }
+    REQUIRE(deeper_levels > 50);
+    REQUIRE(inside_spread > 10);
+    REQUIRE(qrp.ogata_residuals().size() == 600);
+    double sum_tau = 0.0;
+    for (double r : qrp.ogata_residuals()) sum_tau += r;
+    const double mean_tau = sum_tau / 600.0;
+    REQUIRE(mean_tau > 0.85);
+    REQUIRE(mean_tau < 1.15);
+
+    // Verify HLR Model IIb opposite-queue and imbalance coupling on deeper levels m >= 1
+    const auto rates_pos_imb = qrp.compute_multilevel_intensities(bq, aq, 2);
+    const auto rates_neg_imb = qrp.compute_multilevel_intensities(aq, bq, 2);
+    REQUIRE(rates_pos_imb.buy_limit[1] != rates_neg_imb.buy_limit[1]);
+    REQUIRE(rates_pos_imb.sell_limit[2] != rates_neg_imb.sell_limit[2]);
+}
+
+TEST_CASE("SimulationSession survives total 5-level side depletion with in-flight taker orders",
+          "[simulation][depletion][edge_case]") {
+    sim::SimulationSessionConfig scfg{};
+    scfg.num_events = 400;
+    scfg.initial_depth_per_level = 5; // very thin book so 5 levels deplete rapidly
+    scfg.qr_params.min_qty = 20;
+    scfg.qr_params.max_qty = 80;
+    scfg.qr_params.base_market_rate = 0.08; // heavy market sweeps
+    scfg.qr_params.theta_reinit = 0.90;
+
+    sim::StrategicAgentConfig taker{};
+    taker.agent_id = 30;
+    taker.kind = sim::StrategicAgentKind::TwapExecution;
+    taker.execution_target_qty = 200;
+    taker.execution_slices = 20;
+    taker.latency = sim::LatencyConfig{1000, 500, 1000};
+
+    sim::StrategicAgentConfig mm{};
+    mm.agent_id = 31;
+    mm.kind = sim::StrategicAgentKind::CjpHeuristic;
+    mm.latency = sim::LatencyConfig{2000, 500, 2000};
+
+    sim::SimulationSession session(scfg, {taker, mm});
+    const auto res = session.run();
+    REQUIRE(res.events_processed == 400);
+    REQUIRE(res.invariants_ok);
+    REQUIRE(res.export_parity_ok);
+    REQUIRE(res.join_manifest_clean);
+    REQUIRE(res.total_trades > 0);
 }

@@ -1,75 +1,22 @@
+// PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/)
+// Required Notice: Copyright (c) 2026 Radu Irbe (GitHub: r-irbe).
+
 #include <benchmark/benchmark.h>
 
-#include "sim/alloc_probe.hpp"
+#include "qr/alloc_guard.hpp"
 #include "sim/flat_ladder_book.hpp"
 #include "sim/lob.hpp"
 #include "sim/queue_reactive.hpp"
 #include "sim/rng.hpp"
+#include "sim/bitwise_veb_codings.hpp"
+#include "sim/veb_static_search.hpp"
+#include "sim/ofi_sparsity_features.hpp"
 
 #include <cstdlib>
 #include <new>
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-// --- CMU-002: bench-only global allocation-operator replacement -------------
-//
-// These global replacements live ONLY in the benchmark translation unit (a
-// standalone binary). The library and test binaries are deliberately NOT
-// instrumented, so Catch2 static registration and `sim` keep the platform
-// allocator. When a ScopedAllocCounter is armed (`alloc_counting_active()`),
-// each allocation is tallied into the thread-local AllocStats; otherwise these
-// are thin pass-throughs over std::malloc/std::free. The full standard
-// non-aligned new/delete family is provided so partial replacement cannot mix
-// allocators. Over-aligned (`std::align_val_t`) allocations are intentionally
-// left to the default implementation and are NOT counted (documented limit).
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
-void* operator new(std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) {
-#if defined(__cpp_exceptions)
-        throw std::bad_alloc();
-#else
-        std::abort();
-#endif
-    }
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (!p) {
-#if defined(__cpp_exceptions)
-        throw std::bad_alloc();
-#else
-        std::abort();
-#endif
-    }
-    if (sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p && sim::diag::alloc_counting_active()) sim::diag::note_alloc(size);
-    return p;
-}
-void operator delete(void* ptr) noexcept { std::free(ptr); }
-void operator delete[](void* ptr) noexcept { std::free(ptr); }
-void operator delete(void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete(void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-void operator delete[](void* ptr, const std::nothrow_t&) noexcept { std::free(ptr); }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
 
 namespace {
 
@@ -651,9 +598,8 @@ static void BM_FlatLadder_DeepCrossingMatch(benchmark::State& state) {
         kQty);
 }
 
-// CMU-002: allocation-probe family. These benchmarks measure ALLOCATIONS, not
-// wall-clock latency. Do NOT compare their timing to the latency families
-// (e.g. BM_LOB_AddNoCross); read only their `allocs` / `alloc_bytes` counters.
+// Allocation-probe benchmarks: measure steady-state heap allocations across
+// passive and crossing hot paths after book construction.
 static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     const int batch = static_cast<int>(state.range(0));
     constexpr sim::Tick kMid = 10'000;
@@ -662,9 +608,9 @@ static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     std::uint64_t total_bytes = 0;
 
     for (auto _ : state) {
-        // Construct the book OUTSIDE the counted region so we measure the
-        // steady-state add loop, not one-time book construction.
+        state.PauseTiming();
         sim::LimitOrderBook book(static_cast<std::size_t>(batch * 2 + 64));
+        state.ResumeTiming();
         std::uint64_t sink = 0;
         sim::diag::AllocStats delta{};
         {
@@ -691,9 +637,97 @@ static void BM_LOB_AddNoCross_AllocProbe(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch) * 2);
 }
 
+static void BM_FlatLadder_AddNoCross_AllocProbe(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    constexpr sim::Tick kMin = 9'980;
+    constexpr sim::Tick kMax = 10'020;
+    constexpr sim::Tick kMid = 10'000;
+    constexpr sim::Qty kQty = 1;
+    std::uint64_t total_allocs = 0;
+    std::uint64_t total_bytes = 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        sim::FlatLadderBook book(kMin, kMax, static_cast<std::size_t>(batch * 2 + 64));
+        state.ResumeTiming();
+        std::uint64_t sink = 0;
+        sim::diag::AllocStats delta{};
+        {
+            sim::diag::ScopedAllocCounter counter;
+            for (int i = 0; i < batch; ++i) {
+                const sim::Order buy = make_limit_order(
+                    1, sim::Side::Buy, static_cast<sim::Tick>(kMid - 10 - (i & 7)), kQty);
+                const sim::Order sell = make_limit_order(
+                    2, sim::Side::Sell, static_cast<sim::Tick>(kMid + 10 + (i & 7)), kQty);
+                const sim::TimeNs ts = static_cast<sim::TimeNs>(i);
+                sink += static_cast<std::uint64_t>(book.add(buy, ts * 2).filled);
+                sink += static_cast<std::uint64_t>(book.add(sell, ts * 2 + 1).filled);
+            }
+            delta = counter.delta();
+        }
+        benchmark::DoNotOptimize(sink);
+        total_allocs += delta.allocations;
+        total_bytes += delta.bytes;
+    }
+
+    state.counters["allocs"] =
+        benchmark::Counter(static_cast<double>(total_allocs), benchmark::Counter::kAvgIterations);
+    state.counters["alloc_bytes"] =
+        benchmark::Counter(static_cast<double>(total_bytes), benchmark::Counter::kAvgIterations);
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch) * 2);
+}
+
+static void BM_FlatLadder_AddIntoCrossing_AllocProbe(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    constexpr sim::Tick kMin = 9'980;
+    constexpr sim::Tick kMax = 10'020;
+    constexpr sim::Tick kAsk = 10'000;
+    constexpr sim::Qty kQty = 1;
+    std::uint64_t total_allocs = 0;
+    std::uint64_t total_bytes = 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        sim::FlatLadderBook book(kMin, kMax, static_cast<std::size_t>(batch * 2 + 64));
+        for (int i = 0; i < batch; ++i) {
+            const sim::Order ask = make_limit_order(
+                1, sim::Side::Sell, static_cast<sim::Tick>(kAsk + (i & 7)), kQty);
+            book.add_into(ask, static_cast<sim::TimeNs>(i), nullptr, 0);
+        }
+        state.ResumeTiming();
+
+        sim::Trade trade_buf[16]{};
+        std::uint64_t sink = 0;
+        sim::diag::AllocStats delta{};
+        {
+            sim::diag::ScopedAllocCounter counter;
+            for (int i = 0; i < batch; ++i) {
+                const sim::Order buy = make_limit_order(
+                    2, sim::Side::Buy, static_cast<sim::Tick>(kAsk + 7), kQty);
+                const auto summary = book.add_into(
+                    buy, static_cast<sim::TimeNs>(batch + i), trade_buf, 16);
+                sink += static_cast<std::uint64_t>(summary.filled) + summary.trade_count;
+            }
+            delta = counter.delta();
+        }
+        benchmark::DoNotOptimize(sink);
+        benchmark::DoNotOptimize(trade_buf);
+        total_allocs += delta.allocations;
+        total_bytes += delta.bytes;
+    }
+
+    state.counters["allocs"] =
+        benchmark::Counter(static_cast<double>(total_allocs), benchmark::Counter::kAvgIterations);
+    state.counters["alloc_bytes"] =
+        benchmark::Counter(static_cast<double>(total_bytes), benchmark::Counter::kAvgIterations);
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(batch));
+}
+
 BENCHMARK(BM_LOB_AddNoCross)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_LOB_AddNoCross_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_FlatLadder_AddNoCross)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_AddNoCross_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_AddIntoCrossing_AllocProbe)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_LOB_CancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_CancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_LOB_CancelCycle_NoCompaction)->Arg(1024)->Arg(4096)->Arg(16384);
@@ -701,8 +735,7 @@ BENCHMARK(BM_LOB_CrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_CrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_LOB_OutOfBandPassive)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_OutOfBandPassive)->Arg(1024)->Arg(4096)->Arg(16384);
-// Deep-ladder benches \u2014 evidence that bitmap refresh keeps cancel + match
-// cost essentially flat as the tick band widens 2.5\u00d7\u00d72500.
+// Deep-ladder benchmarks across a 100,001-tick band.
 BENCHMARK(BM_FlatLadder_DeepCancelCycle)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_DeepRefreshHeavy)->Arg(1024)->Arg(4096)->Arg(16384);
 BENCHMARK(BM_FlatLadder_DeepCrossingMatch)->Arg(1024)->Arg(4096)->Arg(16384);
@@ -780,4 +813,129 @@ BENCHMARK(BM_FlatLadder_STP_CancelPassive)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_FlatLadder_QueueAhead)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_QueueReactive_EventGeneration)->Arg(1024)->Arg(4096);
 
+
+void BM_FlatLadder_SparseLevels(benchmark::State& state) {
+    const int depth = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(100000, 300000, 1024);
+    for (int i = 0; i < 16; ++i) {
+        book.add(make_limit_order(1, sim::Side::Buy, 199000 - i * 4096, 10), i * 2);
+        book.add(make_limit_order(2, sim::Side::Sell, 201000 + i * 4096, 10), i * 2 + 1);
+    }
+    std::size_t sink = 0;
+    for (auto _ : state) {
+        auto bids = book.levels(sim::Side::Buy, static_cast<std::size_t>(depth));
+        auto asks = book.levels(sim::Side::Sell, static_cast<std::size_t>(depth));
+        sink += bids.size() + asks.size();
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * 2);
+}
+
+void BM_BitwiseVeb4096_Ops(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::BitwiseVeb4096 veb{};
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            const auto t = static_cast<std::uint32_t>((i * 73) & 4095);
+            veb.insert(t);
+            sink += veb.min_tick() + veb.next_higher(t >> 1);
+        }
+        for (int i = 0; i < batch; ++i) {
+            const auto t = static_cast<std::uint32_t>((i * 73) & 4095);
+            veb.remove(t);
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch * 2);
+}
+
+void BM_ReversibleSubgame_RolloutRollback(benchmark::State& state) {
+    const int steps = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(9500, 10500, 4096);
+    for (int i = 0; i < 64; ++i) {
+        book.add_into(make_limit_order(1, sim::Side::Buy, 9990 - (i & 15), 10), i, nullptr, 0);
+        book.add_into(make_limit_order(2, sim::Side::Sell, 10010 + (i & 15), 10), 64 + i, nullptr, 0);
+    }
+    sim::LadderUndoLog undo_log;
+    sim::Trade trade_buf[8];
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        sim::ReversibleSubgameScope scope(book, undo_log);
+        for (int s = 0; s < steps; ++s) {
+            const sim::Order o = make_limit_order(3, (s & 1) ? sim::Side::Buy : sim::Side::Sell,
+                                                  (s & 1) ? 9995 : 10005, 5);
+            auto ms = scope.add(o, 1000 + s, trade_buf, 8);
+            sink += static_cast<std::uint64_t>(ms.remaining);
+        }
+        scope.rollback();
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * steps);
+}
+
+void BM_EytzingerTickGrid_LowerBound(benchmark::State& state) {
+    const int n = static_cast<int>(state.range(0));
+    std::vector<std::int64_t> sorted(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) sorted[static_cast<std::size_t>(i)] = 10000 + i * 5;
+    sim::EytzingerTickGrid<std::int64_t> grid(sorted);
+    std::size_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < 256; ++i) {
+            sink += grid.lower_bound_rank(10000 + ((i * 97) % (n * 5)));
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * 256);
+}
+
+void BM_OnlineHawkesQ16_Step(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::OnlineHawkesQ16 hawkes(65536ULL, 16384ULL, 65536ULL);
+    std::uint64_t sink = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            sink += hawkes.record_event(1024ULL);
+            sink += sim::SwarQueueReactiveRegimeLut::decode_add(static_cast<std::uint32_t>(i & 7));
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_MultiLevelOfi_Avx2(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::TopKBookSnapshot<8> prev{};
+    sim::TopKBookSnapshot<8> curr{};
+    for (std::size_t m = 0; m < 8; ++m) {
+        prev.bid_count = 8;
+        prev.ask_count = 8;
+        curr.bid_count = 8;
+        curr.ask_count = 8;
+        prev.bids[m] = {static_cast<sim::Tick>(10000 - m), 50, 2};
+        prev.asks[m] = {static_cast<sim::Tick>(10005 + m), 60, 2};
+        curr.bids[m] = {static_cast<sim::Tick>(10000 - m), 65, 3};
+        curr.asks[m] = {static_cast<sim::Tick>(10005 + m), 45, 2};
+    }
+    const auto weights = sim::default_ofi_decay_weights<8>();
+    double sink = 0.0;
+    for (auto _ : state) {
+        for (int i = 0; i < batch; ++i) {
+            curr.bids[i & 7].qty += 1;
+            const auto out = sim::compute_multilevel_ofi_avx2<8>(prev, curr, weights);
+            sink += out.weighted_ofi;
+        }
+        benchmark::DoNotOptimize(sink);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+BENCHMARK(BM_FlatLadder_SparseLevels)->Arg(5)->Arg(16);
+BENCHMARK(BM_BitwiseVeb4096_Ops)->Arg(256)->Arg(1024);
+BENCHMARK(BM_ReversibleSubgame_RolloutRollback)->Arg(64)->Arg(256);
+BENCHMARK(BM_EytzingerTickGrid_LowerBound)->Arg(256)->Arg(4096);
+BENCHMARK(BM_OnlineHawkesQ16_Step)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_MultiLevelOfi_Avx2)->Arg(256)->Arg(1024);
+
 BENCHMARK_MAIN();
+
