@@ -1223,6 +1223,7 @@ static HawkesSixChannelEval evaluate_log_likelihood_6ch(
 enum class HawkesMle6chMode : std::uint8_t {
     DampedNewton48Param = 0,
     DampedNewton54Param = 1,
+    Stage2Initializer = 2,
 };
 
 // Six-channel Hawkes-QR MLE calibration result.
@@ -1665,7 +1666,18 @@ static HawkesSixChannelResult calibrate_mle_6ch(
     double final_fisher_min = 1e9;
     std::uint32_t total_iters = 0;
 
-    if (mode == HawkesMle6chMode::DampedNewton48Param) {
+    if (mode == HawkesMle6chMode::Stage2Initializer) {
+        for (int m = 0; m < 6; ++m) {
+            res.mu[m] = mu_init[m];
+            res.gamma[m] = gamma_init[m];
+            for (int n = 0; n < 6; ++n) {
+                res.alpha_matrix[m][n] = alpha_init[m][n];
+            }
+            res.beta_channel[m] = beta_scalar;
+        }
+        res.iterations = 0;
+        res.converged = true;
+    } else if (mode == HawkesMle6chMode::DampedNewton48Param) {
         const double decay_grid[6] = {
             0.50 * beta_scalar, 0.75 * beta_scalar, 1.00 * beta_scalar,
             1.50 * beta_scalar, 2.00 * beta_scalar, 3.00 * beta_scalar
@@ -1861,13 +1873,18 @@ static HawkesSixChannelResult calibrate_mle_6ch(
     }
     res.log_likelihood = total_ll_train;
 
-    const double K = (mode == HawkesMle6chMode::DampedNewton48Param) ? 48.0 : 54.0;
+    const double K = (mode == HawkesMle6chMode::DampedNewton48Param) ? 48.0 : ((mode == HawkesMle6chMode::DampedNewton54Param) ? 54.0 : 0.0);
     res.aic = 2.0 * K - 2.0 * total_ll_train;
     res.bic = K * std::log(static_cast<double>(n_train)) - 2.0 * total_ll_train;
     res.score_max_abs = final_grad_norm_max;
     res.fisher_min = std::max(1e-6, final_fisher_min);
-    res.iterations = total_iters / 6;
-    res.converged = true;
+    if (mode == HawkesMle6chMode::Stage2Initializer) {
+        res.iterations = 0;
+        res.converged = true;
+    } else {
+        res.iterations = total_iters / 6;
+        res.converged = true;
+    }
 
     if (n_total > n_train + 2) {
         const auto oos = events.subspan(n_train);

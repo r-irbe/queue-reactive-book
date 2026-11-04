@@ -112,6 +112,48 @@ typedef struct QrlobMleCalibrationReport {
     uint64_t calibration_hash;
 } QrlobMleCalibrationReport;
 
+typedef struct QrlobGpuParityReport {
+    int32_t gpu_available;
+    int32_t init_rc;
+    int32_t rollout_trajectories;
+    uint32_t rollout_mismatches;
+    uint32_t rollout_survived;
+    int32_t rollout_l5_trajectories;
+    uint32_t rollout_l5_mismatches;
+    uint32_t rollout_l5_survived;
+    int32_t ozaki_events;
+    float ozaki_gpu_loglik;
+    float ozaki_cpu_loglik;
+    float ozaki_gpu_score;
+    float ozaki_cpu_score;
+    float ozaki_gpu_fisher;
+    float ozaki_cpu_fisher;
+    float ozaki_max_rel_err;
+    int32_t parity_ok;
+} QrlobGpuParityReport;
+
+typedef struct QrlobSixChannelCalibrationReport {
+    double mu[6];
+    double gamma[6];
+    double alpha;
+    double beta;
+    double beta_channel[6];
+    double alpha_matrix[6][6];
+    double branching_matrix[6][6];
+    double spectral_radius;
+    double log_likelihood;
+    double log_likelihood_oos;
+    double oos_llr_per_event;
+    double aic;
+    double bic;
+    double score_max_abs;
+    double fisher_min;
+    uint32_t iterations;
+    int32_t converged;
+    int32_t solver_mode;
+    uint64_t n_events;
+} QrlobSixChannelCalibrationReport;
+
 // Run C++ microbenchmarks + FlatLadderParityHarness in-process and populate summary
 int qrlob_ffi_run_microbenchmarks(
     uint64_t num_ops,
@@ -186,6 +228,21 @@ int qrlob_ffi_generate_shm_microstructure_stream(
     int use_compact_ring_abi,
     uint64_t* out_events_published,
     uint64_t* out_final_hash);
+
+// Run live CUDA Driver API sm_89 GPU kernel parity suite and populate report
+int qrlob_ffi_run_gpu_parity(
+    int32_t n_trajectories,
+    int32_t n_events,
+    uint64_t seed,
+    QrlobGpuParityReport* out_report);
+
+// Calibrate 6-channel Hawkes-QR model on a LOBSTER message CSV file
+// solver_mode: 0=48Param, 1=54Param, 2=Stage2Initializer
+int qrlob_ffi_calibrate_lobster_6ch(
+    const char* csv_path,
+    double train_fraction,
+    int32_t solver_mode,
+    QrlobSixChannelCalibrationReport* out_report);
 
 #ifdef __cplusplus
 }

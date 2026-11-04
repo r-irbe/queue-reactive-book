@@ -105,6 +105,131 @@ inline AcceleratorVerdict accelerator_verdict(const ParityResult& parity,
 
 
 // ============================================================================
+// CPU Reference Implementations for sm_89 Accelerator Kernels
+// ============================================================================
+
+inline void rollout_cpu_reference(
+    std::uint64_t* state,
+    std::uint64_t* seeds,
+    std::uint32_t* out_survival,
+    float* out_intensity,
+    std::int32_t n) noexcept {
+    constexpr float kTwoPowMinus16 = 1.0f / 65536.0f;
+    for (std::int32_t i = 0; i < n; ++i) {
+        const std::uint64_t s = state[i];
+        const std::uint64_t decay = sim::gpu::q16_horner_decay_step(s);
+        state[i] = decay;
+
+        const std::uint64_t seed = seeds[i];
+        const std::uint64_t rng_next = sim::gpu::rng_mix_step(seed);
+        seeds[i] = rng_next;
+
+        out_intensity[i] = static_cast<float>(decay) * kTwoPowMinus16;
+        const std::uint32_t lhs = static_cast<std::uint32_t>(decay) << 15U;
+        const std::uint32_t rhs = static_cast<std::uint32_t>(rng_next & 0x7FFFFFFFULL);
+        out_survival[i] = (lhs > rhs) ? 1U : 0U;
+    }
+}
+
+inline void rollout_l5_cpu_reference(
+    std::uint32_t* bids,
+    std::uint32_t* asks,
+    std::uint64_t* seeds,
+    std::uint32_t* out_survival,
+    std::int32_t* out_mid_moves,
+    std::int32_t n) noexcept {
+    for (std::int32_t i = 0; i < n; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        const std::uint64_t s = seeds[idx];
+        const std::uint64_t mix = s ^ (static_cast<std::uint64_t>(i + 1) * sim::gpu::kWeylGoldenIncrement);
+        const std::uint64_t s_next = sim::gpu::rng_mix_step(mix);
+        seeds[idx] = s_next;
+
+        const std::uint32_t side = static_cast<std::uint32_t>(s_next & 1ULL);
+        std::uint32_t level = static_cast<std::uint32_t>((s_next >> 1U) & 7ULL);
+        if (level >= 5U) level -= 5U;
+        std::uint32_t kind = static_cast<std::uint32_t>((s_next >> 4U) & 3ULL);
+        if (kind == 3U) kind = 0U;
+        const std::uint32_t delta = static_cast<std::uint32_t>(10U + ((s_next >> 8U) & 31ULL));
+
+        std::int32_t mid_m = 0;
+        if (side == 0U) {
+            if (kind == 0U) {
+                bids[idx * 5U + level] += delta;
+            } else if (kind == 1U) {
+                bids[idx * 5U + level] = (bids[idx * 5U + level] > delta) ? (bids[idx * 5U + level] - delta) : 0U;
+            } else {
+                bids[idx * 5U + 0U] = (bids[idx * 5U + 0U] > delta) ? (bids[idx * 5U + 0U] - delta) : 0U;
+            }
+            if (bids[idx * 5U + 0U] == 0U) {
+                bids[idx * 5U + 0U] = bids[idx * 5U + 1U];
+                bids[idx * 5U + 1U] = bids[idx * 5U + 2U];
+                bids[idx * 5U + 2U] = bids[idx * 5U + 3U];
+                bids[idx * 5U + 3U] = bids[idx * 5U + 4U];
+                bids[idx * 5U + 4U] = 100U;
+                mid_m = -1;
+            }
+        } else {
+            if (kind == 0U) {
+                asks[idx * 5U + level] += delta;
+            } else if (kind == 1U) {
+                asks[idx * 5U + level] = (asks[idx * 5U + level] > delta) ? (asks[idx * 5U + level] - delta) : 0U;
+            } else {
+                asks[idx * 5U + 0U] = (asks[idx * 5U + 0U] > delta) ? (asks[idx * 5U + 0U] - delta) : 0U;
+            }
+            if (asks[idx * 5U + 0U] == 0U) {
+                asks[idx * 5U + 0U] = asks[idx * 5U + 1U];
+                asks[idx * 5U + 1U] = asks[idx * 5U + 2U];
+                asks[idx * 5U + 2U] = asks[idx * 5U + 3U];
+                asks[idx * 5U + 3U] = asks[idx * 5U + 4U];
+                asks[idx * 5U + 4U] = 100U;
+                mid_m = 1;
+            }
+        }
+
+        out_mid_moves[idx] = mid_m;
+
+        const std::uint64_t q_tot = static_cast<std::uint64_t>(bids[idx * 5U + 0U] + asks[idx * 5U + 0U]) & 0xFFFFULL;
+        const std::uint64_t decay = sim::gpu::q16_horner_decay_step(q_tot);
+        out_survival[idx] = ((static_cast<std::uint32_t>(decay) << 15U) > static_cast<std::uint32_t>(s_next & 0x7FFFFFFFULL)) ? 1U : 0U;
+    }
+}
+
+inline void ozaki_cpu_reference(
+    const float* offsets,
+    const std::uint32_t* channels,
+    const float* depths,
+    const float* mu6,
+    const float* gamma6,
+    double& out_ll,
+    double& out_sc,
+    double& out_fi,
+    std::int32_t n) noexcept {
+    out_ll = 0.0;
+    out_sc = 0.0;
+    out_fi = 0.0;
+    for (std::int32_t i = 0; i < n; ++i) {
+        std::uint32_t c = channels[i] & 7U;
+        if (c >= 6U) c = 0U;
+        const float q = depths[i];
+        const float dt = offsets[i];
+        const float mu = mu6[c];
+        const float gam = gamma6[c];
+        const float gq = gam * q;
+        const float phi = (c < 2U) ? (1.0f - gq) : (1.0f + gq);
+        const float f10 = mu * phi;
+        const float f11 = dt * f10;
+        const float f12 = gam * f10;
+        const float f13 = dt * f12;
+        const float f14 = f10 * f10;
+        const float f15 = dt * f14;
+        out_ll += static_cast<double>(f11);
+        out_sc += static_cast<double>(f13);
+        out_fi += static_cast<double>(f15);
+    }
+}
+
+// ============================================================================
 // Live CUDA Driver API (sm_89) Rollout & Ozaki Kernel Parity Harness
 // ============================================================================
 

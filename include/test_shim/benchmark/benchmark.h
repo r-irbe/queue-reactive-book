@@ -191,8 +191,26 @@ inline int RunSpecifiedBenchmarks(int argc = 0, char* argv[] = nullptr) {
                     label += std::to_string(args[k]);
                 }
             }
-            if (!filter.empty() && label.find(filter) == std::string::npos &&
-                target->name.find(filter) == std::string::npos) {
+            bool bench_matched = false;
+            if (filter.empty()) {
+                bench_matched = true;
+            } else {
+                std::size_t start = 0;
+                while (start <= filter.size()) {
+                    const std::size_t pipe = filter.find('|', start);
+                    const std::string token = (pipe == std::string::npos)
+                                                  ? filter.substr(start)
+                                                  : filter.substr(start, pipe - start);
+                    if (!token.empty() &&
+                        (label.find(token) != std::string::npos || target->name.find(token) != std::string::npos)) {
+                        bench_matched = true;
+                        break;
+                    }
+                    if (pipe == std::string::npos) break;
+                    start = pipe + 1;
+                }
+            }
+            if (!bench_matched) {
                 continue;
             }
 

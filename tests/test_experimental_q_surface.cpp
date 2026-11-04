@@ -635,6 +635,53 @@ TEST_CASE("experimental 6-channel sign-aware Ozaki Hawkes MLE and 6x6 cross-exci
     }
 }
 
+TEST_CASE("experimental HawkesMle6chMode::Stage2Initializer and FFI parity/calibration extensions",
+          "[experimental][hawkes][ffi][parity]") {
+    std::vector<sim::experimental::SixChannelEvent> events;
+    REQUIRE(sim::experimental::load_lobster_six_channel_csv("data/lobster_AAPL_2012-06-21_message_5.csv", events));
+    REQUIRE(events.size() >= 1000);
+
+    const auto res_s2 = sim::experimental::calibrate_mle_6ch(
+        std::span<const sim::experimental::SixChannelEvent>(events.data(), events.size()),
+        0.70,
+        sim::experimental::HawkesMle6chMode::Stage2Initializer);
+    REQUIRE(res_s2.iterations == 0);
+    REQUIRE(res_s2.converged);
+    REQUIRE(res_s2.solver_mode == sim::experimental::HawkesMle6chMode::Stage2Initializer);
+    REQUIRE(res_s2.beta > 0.0);
+    REQUIRE(res_s2.alpha > 0.0);
+    REQUIRE(res_s2.spectral_radius > 0.0);
+    REQUIRE(res_s2.spectral_radius < 1.0);
+    REQUIRE(std::isfinite(res_s2.log_likelihood));
+    REQUIRE(std::isfinite(res_s2.log_likelihood_oos));
+    REQUIRE(std::isfinite(res_s2.oos_llr_per_event));
+
+    QrlobGpuParityReport gpu_rep{};
+    REQUIRE(qrlob_ffi_run_gpu_parity(4096, 1024, 42, nullptr) == -1);
+    REQUIRE(qrlob_ffi_run_gpu_parity(4096, 1024, 42, &gpu_rep) == 0);
+    if (gpu_rep.gpu_available) {
+        REQUIRE(gpu_rep.init_rc == 0);
+        REQUIRE(gpu_rep.rollout_trajectories == 4096);
+        REQUIRE(gpu_rep.rollout_mismatches == 0U);
+        REQUIRE(gpu_rep.rollout_l5_trajectories == 4096);
+        REQUIRE(gpu_rep.rollout_l5_mismatches == 0U);
+        REQUIRE(gpu_rep.ozaki_events == 1024);
+        REQUIRE(gpu_rep.ozaki_max_rel_err < 1e-4f);
+        REQUIRE(gpu_rep.parity_ok == 1);
+    }
+
+    QrlobSixChannelCalibrationReport cal_rep{};
+    REQUIRE(qrlob_ffi_calibrate_lobster_6ch(nullptr, 0.70, 0, &cal_rep) == -1);
+    REQUIRE(qrlob_ffi_calibrate_lobster_6ch("non_existent_file.csv", 0.70, 0, &cal_rep) == -2);
+    REQUIRE(qrlob_ffi_calibrate_lobster_6ch("data/lobster_AAPL_2012-06-21_message_5.csv", 0.70, 2, &cal_rep) == 0);
+    REQUIRE(cal_rep.solver_mode == 2);
+    REQUIRE(cal_rep.iterations == 0);
+    REQUIRE(cal_rep.converged == 1);
+    REQUIRE(cal_rep.spectral_radius > 0.0);
+    REQUIRE(cal_rep.spectral_radius < 1.0);
+    REQUIRE(cal_rep.n_events >= 1000);
+}
+
 TEST_CASE("experimental lobster_calibration_summary.json verified",
           "[experimental][hawkes][calibration_summary]") {
     std::string summary_path = "data/lobster_calibration_summary.json";

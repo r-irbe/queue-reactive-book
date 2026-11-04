@@ -11,6 +11,8 @@
 #include "sim/bitwise_veb_codings.hpp"
 #include "sim/veb_static_search.hpp"
 #include "sim/ofi_sparsity_features.hpp"
+#include "sim/accelerator_parity.hpp"
+#include "sim/gpu_kernels.hpp"
 
 #include <cstdlib>
 #include <new>
@@ -809,8 +811,226 @@ void BM_QueueReactive_EventGeneration(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
 }
 
+void BM_FlatLadder_QueueAhead_FIFO_Watermark(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(90, 110, batch * 2);
+    for (int i = 0; i < batch; ++i) {
+        book.add(make_limit_order(static_cast<sim::AgentId>(i + 1), sim::Side::Buy, 100, 10), i);
+    }
+    sim::Qty sink = 0;
+    for (auto _ : state) {
+        for (int i = 1; i <= batch; ++i) {
+            auto q = book.queue_ahead(static_cast<sim::OrderId>(i));
+            if (q) sink += *q;
+        }
+    }
+    benchmark::DoNotOptimize(sink);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_FlatLadder_QueueAhead_Fenwick_InteriorCancel(benchmark::State& state) {
+    const int batch = static_cast<int>(state.range(0));
+    sim::FlatLadderBook book(90, 110, batch * 2);
+    for (int i = 0; i < batch; ++i) {
+        book.add(make_limit_order(static_cast<sim::AgentId>(i + 1), sim::Side::Buy, 100, 10), i);
+    }
+    book.cancel(static_cast<sim::OrderId>(2), batch);
+    if (batch > 4) {
+        book.cancel(static_cast<sim::OrderId>(batch / 2), batch);
+    }
+    sim::Qty sink = 0;
+    for (auto _ : state) {
+        for (int i = 1; i <= batch; ++i) {
+            auto q = book.queue_ahead(static_cast<sim::OrderId>(i));
+            if (q) sink += *q;
+        }
+    }
+    benchmark::DoNotOptimize(sink);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * batch);
+}
+
+void BM_Rollout_L1_CPU(benchmark::State& state) {
+    constexpr std::int32_t n = 4096;
+    std::vector<std::uint64_t> states(n);
+    std::vector<std::uint64_t> seeds(n);
+    std::vector<std::uint32_t> survival(n);
+    std::vector<float> intensity(n);
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        states[i] = (static_cast<std::uint64_t>(i) * 40503ULL + 17ULL) & 0xFFFFULL;
+        seeds[i] = 0x9E3779B97F4A7C15ULL ^ (static_cast<std::uint64_t>(i + 1) * 0xBF58476D1CE4E5B9ULL);
+    }
+
+    for (auto _ : state) {
+        sim::rollout_cpu_reference(states.data(), seeds.data(), survival.data(), intensity.data(), n);
+        benchmark::DoNotOptimize(survival.data());
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
+void BM_Rollout_L1_GPU(benchmark::State& state) {
+    constexpr std::int32_t n = 4096;
+    std::vector<std::uint64_t> states(n);
+    std::vector<std::uint64_t> seeds(n);
+    std::vector<std::uint32_t> survival(n);
+    std::vector<float> intensity(n);
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        states[i] = (static_cast<std::uint64_t>(i) * 40503ULL + 17ULL) & 0xFFFFULL;
+        seeds[i] = 0x9E3779B97F4A7C15ULL ^ (static_cast<std::uint64_t>(i + 1) * 0xBF58476D1CE4E5B9ULL);
+    }
+
+    sim::gpu::GpuContext ctx{};
+    const int init_rc = sim::gpu::gpu_init(&ctx);
+    if (init_rc != 0) {
+        for (auto _ : state) {
+            sim::rollout_cpu_reference(states.data(), seeds.data(), survival.data(), intensity.data(), n);
+            benchmark::DoNotOptimize(survival.data());
+        }
+        state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+        return;
+    }
+
+    for (auto _ : state) {
+        const int rc = sim::gpu::gpu_rollout(
+            &ctx, states.data(), seeds.data(), survival.data(), intensity.data(), n);
+        if (rc != 0) {
+            sim::rollout_cpu_reference(states.data(), seeds.data(), survival.data(), intensity.data(), n);
+        }
+        benchmark::DoNotOptimize(survival.data());
+    }
+    sim::gpu::gpu_shutdown(&ctx);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
+void BM_Rollout_L5_CPU(benchmark::State& state) {
+    constexpr std::int32_t n = 4096;
+    std::vector<std::uint32_t> bids(n * 5, 100U);
+    std::vector<std::uint32_t> asks(n * 5, 100U);
+    std::vector<std::uint64_t> seeds(n);
+    std::vector<std::uint32_t> survival(n);
+    std::vector<std::int32_t> mid_moves(n);
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        seeds[i] = 0x9E3779B97F4A7C15ULL ^ (static_cast<std::uint64_t>(i + 1) * 0xBF58476D1CE4E5B9ULL);
+    }
+
+    for (auto _ : state) {
+        sim::rollout_l5_cpu_reference(bids.data(), asks.data(), seeds.data(), survival.data(), mid_moves.data(), n);
+        benchmark::DoNotOptimize(survival.data());
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
+void BM_Rollout_L5_GPU(benchmark::State& state) {
+    constexpr std::int32_t n = 4096;
+    std::vector<std::uint32_t> bids(n * 5, 100U);
+    std::vector<std::uint32_t> asks(n * 5, 100U);
+    std::vector<std::uint64_t> seeds(n);
+    std::vector<std::uint32_t> survival(n);
+    std::vector<std::int32_t> mid_moves(n);
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        seeds[i] = 0x9E3779B97F4A7C15ULL ^ (static_cast<std::uint64_t>(i + 1) * 0xBF58476D1CE4E5B9ULL);
+    }
+
+    sim::gpu::GpuContext ctx{};
+    const int init_rc = sim::gpu::gpu_init(&ctx);
+    if (init_rc != 0) {
+        for (auto _ : state) {
+            sim::rollout_l5_cpu_reference(bids.data(), asks.data(), seeds.data(), survival.data(), mid_moves.data(), n);
+            benchmark::DoNotOptimize(survival.data());
+        }
+        state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+        return;
+    }
+
+    for (auto _ : state) {
+        const int rc = sim::gpu::gpu_rollout_l5(
+            &ctx, bids.data(), asks.data(), seeds.data(), survival.data(), mid_moves.data(), n);
+        if (rc != 0) {
+            sim::rollout_l5_cpu_reference(bids.data(), asks.data(), seeds.data(), survival.data(), mid_moves.data(), n);
+        }
+        benchmark::DoNotOptimize(survival.data());
+    }
+    sim::gpu::gpu_shutdown(&ctx);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
+void BM_Ozaki_CPU(benchmark::State& state) {
+    constexpr std::int32_t n = 1024;
+    std::vector<float> offsets(n);
+    std::vector<std::uint32_t> channels(n);
+    std::vector<float> depths(n);
+    const float mu6[6]    = {1.20f, 1.15f, 0.85f, 0.80f, 0.45f, 0.40f};
+    const float gamma6[6] = {0.18f, 0.16f, 0.22f, 0.20f, 0.30f, 0.28f};
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        offsets[i]  = 0.001f * static_cast<float>((i % 17) + 1);
+        channels[i] = static_cast<std::uint32_t>(i % 8);
+        depths[i]   = 0.25f * static_cast<float>((i % 5) + 1);
+    }
+
+    double ll = 0.0, sc = 0.0, fi = 0.0;
+    for (auto _ : state) {
+        sim::ozaki_cpu_reference(offsets.data(), channels.data(), depths.data(), mu6, gamma6, ll, sc, fi, n);
+        benchmark::DoNotOptimize(ll);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
+void BM_Ozaki_GPU(benchmark::State& state) {
+    constexpr std::int32_t n = 1024;
+    std::vector<float> offsets(n);
+    std::vector<std::uint32_t> channels(n);
+    std::vector<float> depths(n);
+    const float mu6[6]    = {1.20f, 1.15f, 0.85f, 0.80f, 0.45f, 0.40f};
+    const float gamma6[6] = {0.18f, 0.16f, 0.22f, 0.20f, 0.30f, 0.28f};
+
+    for (std::int32_t i = 0; i < n; ++i) {
+        offsets[i]  = 0.001f * static_cast<float>((i % 17) + 1);
+        channels[i] = static_cast<std::uint32_t>(i % 8);
+        depths[i]   = 0.25f * static_cast<float>((i % 5) + 1);
+    }
+
+    float loglik = 0.0f, score = 0.0f, fisher = 0.0f;
+    sim::gpu::GpuContext ctx{};
+    const int init_rc = sim::gpu::gpu_init(&ctx);
+    if (init_rc != 0) {
+        double cpu_ll = 0.0, cpu_sc = 0.0, cpu_fi = 0.0;
+        for (auto _ : state) {
+            sim::ozaki_cpu_reference(offsets.data(), channels.data(), depths.data(), mu6, gamma6, cpu_ll, cpu_sc, cpu_fi, n);
+            benchmark::DoNotOptimize(cpu_ll);
+        }
+        state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+        return;
+    }
+
+    for (auto _ : state) {
+        const int rc = sim::gpu::gpu_ozaki(
+            &ctx, offsets.data(), channels.data(), depths.data(), mu6, gamma6,
+            &loglik, &score, &fisher, n);
+        if (rc != 0) {
+            double cpu_ll = 0.0, cpu_sc = 0.0, cpu_fi = 0.0;
+            sim::ozaki_cpu_reference(offsets.data(), channels.data(), depths.data(), mu6, gamma6, cpu_ll, cpu_sc, cpu_fi, n);
+            loglik = static_cast<float>(cpu_ll);
+        }
+        benchmark::DoNotOptimize(loglik);
+    }
+    sim::gpu::gpu_shutdown(&ctx);
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * n);
+}
+
 BENCHMARK(BM_FlatLadder_STP_CancelPassive)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_FlatLadder_QueueAhead)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_QueueAhead_FIFO_Watermark)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_FlatLadder_QueueAhead_Fenwick_InteriorCancel)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
+BENCHMARK(BM_Rollout_L1_CPU);
+BENCHMARK(BM_Rollout_L1_GPU);
+BENCHMARK(BM_Rollout_L5_CPU);
+BENCHMARK(BM_Rollout_L5_GPU);
+BENCHMARK(BM_Ozaki_CPU);
+BENCHMARK(BM_Ozaki_GPU);
 BENCHMARK(BM_QueueReactive_EventGeneration)->Arg(1024)->Arg(4096);
 
 

@@ -116,6 +116,50 @@ class QrlobAgentSummary(ctypes.Structure):
         ("queue_risk_x2", ctypes.c_int64),
     ]
 
+class QrlobGpuParityReport(ctypes.Structure):
+    _fields_ = [
+        ("gpu_available", ctypes.c_int32),
+        ("init_rc", ctypes.c_int32),
+        ("rollout_trajectories", ctypes.c_int32),
+        ("rollout_mismatches", ctypes.c_uint32),
+        ("rollout_survived", ctypes.c_uint32),
+        ("rollout_l5_trajectories", ctypes.c_int32),
+        ("rollout_l5_mismatches", ctypes.c_uint32),
+        ("rollout_l5_survived", ctypes.c_uint32),
+        ("ozaki_events", ctypes.c_int32),
+        ("ozaki_gpu_loglik", ctypes.c_float),
+        ("ozaki_cpu_loglik", ctypes.c_float),
+        ("ozaki_gpu_score", ctypes.c_float),
+        ("ozaki_cpu_score", ctypes.c_float),
+        ("ozaki_gpu_fisher", ctypes.c_float),
+        ("ozaki_cpu_fisher", ctypes.c_float),
+        ("ozaki_max_rel_err", ctypes.c_float),
+        ("parity_ok", ctypes.c_int32),
+    ]
+
+class QrlobSixChannelCalibrationReport(ctypes.Structure):
+    _fields_ = [
+        ("mu", ctypes.c_double * 6),
+        ("gamma", ctypes.c_double * 6),
+        ("alpha", ctypes.c_double),
+        ("beta", ctypes.c_double),
+        ("beta_channel", ctypes.c_double * 6),
+        ("alpha_matrix", (ctypes.c_double * 6) * 6),
+        ("branching_matrix", (ctypes.c_double * 6) * 6),
+        ("spectral_radius", ctypes.c_double),
+        ("log_likelihood", ctypes.c_double),
+        ("log_likelihood_oos", ctypes.c_double),
+        ("oos_llr_per_event", ctypes.c_double),
+        ("aic", ctypes.c_double),
+        ("bic", ctypes.c_double),
+        ("score_max_abs", ctypes.c_double),
+        ("fisher_min", ctypes.c_double),
+        ("iterations", ctypes.c_uint32),
+        ("converged", ctypes.c_int32),
+        ("solver_mode", ctypes.c_int32),
+        ("n_events", ctypes.c_uint64),
+    ]
+
 class QrlobMleCalibrationReport(ctypes.Structure):
     _fields_ = [
         ("n_total", ctypes.c_uint64),
@@ -202,6 +246,16 @@ def load_ffi_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)
     ]
     lib.qrlob_ffi_calibrate_lobster_mle.restype = ctypes.c_int
+
+    lib.qrlob_ffi_run_gpu_parity.argtypes = [
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_uint64, ctypes.POINTER(QrlobGpuParityReport)
+    ]
+    lib.qrlob_ffi_run_gpu_parity.restype = ctypes.c_int
+
+    lib.qrlob_ffi_calibrate_lobster_6ch.argtypes = [
+        ctypes.c_char_p, ctypes.c_double, ctypes.c_int32, ctypes.POINTER(QrlobSixChannelCalibrationReport)
+    ]
+    lib.qrlob_ffi_calibrate_lobster_6ch.restype = ctypes.c_int
 
     return lib
 
@@ -465,3 +519,59 @@ def calibrate_lobster_mle_ffi(csv_path: str, train_fraction: float = 0.70):
         "calibration_hash": f"0x{rep.calibration_hash:016x}",
     }
     return summary, residuals
+
+
+def run_gpu_parity(n_trajectories: int = 4096, n_events: int = 1024, seed: int = 42) -> Dict[str, object]:
+    lib = load_ffi_library()
+    rep = QrlobGpuParityReport()
+    rc = lib.qrlob_ffi_run_gpu_parity(n_trajectories, n_events, seed, ctypes.byref(rep))
+    if rc != 0:
+        raise RuntimeError(f"qrlob_ffi_run_gpu_parity failed with rc={rc}")
+    return {
+        "gpu_available": bool(rep.gpu_available),
+        "init_rc": int(rep.init_rc),
+        "rollout_trajectories": int(rep.rollout_trajectories),
+        "rollout_mismatches": int(rep.rollout_mismatches),
+        "rollout_survived": int(rep.rollout_survived),
+        "rollout_l5_trajectories": int(rep.rollout_l5_trajectories),
+        "rollout_l5_mismatches": int(rep.rollout_l5_mismatches),
+        "rollout_l5_survived": int(rep.rollout_l5_survived),
+        "ozaki_events": int(rep.ozaki_events),
+        "ozaki_gpu_loglik": float(rep.ozaki_gpu_loglik),
+        "ozaki_cpu_loglik": float(rep.ozaki_cpu_loglik),
+        "ozaki_gpu_score": float(rep.ozaki_gpu_score),
+        "ozaki_cpu_score": float(rep.ozaki_cpu_score),
+        "ozaki_gpu_fisher": float(rep.ozaki_gpu_fisher),
+        "ozaki_cpu_fisher": float(rep.ozaki_cpu_fisher),
+        "ozaki_max_rel_err": float(rep.ozaki_max_rel_err),
+        "parity_ok": bool(rep.parity_ok),
+    }
+
+def calibrate_lobster_6ch(csv_path: str, train_fraction: float = 0.70, solver_mode: int = 0) -> Dict[str, object]:
+    lib = load_ffi_library()
+    rep = QrlobSixChannelCalibrationReport()
+    b_path = csv_path.encode("ascii") if csv_path else None
+    rc = lib.qrlob_ffi_calibrate_lobster_6ch(b_path, train_fraction, solver_mode, ctypes.byref(rep))
+    if rc != 0:
+        raise RuntimeError(f"qrlob_ffi_calibrate_lobster_6ch failed with rc={rc}")
+    return {
+        "mu": [rep.mu[i] for i in range(6)],
+        "gamma": [rep.gamma[i] for i in range(6)],
+        "alpha": float(rep.alpha),
+        "beta": float(rep.beta),
+        "beta_channel": [rep.beta_channel[i] for i in range(6)],
+        "alpha_matrix": [[rep.alpha_matrix[i][j] for j in range(6)] for i in range(6)],
+        "branching_matrix": [[rep.branching_matrix[i][j] for j in range(6)] for i in range(6)],
+        "spectral_radius": float(rep.spectral_radius),
+        "log_likelihood": float(rep.log_likelihood),
+        "log_likelihood_oos": float(rep.log_likelihood_oos),
+        "oos_llr_per_event": float(rep.oos_llr_per_event),
+        "aic": float(rep.aic),
+        "bic": float(rep.bic),
+        "score_max_abs": float(rep.score_max_abs),
+        "fisher_min": float(rep.fisher_min),
+        "iterations": int(rep.iterations),
+        "converged": bool(rep.converged),
+        "solver_mode": int(rep.solver_mode),
+        "n_events": int(rep.n_events),
+    }

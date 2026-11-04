@@ -655,4 +655,83 @@ int qrlob_ffi_generate_shm_microstructure_stream(
     return 0;
 }
 
+int qrlob_ffi_run_gpu_parity(
+    int32_t n_trajectories,
+    int32_t n_events,
+    uint64_t seed,
+    QrlobGpuParityReport* out_report) {
+    if (!out_report) return -1;
+    std::memset(out_report, 0, sizeof(QrlobGpuParityReport));
+    const auto rep = sim::run_gpu_kernel_parity_suite(n_trajectories, n_events, seed);
+    out_report->gpu_available = rep.gpu_available ? 1 : 0;
+    out_report->init_rc = rep.init_rc;
+    out_report->rollout_trajectories = rep.rollout_trajectories;
+    out_report->rollout_mismatches = rep.rollout_mismatches;
+    out_report->rollout_survived = rep.rollout_survived;
+    out_report->rollout_l5_trajectories = rep.rollout_l5_trajectories;
+    out_report->rollout_l5_mismatches = rep.rollout_l5_mismatches;
+    out_report->rollout_l5_survived = rep.rollout_l5_survived;
+    out_report->ozaki_events = rep.ozaki_events;
+    out_report->ozaki_gpu_loglik = rep.ozaki_gpu_loglik;
+    out_report->ozaki_cpu_loglik = rep.ozaki_cpu_loglik;
+    out_report->ozaki_gpu_score = rep.ozaki_gpu_score;
+    out_report->ozaki_cpu_score = rep.ozaki_cpu_score;
+    out_report->ozaki_gpu_fisher = rep.ozaki_gpu_fisher;
+    out_report->ozaki_cpu_fisher = rep.ozaki_cpu_fisher;
+    out_report->ozaki_max_rel_err = rep.ozaki_max_rel_err;
+    out_report->parity_ok = rep.parity_ok ? 1 : 0;
+    return 0;
+}
+
+int qrlob_ffi_calibrate_lobster_6ch(
+    const char* csv_path,
+    double train_fraction,
+    int32_t solver_mode,
+    QrlobSixChannelCalibrationReport* out_report) {
+    if (!csv_path || csv_path[0] == 0 || !out_report) return -1;
+    std::memset(out_report, 0, sizeof(QrlobSixChannelCalibrationReport));
+
+    std::vector<sim::experimental::SixChannelEvent> events;
+    if (!sim::experimental::load_lobster_six_channel_csv(std::string(csv_path), events)) {
+        return -2;
+    }
+    if (events.empty()) {
+        return -3;
+    }
+
+    const double train_frac = (train_fraction > 0.0 && train_fraction < 1.0) ? train_fraction : 0.70;
+    sim::experimental::HawkesMle6chMode mode = sim::experimental::HawkesMle6chMode::DampedNewton48Param;
+    if (solver_mode == 1) {
+        mode = sim::experimental::HawkesMle6chMode::DampedNewton54Param;
+    } else if (solver_mode == 2) {
+        mode = sim::experimental::HawkesMle6chMode::Stage2Initializer;
+    }
+
+    const auto res = sim::experimental::calibrate_mle_6ch(
+        std::span<const sim::experimental::SixChannelEvent>(events.data(), events.size()),
+        train_frac,
+        mode);
+
+    std::memcpy(out_report->mu, res.mu, sizeof(res.mu));
+    std::memcpy(out_report->gamma, res.gamma, sizeof(res.gamma));
+    out_report->alpha = res.alpha;
+    out_report->beta = res.beta;
+    std::memcpy(out_report->beta_channel, res.beta_channel, sizeof(res.beta_channel));
+    std::memcpy(out_report->alpha_matrix, res.alpha_matrix, sizeof(res.alpha_matrix));
+    std::memcpy(out_report->branching_matrix, res.branching_matrix, sizeof(res.branching_matrix));
+    out_report->spectral_radius = res.spectral_radius;
+    out_report->log_likelihood = res.log_likelihood;
+    out_report->log_likelihood_oos = res.log_likelihood_oos;
+    out_report->oos_llr_per_event = res.oos_llr_per_event;
+    out_report->aic = res.aic;
+    out_report->bic = res.bic;
+    out_report->score_max_abs = res.score_max_abs;
+    out_report->fisher_min = res.fisher_min;
+    out_report->iterations = res.iterations;
+    out_report->converged = res.converged ? 1 : 0;
+    out_report->solver_mode = static_cast<int32_t>(res.solver_mode);
+    out_report->n_events = static_cast<uint64_t>(events.size());
+    return 0;
+}
+
 } // extern "C"
