@@ -10,12 +10,14 @@
 
 ## Why Use This Simulator? (What Problem Does It Solve?)
 
-When you design or backtest a market-making or execution strategy, simplified backtesters that assume "you always fill at the touch" hide the real tradeoff in electronic markets:
+When you design or backtest a market-making or execution strategy, simplified backtesters that assume "you always fill immediately at the touch" hide the real tradeoff in electronic markets, while standard pointer-based order books (`std::map` + per-order heap nodes) spend most of their time in `malloc`/`free` and cache misses:
 
 - **Cancel too slowly**, and your resting quote gets picked off by faster traders when the price moves against you (*adverse selection*[^adverse-selection]).
 - **Cancel too aggressively**, and you lose your place in line (*queue priority*[^queue-ahead]) when the price stays stable.
 
 `queue-reactive-book` lets you hold the matching rules and order-arrival stream fixed while sweeping your order-entry latency, quote width, and inventory penalties—so you can measure exactly how latency changes your profit and loss (PnL), fill rates, and adverse selection.
+
+![How Queue-Reactive Order Book Achieves 6.6 ns Cancels & Exact Attribution](docs/assets/mechanics.png)
 
 ---
 
